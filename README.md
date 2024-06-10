@@ -1,1 +1,3 @@
-# CovDMR_calling
+# Covariance DMR calling
+
+Scripts for covariance differential methylation calling
