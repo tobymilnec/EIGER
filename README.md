@@ -4,4 +4,7 @@ Scripts for covariance differential methylation calling, currently setup for usi
 
 Annotation based on rank and difference between samples. Other methods to be developped
 
-working data in : /rds/user/tm739/rds-massie-nutgKVmnlpI/Deconvolution/Toby/atlas/Prostate_Atlas_hg38
+working data in : 
+- wgbs : /rds/user/tm739/rds-massie-nutgKVmnlpI/Deconvolution/Toby/atlas/Prostate_Atlas_hg38
+- targeted : /home/tm739/rds/rds-massie-nutgKVmnlpI/Deconvolution/Toby/wgbstools_data/ICGC/pilot
+
