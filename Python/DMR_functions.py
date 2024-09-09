@@ -33,10 +33,6 @@ def covariance_blocks(chr_arr):
     M = len(chr_arr)-1
     covariance = [np.cov(chr_arr[j, :], chr_arr[j+1, :], ddof=1)[1][0] for j in range(M)]
     return covariance
-def covariance_blocks(chr_arr):
-    M = len(chr_arr)-1
-    covariance = [np.cov(chr_arr[j, :], chr_arr[j+1, :],ddof=1)[1][0] for j in range(M)]
-    return covariance
 
 @jit(nopython=True)
 def correlation_blocks(chr_arr):
