@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on 26 May 2023
+@author: Toby Milne-Clark
+"""
+
 import os.path as op
 import os
 import gzip
