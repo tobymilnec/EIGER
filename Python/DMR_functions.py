@@ -372,3 +372,40 @@ def find_separators(df, region, meta,
     }
     
     return result
+
+def expand_averages_column(df, averages_column='averages', sample_names=None):
+    """
+    Given a DataFrame (df) that contains a column (averages_column) where each row 
+    is an array or list of per-sample averages, this function splits that column into
+    separate columns, one for each sample.
+    
+    Parameters:
+      df : pandas.DataFrame
+          The DataFrame that contains the averages column.
+      averages_column : str, default 'averages'
+          The name of the column in df that contains the array of averages.
+      sample_names : list of str or None, default None
+          Optional list of sample names to use as column headers. If None, defaults to 
+          ['sample_0', 'sample_1', ...].
+    
+    Returns:
+      df_out : pandas.DataFrame
+          The DataFrame with the averages column replaced by individual sample columns.
+    """
+    # Convert the column of arrays/lists into a list of lists.
+    avg_list = df[averages_column].tolist()
+    
+    # Determine the number of samples (assumes every row has the same length array)
+    n_samples = len(avg_list[0])
+    
+    # If no sample names are provided, use default names.
+    if sample_names is None:
+        sample_names = [f'sample_{i}' for i in range(n_samples)]
+    
+    # Create a new DataFrame from the list of averages.
+    averages_df = pd.DataFrame(avg_list, index=df.index, columns=sample_names)
+    
+    # Optionally drop the original averages column and join the new columns.
+    df_out = df.drop(columns=[averages_column]).join(averages_df)
+    
+    return df_out
