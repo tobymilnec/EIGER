@@ -8,3 +8,11 @@ working data in :
 - wgbs : /rds/user/tm739/rds-massie-nutgKVmnlpI/Deconvolution/Toby/atlas/Prostate_Atlas_hg38
 - targeted : /home/tm739/rds/rds-massie-nutgKVmnlpI/Deconvolution/Toby/wgbstools_data/ICGC/pilot
 
+todo list:
+
+- Methrix object input, modify main function to take it as an input.
+- Bed and Cov input
+- Annotations through R (functions already written but need to create rpy2 versions)
+- Multi-Omic intergration. Allow additional data sources to be overlapped with data for higher convidence regions, currently scRNA-seq has been tested (do this in R as current? or move to python?)
+- Network propagation for DMRs? Would be interesting to see if this can be used to refine regions futher. (probably more useful in Tum vs Ben comps)
+
