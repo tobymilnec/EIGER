@@ -17,3 +17,5 @@ todo list:
 - Multi-Omic intergration. Allow additional data sources to be overlapped with data for higher convidence regions, currently scRNA-seq has been tested (do this in R as current? or move to python?)
 - Network propagation for DMRs? Would be interesting to see if this can be used to refine regions futher. (probably more useful in Tum vs Ben comps)
 
+<img width="1360" height="1010" alt="GSTP1_plot" src="https://github.com/user-attachments/assets/b733b5a6-230c-454d-9a79-5037cefa1803" />
+
