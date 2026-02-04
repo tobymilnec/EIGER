@@ -1,3 +1,5 @@
+<img width="1408" height="768" alt="Gemini_Generated_Image_3p26wp3p26wp3p26" src="https://github.com/user-attachments/assets/32576634-76bb-40e6-9a16-bf4ae769dd5c" />
+
 # EIGER: Estimating Interdependent Genome-wide Epigenetic Regions
 ## Covariance based DMR calling
 
