@@ -34,7 +34,7 @@ def load_beta_frequencies(
     Returns a np.ndarray[uint8] with shape (NSITES, 2).
     Columns give met freq, and freq site observed."""
     suff = op.splitext(fn)
-    if suff == '.lbeta':
+    if suff[1] == '.lbeta':
         sizet = 2
         dtype = np.uint16
     else:
@@ -81,9 +81,9 @@ def load_beta_frequencies_from_bed(
         opts.append('-f')
     opts = ' '.join(opts)
     call(f'wgbstools bed2beta  -o {dotbeta_dir} {opts} {fn}')
-    betafreq = load_beta_frequencies(fn, *args, **kwargs)
-    # delete .beta file
-    tmpfn = f"{dotbeta_dir}/{op.splitext(fn)[1]}.beta"
+    # Load the converted .beta file, not the original bed file
+    tmpfn = f"{dotbeta_dir}/{op.splitext(op.basename(fn))[0]}.beta"
+    betafreq = load_beta_frequencies(tmpfn, *args, **kwargs)
     if rm_dotbeta:
         os.remove(tmpfn)
     return betafreq
@@ -166,7 +166,7 @@ class Methylation:
     @classmethod
     def from_freq_array(cls, freq:MetFreqArr, files=None):
         beta = freq[:, :, 0] / freq[:, :, 1]
-        return cls(freq[0], freq[1], beta, files)
+        return cls(freq[:, :, 0], freq[:, :, 1], beta, files)
     @classmethod
     def from_dotbeta(cls, files:ListFiles):
         freq = load_methylation_frequencies(files)

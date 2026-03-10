@@ -16,12 +16,11 @@ import os
 import argparse
 import numpy as np
 import pandas as pd
-from os import listdir
-from os.path import isfile, join
+from os.path import join
 from joblib import Parallel, delayed
 
 from functions.load_functions import load_methylation_frequencies
-from functions.processing import covariance_blocks, extract_blocks, find_seperators, compute_laplacian_score, expand_averages_column, fdr
+from functions.processing import covariance_blocks, extract_blocks, find_separators, compute_laplacian_score, expand_averages_column, fdr
 
 # ============================
 # MAIN FUNCTION
@@ -57,8 +56,6 @@ def main():
 
     # --- Compute block means (DMRs) ---
     print("Computing block means (DMRs)...")
-    from joblib import Parallel, delayed
-
     DMRS = Parallel(n_jobs=-1)(
         delayed(np.mean)(betas[range(blks[j, 0], blks[j, 1] + 1), :], axis=0)
         for j in range(len(blks))
@@ -70,10 +67,10 @@ def main():
 
     # --- Annotate each block via parallel processing ---
     print("Annotating DMR blocks...")
-    # Convert meta DataFrame to numpy array (if required by find_seperators)
+    # Convert meta DataFrame to numpy array for find_separators
     meta_arr = meta_df.to_numpy()
     DMRS_anno = Parallel(n_jobs=-1)(
-        delayed(find_seperators)(
+        delayed(find_separators)(
             betas, range(blks[j, 0], blks[j, 1] + 1), meta_arr,
             sample_avg_func=np.mean,
             thres=0.4, N_target=3, sigma=0.05, tau=0.02,

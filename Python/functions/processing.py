@@ -6,14 +6,11 @@ Created on 26 May 2023
 """
 
 ##### DMR calling functions
-import itertools
+import math
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy import stats
 from numba import jit
-import seaborn as sns
-import math
 from sklearn.neighbors import kneighbors_graph
 import scipy.sparse
 
@@ -21,6 +18,26 @@ import scipy.sparse
 # Elapsed (no jit) = 14.89403999998467s
 # Elapsed (after jit compilation) = 0.482649749959819s
 # Speed increase is noticible 
+
+@jit(nopython=True)
+def _cov2(x, y):
+    """Compute sample covariance (ddof=1) between two 1-D arrays."""
+    n = len(x)
+    mx = np.mean(x)
+    my = np.mean(y)
+    return np.sum((x - mx) * (y - my)) / (n - 1)
+
+
+@jit(nopython=True)
+def _corr2(x, y):
+    """Compute Pearson correlation between two 1-D arrays."""
+    cov = _cov2(x, y)
+    sx = np.std(x)
+    sy = np.std(y)
+    if sx == 0.0 or sy == 0.0:
+        return 0.0
+    return cov / (sx * sy)
+
 
 @jit(nopython=True)
 def covariance_blocks(chr_arr):
@@ -33,8 +50,8 @@ def covariance_blocks(chr_arr):
     Returns:
     list: A list of covariances between consecutive rows of the input array.
     """
-    M = len(chr_arr)-1
-    covariance = [np.cov(chr_arr[j, :], chr_arr[j+1, :], ddof=1)[1][0] for j in range(M)]
+    M = len(chr_arr) - 1
+    covariance = [_cov2(chr_arr[j, :], chr_arr[j + 1, :]) for j in range(M)]
     return covariance
 
 
@@ -49,8 +66,8 @@ def correlation_blocks(chr_arr):
     Returns:
     correlation (list): A list of correlation coefficients between consecutive rows.
     """
-    M = len(chr_arr)-1
-    correlation = [np.corrcoef(chr_arr[j, :], chr_arr[j+1, :])[1][0] for j in range(M)]
+    M = len(chr_arr) - 1
+    correlation = [_corr2(chr_arr[j, :], chr_arr[j + 1, :]) for j in range(M)]
     return correlation
 
 
@@ -62,10 +79,9 @@ def contiguous_regions(condition):
     # Find the indicies of changes in "condition"
     d = np.diff(condition,n=1, axis=0)
     idx, _ = d.nonzero() 
-    # We need to start things after the change in "condition". Therefore, 
-    # we'll shift the index by 1 to the right. -JK
-        # LB this copy to increment is horrible but I get 
-    # ValueError: output array is read-only without it 
+    # We need to start things after the change in "condition". Therefore,
+    # we'll shift the index by 1 to the right.
+    # Copy idx to a mutable array before incrementing (np.diff output is read-only).
     mutable_idx = np.array(idx)
     mutable_idx +=  1
     idx = mutable_idx
@@ -374,6 +390,12 @@ def find_separators(df, region, meta,
     }
     
     return result
+
+def fdr(p_vals):
+    ranked_p_values = stats.rankdata(p_vals)
+    fdr = p_vals * len(p_vals) / ranked_p_values
+    fdr[fdr > 1] = 1
+    return fdr
 
 def expand_averages_column(df, averages_column='averages', sample_names=None):
     """
