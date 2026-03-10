@@ -112,7 +112,7 @@ EIGER/
 
 If you use EIGER in your work, please cite:
 
-> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/your-username/EIGER
+> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/tobymilnec/EIGER
 
 ---
 
