@@ -130,10 +130,7 @@ def load_methylation_frequencies(
     return arr
 
 
-def _test_load_met_freq(fn = 'path/to/file.beta'):
-    # paff_data = Path('/home/jcthomas/data/deconv_test/')
-    # fn = paff_data / 'immune_P8100.dedup.sorted.beta'
-
+def _test_load_met_freq(fn='path/to/file.beta'):
     files = [fn] * 40
 
     bf = load_methylation_frequencies(files)

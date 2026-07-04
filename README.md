@@ -27,7 +27,7 @@ See [requirements.txt](requirements.txt) for the Python dependencies.
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/EIGER.git
+git clone https://github.com/tobymilnec/EIGER.git
 cd EIGER
 pip install -r requirements.txt
 ```
@@ -93,9 +93,13 @@ EIGER/
 
 ## Citation
 
-If you use EIGER, please cite:
+If you use EIGER, please cite the associated paper:
 
-> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/your-username/EIGER
+> Milne-Clark T, Lee Yu H, Nazlamova L, et al. *Epigenetic Drivers of Localised Prostate Cancers Reveal Neuronal and Microenvironmental Reprogramming and inform Liquid Biopsy Biomarkers*. SSRN (2026). doi:10.2139/ssrn.6121766. https://ssrn.com/abstract=6121766
+
+You may also cite the software directly:
+
+> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/tobymilnec/EIGER
 
 ## Planned features
 
