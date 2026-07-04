@@ -103,7 +103,9 @@ def load_methylation_frequencies(
         force_overwrite: If True, overwrite .beta files that exist in dotbeta_dir
         """
     if file_type == 'infer':
-        file_type = op.splitext(files[-1])
+        ext = op.splitext(str(files[-1]))[1].lstrip('.')
+        # .beta and .lbeta share the same loader
+        file_type = 'beta' if ext in ('beta', 'lbeta') else ext
     loaders = {
         'beta': load_beta_frequencies,
         'bed':partial(load_beta_frequencies_from_bed, bedgraph=False, *loadBedArgs, **loadBedKW, ),

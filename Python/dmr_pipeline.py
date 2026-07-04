@@ -7,9 +7,9 @@ The user supplies:
   - A meta CSV file containing (at least) beta file names in the first column.
   - The directory where the beta files are stored.
   - A CpG bed file (e.g. gzipped) for mapping coordinates.
-The pipeline loads the beta files, computes DMRs, annotates them using a 
-find_seperators function (with parallel processing), computes Laplacian scores,
-maps CpG coordinates, and outputs a CSV of results.
+The pipeline loads the beta files, computes DMRs, annotates them using
+find_separators (with parallel processing), computes Laplacian scores,
+maps CpG coordinates, and writes a CSV of results.
 """
 
 import os
@@ -22,9 +22,6 @@ from joblib import Parallel, delayed
 from functions.load_functions import load_methylation_frequencies
 from functions.processing import covariance_blocks, extract_blocks, find_separators, compute_laplacian_score, expand_averages_column, fdr
 
-# ============================
-# MAIN FUNCTION
-# ============================
 
 def main():
     parser = argparse.ArgumentParser(description="DMR-calling pipeline")
@@ -92,9 +89,9 @@ def main():
     if 'averages' in DMRS_anno_df.columns:
         DMRS_anno_df = expand_averages_column(DMRS_anno_df, averages_column='averages', sample_names=sample_names)
 
-    # --- Optionally apply FDR correction on p-values (if column exists) ---
-    if 'pvalue' in DMRS_anno_df.columns:
-        DMRS_anno_df['fdr'] = fdr(DMRS_anno_df['pvalue'].to_numpy(dtype='float'))
+    # --- Apply FDR correction on the sample-level p-values ---
+    if 'pvalue_sample' in DMRS_anno_df.columns:
+        DMRS_anno_df['fdr'] = fdr(DMRS_anno_df['pvalue_sample'].to_numpy(dtype='float'))
 
     # --- Read CpG location file ---
     print("Reading CpG location file...")

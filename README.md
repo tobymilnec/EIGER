@@ -2,36 +2,27 @@
 
 # EIGER: Estimating Interdependent Genome-wide Epigenetic Regions
 
-**Covariance-based differentially methylated region (DMR) calling for whole-genome bisulfite sequencing data.**
+Covariance-based DMR calling for whole-genome bisulfite sequencing data.
 
-EIGER identifies DMRs by computing the covariance between adjacent CpG sites across samples, grouping sites into contiguous high-covariance blocks, and scoring each block for sample-, cell-type-, and tissue-level methylation separation. Blocks are ranked using a Laplacian score and corrected for rare-group prevalence.
-
-<img width="1360" height="1010" alt="Example DMR plot (GSTP1)" src="https://github.com/user-attachments/assets/b733b5a6-230c-454d-9a79-5037cefa1803" />
-
----
+EIGER calls differentially methylated regions by computing the covariance between adjacent CpG sites across samples, grouping sites into contiguous high-covariance blocks, and scoring each block for sample-, cell-type- and tissue-level methylation separation. Blocks are ranked by a Laplacian score and corrected for rare-group prevalence.
 
 ## Features
 
 - Covariance-based block segmentation of CpG sites (Numba-accelerated)
-- Sample-level, cell-type-level, and tissue-level separation scoring
+- Sample-, cell-type- and tissue-level separation scoring
 - Rare-group prevalence correction (Gaussian and logistic)
 - Laplacian score ranking of DMR blocks
 - Benjamini-Hochberg FDR correction
 - Parallel processing via `joblib`
-- Input: wgbstools `.beta` / `.lbeta` files, with optional `.bed`, `.bedgraph`, and `.cov` support via `wgbstools`
-- Output: annotated DMR table with genomic coordinates as a CSV
-
----
+- Reads wgbstools `.beta` / `.lbeta` files, with optional `.bed`, `.bedgraph` and `.cov` support through `wgbstools`
+- Writes an annotated DMR table with genomic coordinates as a CSV
 
 ## Requirements
 
-- Python ≥ 3.10
-- [wgbstools](https://github.com/nloyfer/wgbs_tools) (must be on `PATH` for `.bed`/`.cov` input)
-- R packages: `ggplot2`, `dplyr`, `tidyr`, `grid`, `gtable` (for the plotting script)
+- Python >= 3.10
+- [wgbstools](https://github.com/nloyfer/wgbs_tools) on `PATH` (only needed for `.bed`/`.cov` input)
 
-See [requirements.txt](requirements.txt) for the full Python dependency list.
-
----
+See [requirements.txt](requirements.txt) for the Python dependencies.
 
 ## Installation
 
@@ -41,16 +32,14 @@ cd EIGER
 pip install -r requirements.txt
 ```
 
----
-
 ## Usage
 
 ```bash
 python Python/dmr_pipeline.py \
-    --meta        samples.csv \
-    --beta-dir    /path/to/beta/files \
+    --meta          samples.csv \
+    --beta-dir      /path/to/beta/files \
     --location-file cpg_sites.bed.gz \
-    --output      DMRs_with_coords.csv
+    --output        DMRs_with_coords.csv
 ```
 
 ### Arguments
@@ -64,7 +53,7 @@ python Python/dmr_pipeline.py \
 
 ### Meta file format
 
-The meta CSV must have at least the following columns (0-indexed):
+The meta CSV needs at least these columns (0-indexed):
 
 | Column index | Content |
 |---|---|
@@ -74,20 +63,18 @@ The meta CSV must have at least the following columns (0-indexed):
 
 ### Output
 
-The output CSV contains one row per DMR with columns including:
+The output CSV has one row per DMR, with columns including:
 
-- `chr`, `start`, `end` — genomic coordinates
-- `CpG_start`, `CpG_end` — CpG index range
-- `classification` — separation class (e.g. `"grouped celltype separation"`)
-- `direction` — `Hypomethylation` or `Hypermethylation`
-- `delta_minmax`, `delta_celltype_next`, `delta_tissue_next` — methylation gap metrics
-- `pvalue_sample`, `pvalue_cell`, `pvalue_tissue` — t-test p-values
-- `score_*_gaussian`, `score_*_logistic` — prevalence-corrected scores
-- `laplacian_score` — Laplacian feature score
-- `fdr` — Benjamini-Hochberg corrected p-value (sample level)
-- One column per sample containing the per-block average methylation
-
----
+- `chr`, `start`, `end` - genomic coordinates
+- `CpG_start`, `CpG_end` - CpG index range
+- `classification` - separation class (e.g. `"grouped celltype separation"`)
+- `direction` - `Hypomethylation` or `Hypermethylation`
+- `delta_minmax`, `delta_celltype_next`, `delta_tissue_next` - methylation gap metrics
+- `pvalue_sample`, `pvalue_cell`, `pvalue_tissue` - t-test p-values
+- `score_*_gaussian`, `score_*_logistic` - prevalence-corrected scores
+- `laplacian_score` - Laplacian feature score
+- `fdr` - Benjamini-Hochberg corrected sample-level p-value
+- one column per sample with the per-block average methylation
 
 ## Repository structure
 
@@ -97,34 +84,25 @@ EIGER/
 │   ├── dmr_pipeline.py          # Main entry point
 │   └── functions/
 │       ├── load_functions.py    # Beta file loading utilities
-│       ├── processing.py        # DMR calling and scoring functions
-│       ├── plotting.py          # Python DMR plotting (methylation + tracks + covariance)
-│       └── DMR_plotting_TMC.R   # R equivalent of plotting.py
+│       └── processing.py        # DMR calling and scoring functions
 ├── data/
 │   └── ref/                     # Reference files
 ├── requirements.txt
 └── README.md
 ```
 
----
-
 ## Citation
 
-If you use EIGER in your work, please cite:
+If you use EIGER, please cite:
 
-> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/tobymilnec/EIGER
-
----
+> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/your-username/EIGER
 
 ## Planned features
 
 - Methrix object input support
-- rpy2 integration for inline R annotation
 - Multi-omic integration (e.g. scRNA-seq overlay)
 - Network propagation-based DMR refinement
 
----
-
 ## Licence
 
-This project is licensed under the MIT Licence — see [LICENSE](LICENSE) for details.
+Released under the MIT Licence. See [LICENSE](LICENSE).

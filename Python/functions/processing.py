@@ -31,12 +31,16 @@ def _cov2(x, y):
 @jit(nopython=True)
 def _corr2(x, y):
     """Compute Pearson correlation between two 1-D arrays."""
-    cov = _cov2(x, y)
-    sx = np.std(x)
-    sy = np.std(y)
-    if sx == 0.0 or sy == 0.0:
+    mx = np.mean(x)
+    my = np.mean(y)
+    xm = x - mx
+    ym = y - my
+    # normalise consistently; reusing _cov2 (ddof=1) against np.std (ddof=0)
+    # mismatches the normalisation and lets |r| exceed 1.
+    denom = np.sqrt(np.sum(xm * xm) * np.sum(ym * ym))
+    if denom == 0.0:
         return 0.0
-    return cov / (sx * sy)
+    return np.sum(xm * ym) / denom
 
 
 @jit(nopython=True)
@@ -122,7 +126,7 @@ def extract_blocks(arr, DMR_length_threshold=5, cov_threshold=0.1):
     return out
 
 
-# Correction functions (unchanged)
+### rare-group prevalence corrections
 def f_rare_gaussian(p_obs, p_target, sigma):
     return np.exp(-((p_obs - p_target) ** 2) / (2 * sigma ** 2))
 
