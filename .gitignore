@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# generated outputs
+# Scoped deliberately. An unanchored "results*/" or "legacy*/" also matches
+# benchmarking/results_* (the committed benchmark outputs the docs cite) and
+# old_code/beta_2026/legacy/ (source code), so both are anchored to the repo
+# root where the README's example commands actually write.
+/results/
+/legacy/
+/both/
+examples/data/
+examples/out_*/
+benchmarking/out*/
+*.tsv.gz

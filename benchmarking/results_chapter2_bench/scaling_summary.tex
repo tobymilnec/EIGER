@@ -1,0 +1,31 @@
+\begin{table}[htbp]
+\centering
+\caption{Runtime and peak memory on the Chapter~2 design.}
+\label{tab:eiger2_scaling}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrr}
+\toprule
+axis & method & n\_samples & n\_cpg & runtime\_seconds & peak\_memory\_mib \\
+\midrule
+cpgs & EIGER 1 & 24 & 2000 & 0.001 & 1.193 \\
+cpgs & EIGER 1 & 24 & 4000 & 0.002 & 2.322 \\
+cpgs & EIGER 1 & 24 & 8000 & 0.005 & 4.580 \\
+cpgs & EIGER 1 & 24 & 16000 & 0.009 & 9.097 \\
+cpgs & EIGER 2 & 24 & 2000 & 0.111 & 2.566 \\
+cpgs & EIGER 2 & 24 & 4000 & 0.179 & 5.055 \\
+cpgs & EIGER 2 & 24 & 8000 & 0.300 & 10.033 \\
+cpgs & EIGER 2 & 24 & 16000 & 0.574 & 19.990 \\
+samples & EIGER 1 & 8 & 4000 & 0.002 & 1.038 \\
+samples & EIGER 1 & 12 & 4000 & 0.002 & 1.224 \\
+samples & EIGER 1 & 24 & 4000 & 0.002 & 2.322 \\
+samples & EIGER 1 & 48 & 4000 & 0.003 & 4.519 \\
+samples & EIGER 1 & 96 & 4000 & 0.004 & 8.913 \\
+samples & EIGER 2 & 8 & 4000 & 0.149 & 2.088 \\
+samples & EIGER 2 & 12 & 4000 & 0.161 & 2.812 \\
+samples & EIGER 2 & 24 & 4000 & 0.174 & 5.055 \\
+samples & EIGER 2 & 48 & 4000 & 0.211 & 9.542 \\
+samples & EIGER 2 & 96 & 4000 & 0.276 & 18.515 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

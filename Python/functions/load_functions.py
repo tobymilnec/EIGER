@@ -9,6 +9,7 @@ import os.path as op
 import os
 import gzip
 import pathlib
+import warnings
 from pathlib import Path
 from dataclasses import dataclass
 from subprocess import call
@@ -16,6 +17,7 @@ from functools import partial
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 import typing
 from typing import (
     Literal
@@ -24,6 +26,307 @@ from typing import (
 Read = npt.NDArray
 MetFreqArr = npt.NDArray
 ListFiles = list[str|Path]
+
+
+def infer_methylation_file_type(files: ListFiles) -> Literal['beta', 'cov']:
+    """Infer one consistent input type from beta/lbeta or Bismark cov files."""
+    if not files:
+        raise ValueError("At least one methylation file is required")
+
+    detected = set()
+    for file_path in files:
+        name = str(file_path).lower()
+        if name.endswith(('.beta', '.lbeta')):
+            detected.add('beta')
+        elif name.endswith(('.cov', '.cov.gz')):
+            detected.add('cov')
+        else:
+            raise ValueError(
+                f"Cannot infer methylation input type from: {file_path}. "
+                "Expected .beta, .lbeta, .cov, or .cov.gz."
+            )
+
+    if len(detected) != 1:
+        raise ValueError(
+            "All methylation files in one EIGER run must have the same input type"
+        )
+    return detected.pop()
+
+
+def _normalise_chromosome(value) -> str:
+    chromosome = str(value).strip()
+    if chromosome.lower().startswith('chr'):
+        chromosome = chromosome[3:]
+    if chromosome.upper() in {'M', 'MT'}:
+        return 'MT'
+    return chromosome
+
+
+def _reference_chromosome_index(locations):
+    if locations.shape[1] < 2:
+        raise ValueError("The CpG location file must contain chromosome and position")
+
+    chromosomes = locations.iloc[:, 0].astype(str).to_numpy()
+    positions = locations.iloc[:, 1].to_numpy(dtype=np.int64, copy=False)
+    if len(positions) == 0:
+        raise ValueError("The CpG location file is empty")
+
+    boundaries = np.empty(len(chromosomes), dtype=bool)
+    boundaries[0] = True
+    boundaries[1:] = chromosomes[1:] != chromosomes[:-1]
+    starts = np.flatnonzero(boundaries)
+    ends = np.r_[starts[1:], len(chromosomes)]
+
+    reference = {}
+    for start, end in zip(starts, ends):
+        chromosome = _normalise_chromosome(chromosomes[start])
+        if chromosome in reference:
+            raise ValueError(
+                f"CpG locations for chromosome {chromosome!r} are not contiguous"
+            )
+        chromosome_positions = positions[start:end]
+        if np.any(chromosome_positions[1:] < chromosome_positions[:-1]):
+            raise ValueError(
+                f"CpG locations are not sorted within chromosome {chromosome!r}"
+            )
+        reference[chromosome] = (int(start), chromosome_positions)
+    return reference
+
+
+def _matching_reference_rows(chunk, reference, coordinate_offsets):
+    """Yield reference rows, trying strand-aware coordinate offsets in order."""
+    if isinstance(coordinate_offsets, int):
+        coordinate_offsets = (coordinate_offsets,)
+
+    for raw_chromosome, rows in chunk.groupby('chromosome', sort=False):
+        chromosome = _normalise_chromosome(raw_chromosome)
+        chromosome_reference = reference.get(chromosome)
+        if chromosome_reference is None:
+            continue
+
+        reference_start, reference_positions = chromosome_reference
+        source_indices = rows.index.to_numpy()
+        positions = rows['position'].to_numpy(dtype=np.int64, copy=False)
+        unmatched = np.ones(len(rows), dtype=bool)
+        for coordinate_offset in coordinate_offsets:
+            candidates = np.flatnonzero(unmatched)
+            if len(candidates) == 0:
+                break
+            query_positions = positions[candidates] + coordinate_offset
+            local_indices = np.searchsorted(reference_positions, query_positions)
+            in_bounds = local_indices < len(reference_positions)
+            matched = np.zeros(len(local_indices), dtype=bool)
+            matched[in_bounds] = (
+                reference_positions[local_indices[in_bounds]]
+                == query_positions[in_bounds]
+            )
+            if not np.any(matched):
+                continue
+            matched_candidates = candidates[matched]
+            yield (
+                source_indices[matched_candidates],
+                reference_start + local_indices[matched],
+            )
+            unmatched[matched_candidates] = False
+
+
+def _detect_cov_coordinate_offsets(chunk, reference) -> tuple[tuple[int, ...], str]:
+    scores = {}
+    coordinate_options = (
+        ((0, -1), 'one-based'),
+        ((1, 0), 'zero-based'),
+    )
+    for offsets, label in coordinate_options:
+        scores[(offsets, label)] = sum(
+            len(reference_rows)
+            for _, reference_rows in _matching_reference_rows(
+                chunk, reference, offsets
+            )
+        )
+    # Standard Bismark coverage is one-based, so it wins an exact tie.
+    return max(scores, key=lambda item: (scores[item], item[1] == 'one-based'))
+
+
+def load_bismark_coverage_betas(
+        files: ListFiles,
+        locations,
+        coordinate_system: Literal['auto', 'one-based', 'zero-based'] = 'auto',
+        chunk_size: int = 1_000_000,
+        minimum_match_rate: float = 0.5,
+        progress: bool = False,
+        return_total_counts: bool = False,
+):
+    """Load Bismark .cov/.cov.gz files against an EIGER CpG reference.
+
+    Coverage rows are streamed in chunks and aligned by chromosome and position.
+    The returned matrix has shape (CpG sites, samples), with unobserved sites as
+    NaN. Bismark methylated and unmethylated read counts are combined if more
+    than one row maps to the same CpG.
+    """
+    if not files:
+        raise ValueError("At least one Bismark coverage file is required")
+    if coordinate_system not in {'auto', 'one-based', 'zero-based'}:
+        raise ValueError(
+            "coordinate_system must be 'auto', 'one-based', or 'zero-based'"
+        )
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if not 0 <= minimum_match_rate <= 1:
+        raise ValueError("minimum_match_rate must be between 0 and 1")
+
+    reference = _reference_chromosome_index(locations)
+    betas = np.full(
+        (len(locations), len(files)),
+        np.nan,
+        dtype=float,
+    )
+    coverage = (
+        np.zeros((len(locations), len(files)), dtype=np.uint32)
+        if return_total_counts
+        else None
+    )
+    summaries = []
+    column_names = [
+        'chromosome',
+        'position',
+        'end',
+        'percent_methylated',
+        'methylated',
+        'unmethylated',
+    ]
+
+    for sample_index, file_path in enumerate(files):
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Coverage file not found: {file_path}")
+        if progress:
+            print(
+                f"  [{sample_index + 1}/{len(files)}] {file_path.name}",
+                flush=True,
+            )
+
+        methylated_counts = np.zeros(len(locations), dtype=np.uint32)
+        total_counts = np.zeros(len(locations), dtype=np.uint32)
+        total_rows = 0
+        matched_rows = 0
+        chosen_offsets = None
+        chosen_system = coordinate_system
+
+        try:
+            chunks = pd.read_csv(
+                file_path,
+                sep='\t',
+                header=None,
+                names=column_names,
+                usecols=[0, 1, 4, 5],
+                dtype={
+                    'chromosome': 'string',
+                    'position': np.int64,
+                    'methylated': np.float64,
+                    'unmethylated': np.float64,
+                },
+                comment='#',
+                chunksize=chunk_size,
+            )
+            for chunk in chunks:
+                if chunk.empty:
+                    continue
+                chunk.reset_index(drop=True, inplace=True)
+                if chosen_offsets is None:
+                    if coordinate_system == 'auto':
+                        chosen_offsets, chosen_system = (
+                            _detect_cov_coordinate_offsets(chunk, reference)
+                        )
+                    else:
+                        chosen_offsets = (
+                            (0, -1)
+                            if coordinate_system == 'one-based'
+                            else (1, 0)
+                        )
+
+                methylated = chunk['methylated'].to_numpy(dtype=float, copy=False)
+                unmethylated = chunk['unmethylated'].to_numpy(
+                    dtype=float, copy=False
+                )
+                if (
+                    np.any(~np.isfinite(methylated))
+                    or np.any(~np.isfinite(unmethylated))
+                    or np.any(methylated < 0)
+                    or np.any(unmethylated < 0)
+                    or np.any(methylated != np.floor(methylated))
+                    or np.any(unmethylated != np.floor(unmethylated))
+                ):
+                    raise ValueError(
+                        f"Coverage counts must be finite non-negative integers: "
+                        f"{file_path}"
+                    )
+                total = methylated + unmethylated
+                if np.any(total > np.iinfo(np.uint32).max):
+                    raise ValueError(f"Coverage count exceeds uint32: {file_path}")
+
+                total_rows += len(chunk)
+                for source_rows, reference_rows in _matching_reference_rows(
+                    chunk, reference, chosen_offsets
+                ):
+                    np.add.at(
+                        methylated_counts,
+                        reference_rows,
+                        methylated[source_rows].astype(np.uint32),
+                    )
+                    np.add.at(
+                        total_counts,
+                        reference_rows,
+                        total[source_rows].astype(np.uint32),
+                    )
+                    matched_rows += len(reference_rows)
+        except (OSError, pd.errors.ParserError, ValueError) as error:
+            raise ValueError(
+                f"Could not load Bismark coverage file {file_path}: {error}"
+            ) from error
+
+        if total_rows == 0:
+            raise ValueError(f"Coverage file is empty: {file_path}")
+        match_rate = matched_rows / total_rows
+        if match_rate < minimum_match_rate:
+            raise ValueError(
+                f"Only {match_rate:.1%} of rows in {file_path.name} matched the "
+                f"CpG reference (minimum {minimum_match_rate:.1%}). Check the "
+                "genome build and coordinate system."
+            )
+        if match_rate < 0.95:
+            warnings.warn(
+                f"{file_path.name}: {match_rate:.1%} of coverage rows matched "
+                "the CpG reference",
+                RuntimeWarning,
+            )
+
+        observed = total_counts > 0
+        betas[observed, sample_index] = (
+            methylated_counts[observed] / total_counts[observed]
+        )
+        if coverage is not None:
+            coverage[:, sample_index] = total_counts
+        summaries.append(
+            {
+                'file': str(file_path.resolve()),
+                'coordinate_system': chosen_system,
+                'rows': int(total_rows),
+                'matched_rows': int(matched_rows),
+                'match_rate': float(match_rate),
+                'observed_cpgs': int(np.count_nonzero(observed)),
+            }
+        )
+        if progress:
+            print(
+                f"      {match_rate:.1%} rows matched; "
+                f"{np.count_nonzero(observed):,} CpGs observed "
+                f"({chosen_system})",
+                flush=True,
+            )
+
+    if coverage is not None:
+        return betas, summaries, coverage
+    return betas, summaries
 
 def load_beta_frequencies(
         fn, slice_start:int=None, slice_end:int=None
@@ -47,15 +350,83 @@ def load_beta_frequencies(
                 i = 0
             f.seek(i * 2 * sizet)
             if j is None:
-                arr = np.fromfile(f, dtype=np.uint8)
+                arr = np.fromfile(f, dtype=dtype)
             else:
                 arr = np.fromfile(
                     f, dtype=dtype,
-                    count=((j - i) * 2 * sizet)
+                    count=((j - i) * 2)
                 )
     else:
-        arr = np.fromfile(fn, dtype=np.uint8)
+        arr = np.fromfile(fn, dtype=dtype)
     return arr.reshape((-1, 2))
+
+
+def beta_site_count(fn: str | Path) -> int:
+    """Return the number of CpG rows encoded in a beta or lbeta file."""
+    path = Path(fn)
+    if not path.is_file():
+        raise FileNotFoundError(f"Beta file not found: {path}")
+    bytes_per_site = 4 if path.name.lower().endswith('.lbeta') else 2
+    file_size = path.stat().st_size
+    if file_size % bytes_per_site:
+        raise ValueError(f"Invalid beta file size: {path}")
+    return file_size // bytes_per_site
+
+
+def load_beta_values(
+        files: ListFiles,
+        slice_start: int = 0,
+        slice_end: int | None = None,
+        dtype=np.float32,
+        return_total_counts: bool = False,
+):
+    """Load a CpG slice directly as a beta-value matrix.
+
+    This avoids constructing the much larger site-by-sample-by-count array used
+    by the legacy whole-genome loader.
+    """
+    if not files:
+        raise ValueError("At least one beta file is required")
+    total_sites = beta_site_count(files[0])
+    slice_end = total_sites if slice_end is None else int(slice_end)
+    slice_start = int(slice_start)
+    if not 0 <= slice_start <= slice_end <= total_sites:
+        raise ValueError("Invalid beta slice boundaries")
+
+    values = np.full(
+        (slice_end - slice_start, len(files)),
+        np.nan,
+        dtype=dtype,
+    )
+    coverage = (
+        np.zeros((slice_end - slice_start, len(files)), dtype=np.uint32)
+        if return_total_counts
+        else None
+    )
+    for sample_index, file_path in enumerate(files):
+        sample_sites = beta_site_count(file_path)
+        if sample_sites != total_sites:
+            raise ValueError(
+                f"Beta files have inconsistent CpG counts: {files[0]} has "
+                f"{total_sites:,}, but {file_path} has {sample_sites:,}"
+            )
+        counts = load_beta_frequencies(
+            file_path,
+            slice_start=slice_start,
+            slice_end=slice_end,
+        )
+        observed = counts[:, 1] > 0
+        if coverage is not None:
+            coverage[:, sample_index] = counts[:, 1]
+        np.divide(
+            counts[:, 0],
+            counts[:, 1],
+            out=values[:, sample_index],
+            where=observed,
+        )
+    if coverage is not None:
+        return values, coverage
+    return values
 
 
 def load_beta_frequencies_from_bed(
@@ -103,7 +474,9 @@ def load_methylation_frequencies(
         force_overwrite: If True, overwrite .beta files that exist in dotbeta_dir
         """
     if file_type == 'infer':
-        file_type = op.splitext(files[-1])
+        ext = op.splitext(str(files[-1]))[1].lstrip('.')
+        # .beta and .lbeta share the same loader
+        file_type = 'beta' if ext in ('beta', 'lbeta') else ext
     loaders = {
         'beta': load_beta_frequencies,
         'bed':partial(load_beta_frequencies_from_bed, bedgraph=False, *loadBedArgs, **loadBedKW, ),
@@ -128,10 +501,7 @@ def load_methylation_frequencies(
     return arr
 
 
-def _test_load_met_freq(fn = 'path/to/file.beta'):
-    # paff_data = Path('/home/jcthomas/data/deconv_test/')
-    # fn = paff_data / 'immune_P8100.dedup.sorted.beta'
-
+def _test_load_met_freq(fn='path/to/file.beta'):
     files = [fn] * 40
 
     bf = load_methylation_frequencies(files)
@@ -175,5 +545,3 @@ class Methylation:
     def from_bedfiles(cls, files, dotbeta_outdir):
         freq = load_methylation_frequencies(files, bed=True, dotbeta_outdir=dotbeta_outdir)
         return cls.from_freq_array(freq, files)
-
-

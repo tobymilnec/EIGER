@@ -1,0 +1,283 @@
+# Quickstart
+
+Five minutes from a clean machine to a called region set.
+
+---
+
+## 1. Install
+
+### Recommended: conda for the dependencies, pip for the package
+
+`environment.yml` pins every dependency, including the ones only the legacy
+caller needs. Create the environment first, then install EIGER into it. The
+`pip install -e .` step adds no new dependencies — everything is already
+present — it only registers the package and the `eiger2` command.
+
+```bash
+git clone https://github.com/<user>/EIGER.git
+cd EIGER
+
+conda env create -f environment.yml     # or: mamba env create -f environment.yml
+conda activate eiger
+
+pip install -e . --no-deps              # --no-deps: conda already supplied them
+```
+
+Check it:
+
+```bash
+eiger2 --version
+python -c "import eiger2; print(eiger2.__version__)"
+pytest -q                               # 75 tests, ~4 s
+```
+
+### Alternative: pip only
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[legacy,dev]"
+```
+
+`.[legacy]` adds `numba` and `scikit-learn`, which **only the `--legacy` caller
+needs**. The revised caller depends on `numpy`, `pandas` and `scipy` alone, so
+`pip install -e .` is sufficient if you do not need to run the original method.
+
+### Without installing at all
+
+Everything works from `Python/` without installation:
+
+```bash
+cd Python
+python -m eiger2.cli call --betas ... --locations ... --out ...
+```
+
+The only thing you lose is the short `eiger2` command.
+
+---
+
+## 2. Make some example data
+
+```bash
+python examples/make_example_data.py
+```
+
+Writes `examples/data/`: a 5,000 CpG × 24 sample matrix across two chromosomes,
+with spatially autocorrelated background, two latent nuisance factors, read
+depth 15, 5% missing observations, and 20 planted regions spanning a grid of
+effect sizes and prevalences. `truth.tsv` records what was planted.
+
+---
+
+## 3. Run it
+
+```bash
+# the revised caller
+eiger2 call --betas examples/data/betas.tsv \
+            --locations examples/data/cpgs.bed \
+            --out examples/out_eiger2
+
+# the method as originally published
+eiger2 call --betas examples/data/betas.tsv \
+            --locations examples/data/cpgs.bed \
+            --out examples/out_legacy --legacy
+
+# both, with an overlap summary
+eiger2 compare --betas examples/data/betas.tsv \
+               --locations examples/data/cpgs.bed \
+               --out examples/out_compare
+```
+
+Expected output for the first command:
+
+```
+[eiger2] caller     : eiger2
+[eiger2] regions    : 40
+[eiger2] significant: 40 at q <= 0.05
+[eiger2] written to : examples/out_eiger2
+```
+
+---
+
+## 4. Inputs
+
+There are two ways to supply data. Both accept TSV (default), CSV (`.csv`) and
+gzip (`.gz`).
+
+### One file: coordinates and samples together (recommended)
+
+The methrix / bsseq layout. Leading columns are coordinates, every other column
+is a sample:
+
+```
+chr      start     strand   Sample1   Sample2   Sample3
+chr1     10469     +        0.812     0.774     NA
+chr1     10471     +        0.795     0.801     0.788
+```
+
+```bash
+eiger2 call --matrix methrix_betas.tsv --out results/
+```
+
+Recognised coordinate columns, in any case: `chr` / `chrom` / `chromosome` /
+`seqnames`; `start` / `pos` / `position`; optionally `end` / `stop`; and
+`strand`, `cpg_index`, `index`, which are read and discarded. **Every remaining
+column is treated as a sample**, so remove any annotation columns first. Where
+no end coordinate is given each CpG becomes a one-base interval.
+
+### Two files: matrix and coordinates separately
+
+```bash
+eiger2 call --betas betas.tsv --locations cpgs.bed --out results/
+```
+
+`--locations` accepts named columns as above, or a **headerless three-column
+BED** with `--locations-no-header`. Both the `chr start end` and the wgbstools
+`chr position CpG_index` layouts are handled; a CpG index is detected by being
+smaller than the position it would otherwise end, and is discarded.
+
+```bash
+# wgbstools CpG.bed.gz, which has no header row
+eiger2 call --betas betas.tsv --locations CpG.bed.gz --locations-no-header \
+            --out results/
+```
+
+### Requirements common to both
+
+- Methylation as **proportions in [0, 1]**, not percentages.
+- Missing values as empty fields, `NA` or `NaN`.
+- Rows sorted by chromosome then position, and the matrix in the same order.
+
+The CLI checks the row counts, the value range and the sort order, and refuses
+with an explanatory message rather than producing wrong output.
+
+### Targeted panels and other sparse assays
+
+**Supply only the CpGs you have.** EIGER does not need, and should not be given,
+a whole-genome scaffold padded with missing rows. Segmentation runs along row
+order and `--max-cpg-gap-bp` breaks a region wherever consecutive coordinates
+jump further apart than that, so untargeted stretches of genome are handled by
+their absence. Padding to the whole genome multiplies the work with rows that
+cannot contribute an edge.
+
+Two settings matter on panel data:
+
+```bash
+# drop CpGs observed in under half the samples, and set the gap that separates
+# one target interval from the next to about twice your within-target spacing
+eiger2 call --matrix panel.tsv --out results/ \
+    --min-sample-fraction 0.5 \
+    --max-cpg-gap-bp 500
+```
+
+`--min-sample-fraction` is both a speed and a correctness control. On a
+panel-like matrix it cut runtime 3.3-fold *and raised the number of regions
+found from 8 to 80*, because sparsely covered CpGs sit between well-covered ones
+and fragment genuine regions below `--min-cpgs`. Nothing is imputed where
+nothing was measured: dropped CpGs are removed before either caller runs, and
+region coordinates are reported against the original input rows.
+
+### Other formats
+
+`.beta` / `.lbeta` and Bismark `.cov` / `.cov.gz` conversion lives in
+`eiger2.io` (`build_cpg_reference`, `convert_cov_files`, `load_matrix`). A
+first-class `--cov` loader that builds the matrix directly from per-sample
+coverage files is not yet wired into the CLI.
+
+---
+
+## 5. Outputs
+
+| File | Contents |
+|---|---|
+| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue`, `significant`, and `*_descriptive` characterisation fields |
+| `region_sample_means.csv` | per-region mean methylation for each sample |
+| `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, and the realised null diagnostics |
+
+**`region_qvalue` is the only field that expresses confidence that a region is
+real.** Every `*_descriptive` field — delta beta, direction, the inferred sample
+split — is computed *after* the region was selected, on the same data, and is
+for reading rather than filtering.
+
+In `--legacy` mode `region_qvalue` is `NA` by construction: the published method
+defines no false discovery rate. That is the point of the comparison.
+
+---
+
+## 6. Options worth knowing
+
+```bash
+--null-mode lag|permutation          # see below; use permutation above ~100 samples
+--min-prevalence-samples 3           # a region must be carried by >= 3 samples
+--fdr-replicates 50                  # legacy only: attach a permutation q-value
+--statistic correlation|covariance   # default correlation; see README
+--window 4                           # CpGs per window; use 1 above ~30 samples
+--min-cpgs 4                         # minimum region length
+--null-replicates 20                 # raise to 100-300 for --compute-posterior
+--target-fdr 0.05
+--compute-posterior                  # per-region evidence SCORE, not a probability
+```
+
+### Choosing a null: `--null-mode`
+
+`lag` (default) pairs CpGs far apart on the same chromosome and asks *is there
+any regional coordination here?* That is informative at modest cohort sizes and
+becomes trivially false as the cohort grows: with several hundred samples the
+edge statistic is precise, genuine coordination exists across most of the
+genome, and every region clears a threshold set from a near-zero null. On a
+519-sample cohort all 73,784 regions received q = 0 — arithmetically correct and
+useless.
+
+`permutation` keeps that threshold, so which *edges* count as elevated is
+unchanged, but calibrates region **area** against tracks in which the observed
+statistic has been permuted within each chromosome. The same elevated edges are
+present, scattered at random, so the question becomes *is this run longer or
+stronger than chance, given how much coordination the genome contains?* The null
+shares the data's own marginal and therefore cannot saturate. On a 120-sample
+simulation it produced roughly 200 times as many null regions as the lag null,
+with a 35-fold larger maximum area.
+
+Both are sign-agnostic: hypo- and hypermethylated regions produce the same
+positive adjacent correlation, and direction is recovered afterwards from delta
+beta.
+
+### A prevalence floor: `--min-prevalence-samples`
+
+A single aberrant sample deviating across a run of CpGs produces genuine
+coordination, so it forms a region and no null will reject it. It is simply not
+a differentially methylated *region* in the usual sense. On the 519-sample ICGC
+cohort, 95% of otherwise unclassifiable regions were driven by one or two
+samples.
+
+This is a biological criterion, not a statistical one, so it is applied after
+calibration and reported separately: `region_qvalue` stays calibrated on the
+unfiltered set, `minority_size_descriptive` records how many samples carry the
+deviation, and `significant` requires both. It is exactly analogous to requiring
+a fold-change floor alongside a p-value.
+
+### A q-value for the published method: `--fdr-replicates`
+
+`eiger2 call --legacy --fdr-replicates 50` attaches a region-level empirical FDR
+to the originally published caller by permuting **its own** covariance track and
+segmenting the result identically. Discovery is untouched: the regions are
+exactly those the published method reports and the q-value is an annotation on
+them. This is available as `eiger2.core.qvalues_from_track` for any caller that
+can supply a per-edge statistic, its regions and its threshold.
+
+Two warnings are emitted to the console and recorded in the manifest when they
+apply:
+
+- **thin null** — fewer than 1,000 usable null positions, or more than 75% of
+  offered positions discarded by the chromosome-aware mask. The threshold and
+  every q-value derived from it are then unreliable. Lower `--null-min-lag`,
+  raise `--null-replicates`, or call chromosomes separately.
+- **high missingness** — the realised false discovery rate is not calibrated at
+  25% dropout; see the limitations section of the README.
+
+---
+
+## 7. Reproducibility
+
+Every run writes `run_manifest.json` containing the exact resolved
+configuration, SHA-256 prefixes of both input files, package versions and
+platform. Results are deterministic given `--random-seed`. Quote the manifest
+when reporting a result.

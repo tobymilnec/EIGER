@@ -1,0 +1,50 @@
+{
+  "timestamp_utc": "2026-08-02T23:34:02.936054+00:00",
+  "command": "calibration",
+  "arguments": {
+    "command": "calibration",
+    "out_dir": "benchmark_v2",
+    "seeds": 10,
+    "scaling_seeds": 3,
+    "scenarios": [
+      "clean",
+      "nuisance",
+      "missingness",
+      "small_n",
+      "high_noise"
+    ],
+    "statistic": "correlation",
+    "null_replicates": 200
+  },
+  "python": "3.9.23",
+  "numpy": "1.26.4",
+  "pandas": "2.3.1",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "default_config": {
+    "statistic": "correlation",
+    "window": 4,
+    "deflate_components": null,
+    "deflation_thin": 50,
+    "deflation_max_concentration": 0.1,
+    "deflation_concentration_quantile": 0.01,
+    "deflation_max_components": 20,
+    "parallel_analysis_replicates": 5,
+    "parallel_analysis_quantile": 0.99,
+    "deflation_missing": "exact",
+    "null_replicates": 20,
+    "null_quantile": 0.995,
+    "null_min_lag": 1000,
+    "null_stride": 1,
+    "min_cpgs": 4,
+    "max_gap_edges": 0,
+    "min_paired_samples": 5,
+    "min_paired_fraction": 0.0,
+    "max_cpg_gap_bp": 300,
+    "min_observed_samples": 2,
+    "length_stratified_fdr": true,
+    "target_fdr": 0.05,
+    "random_seed": 1,
+    "compute_posterior": false,
+    "min_null_regions_for_posterior": 50
+  }
+}

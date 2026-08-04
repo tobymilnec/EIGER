@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "EIGER: label-free discovery of regionally coordinated DNA methylation"
+abstract: >-
+  EIGER identifies differentially methylated regions without requiring
+  predefined sample groups, by segmenting the genome into blocks in which
+  neighbouring CpGs co-vary across samples. Version 2 adds pairwise-complete
+  estimation, a scale-free discovery statistic, a locality-breaking null and a
+  region-level empirical false discovery rate. The originally published caller
+  is retained and runnable via --legacy.
+type: software
+authors:
+  - family-names: Milne-Clark
+    given-names: Toby
+version: "2.0.0"
+license: MIT
+repository-code: "https://github.com/tobymilnec/EIGER"
+keywords:
+  - DNA methylation
+  - differentially methylated regions
+  - whole-genome bisulfite sequencing
+  - false discovery rate
+  - unsupervised

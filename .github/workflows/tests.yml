@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[legacy,dev]"
+      - name: Lint
+        run: ruff check Python/eiger2 || true
+      - name: Test the shipped package
+        run: pytest tests -q
+      - name: Test the superseded beta
+        run: pytest old_code/tests -q
+      - name: End-to-end smoke test
+        run: |
+          python examples/make_example_data.py
+          eiger2 call --betas examples/data/betas.tsv \
+                      --locations examples/data/cpgs.bed --out /tmp/e2
+          eiger2 call --betas examples/data/betas.tsv \
+                      --locations examples/data/cpgs.bed --out /tmp/lg --legacy
+          test -s /tmp/e2/regions.csv
+          test -s /tmp/lg/regions.csv

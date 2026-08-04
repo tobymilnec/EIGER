@@ -21,7 +21,13 @@ import scipy.sparse
 
 @jit(nopython=True)
 def _cov2(x, y):
-    """Compute sample covariance (ddof=1) between two 1-D arrays."""
+    """Compute sample covariance (ddof=1) between two 1-D arrays.
+
+    Complete-case only. If either array contains a NaN, ``np.mean`` returns NaN
+    and the result is NaN. This is the published EIGER behaviour and is kept as
+    the default so existing results reproduce exactly. Use :func:`_cov2_pairwise`
+    for missing-data-aware estimation.
+    """
     n = len(x)
     mx = np.mean(x)
     my = np.mean(y)
@@ -29,30 +35,177 @@ def _cov2(x, y):
 
 
 @jit(nopython=True)
-def _corr2(x, y):
-    """Compute Pearson correlation between two 1-D arrays."""
-    cov = _cov2(x, y)
-    sx = np.std(x)
-    sy = np.std(y)
-    if sx == 0.0 or sy == 0.0:
-        return 0.0
-    return cov / (sx * sy)
+def _cov2_pairwise(x, y, min_paired_samples=5):
+    """Pairwise-complete sample covariance (ddof=1) between two 1-D arrays.
+
+    Uses only the samples observed at *both* CpGs, and takes the means over that
+    same co-observed set:
+
+        S = {i : x_i and y_i are both observed},   m = |S|
+        cov = sum_{i in S} (x_i - mean_S(x)) * (y_i - mean_S(y)) / (m - 1)
+
+    Two properties matter.
+
+    1. It is unbiased at every missing rate. Mean-imputation gives a missing
+       sample a residual of exactly zero, so it contributes nothing to the
+       cross-product while still counting in the denominator; the estimate is
+       deflated by (1 - m)^2. Dropping the sample removes it from both.
+    2. The means must be recomputed over S. Using the all-sample means would
+       leave a first-order bias, because the co-observed subset is not centred
+       at the full-sample mean when missingness is related to methylation.
+
+    Returns NaN when fewer than ``min_paired_samples`` samples are co-observed,
+    which keeps very low-confidence edges out of the statistic rather than
+    letting them contribute noise.
+    """
+    n_paired = 0
+    sum_x = 0.0
+    sum_y = 0.0
+    for i in range(len(x)):
+        if np.isfinite(x[i]) and np.isfinite(y[i]):
+            n_paired += 1
+            sum_x += x[i]
+            sum_y += y[i]
+    if n_paired < min_paired_samples or n_paired < 2:
+        return np.nan
+    mx = sum_x / n_paired
+    my = sum_y / n_paired
+    total = 0.0
+    for i in range(len(x)):
+        if np.isfinite(x[i]) and np.isfinite(y[i]):
+            total += (x[i] - mx) * (y[i] - my)
+    return total / (n_paired - 1)
 
 
 @jit(nopython=True)
-def covariance_blocks(chr_arr):
+def _corr2(x, y):
+    """Compute Pearson correlation between two 1-D arrays."""
+    mx = np.mean(x)
+    my = np.mean(y)
+    xm = x - mx
+    ym = y - my
+    # normalise consistently; reusing _cov2 (ddof=1) against np.std (ddof=0)
+    # mismatches the normalisation and lets |r| exceed 1.
+    denom = np.sqrt(np.sum(xm * xm) * np.sum(ym * ym))
+    if denom == 0.0:
+        return 0.0
+    return np.sum(xm * ym) / denom
+
+
+@jit(nopython=True)
+def _covariance_blocks_complete(chr_arr):
+    M = len(chr_arr) - 1
+    out = np.empty(M, dtype=np.float64)
+    for j in range(M):
+        out[j] = _cov2(chr_arr[j, :], chr_arr[j + 1, :])
+    return out
+
+
+@jit(nopython=True)
+def _covariance_blocks_pairwise(chr_arr, min_paired_samples):
+    M = len(chr_arr) - 1
+    out = np.empty(M, dtype=np.float64)
+    for j in range(M):
+        out[j] = _cov2_pairwise(
+            chr_arr[j, :], chr_arr[j + 1, :], min_paired_samples
+        )
+    return out
+
+
+def covariance_blocks(chr_arr, pairwise=False, min_paired_samples=5):
     """
     Calculate the covariance between consecutive rows of a 2D array.
 
     Parameters:
-    chr_arr (numpy.ndarray): The input 2D array.
+    chr_arr (numpy.ndarray): The input 2D array (CpGs by samples).
+    pairwise (bool): ``False`` (default) reproduces the published EIGER
+        behaviour exactly — complete-case covariance, in which any NaN in either
+        CpG makes that edge NaN and therefore breaks the region. ``True`` uses
+        pairwise-complete covariance, which is unbiased at every missing rate.
+    min_paired_samples (int): Only used when ``pairwise=True``. Edges with fewer
+        co-observed samples than this return NaN.
 
     Returns:
-    list: A list of covariances between consecutive rows of the input array.
+    numpy.ndarray: Covariances between consecutive rows.
+
+    The default is deliberately the old behaviour. Runs supporting the published
+    manuscript should keep ``pairwise=False``; new analyses should set
+    ``pairwise=True`` unless the beta matrix is fully observed, in which case the
+    two are numerically identical.
     """
-    M = len(chr_arr) - 1
-    covariance = [_cov2(chr_arr[j, :], chr_arr[j + 1, :]) for j in range(M)]
-    return covariance
+    array = np.asarray(chr_arr)
+    if not np.issubdtype(array.dtype, np.floating):
+        array = array.astype(np.float64)
+    if pairwise:
+        return _covariance_blocks_pairwise(array, int(min_paired_samples))
+    return _covariance_blocks_complete(array)
+
+
+@jit(nopython=True)
+def covariance_standard_errors(chr_arr):
+    """Approximate standard errors for adjacent sample covariances.
+
+    The covariance definition is deliberately identical to :func:`_cov2`.
+    Standard errors are estimated from the between-sample variability of the
+    centred cross-products and are used only to quantify uncertainty around
+    EIGER's existing covariance threshold.
+    """
+    n_rows, n_samples = chr_arr.shape
+    out = np.empty(max(n_rows - 1, 0), dtype=np.float64)
+    if n_samples < 2:
+        out[:] = np.inf
+        return out
+    correction = n_samples / (n_samples - 1.0)
+    for row in range(n_rows - 1):
+        x = chr_arr[row, :]
+        y = chr_arr[row + 1, :]
+        mx = np.mean(x)
+        my = np.mean(y)
+        mean_product = 0.0
+        for sample in range(n_samples):
+            mean_product += (x[sample] - mx) * (y[sample] - my)
+        mean_product /= n_samples
+        product_ss = 0.0
+        for sample in range(n_samples):
+            product = (x[sample] - mx) * (y[sample] - my)
+            product_ss += (product - mean_product) ** 2
+        product_variance = product_ss / (n_samples - 1.0)
+        out[row] = correction * np.sqrt(product_variance / n_samples)
+    return out
+
+
+@jit(nopython=True)
+def covariance_standard_errors_with_measurement(chr_arr, measurement_variance):
+    """Adjacent covariance SEs including per-beta sequencing uncertainty."""
+    n_rows, n_samples = chr_arr.shape
+    out = np.empty(max(n_rows - 1, 0), dtype=np.float64)
+    if n_samples < 2:
+        out[:] = np.inf
+        return out
+    correction = n_samples / (n_samples - 1.0)
+    for row in range(n_rows - 1):
+        x = chr_arr[row, :]
+        y = chr_arr[row + 1, :]
+        mx = np.mean(x)
+        my = np.mean(y)
+        mean_product = 0.0
+        for sample in range(n_samples):
+            mean_product += (x[sample] - mx) * (y[sample] - my)
+        mean_product /= n_samples
+        product_ss = 0.0
+        measurement_component = 0.0
+        for sample in range(n_samples):
+            xc = x[sample] - mx
+            yc = y[sample] - my
+            product = xc * yc
+            product_ss += (product - mean_product) ** 2
+            vx = measurement_variance[row, sample]
+            vy = measurement_variance[row + 1, sample]
+            measurement_component += yc * yc * vx + xc * xc * vy + vx * vy
+        product_variance = product_ss / (n_samples - 1.0)
+        product_variance += measurement_component / n_samples
+        out[row] = correction * np.sqrt(product_variance / n_samples)
+    return out
 
 
 @jit(nopython=True)
@@ -76,9 +229,12 @@ def contiguous_regions(condition):
     """Finds contiguous True regions of the boolean array "condition". Returns
     a 2D array where the first column is the start index of the region and the
     second column is the end index."""
-    # Find the indicies of changes in "condition"
-    d = np.diff(condition,n=1, axis=0)
-    idx, _ = d.nonzero() 
+    condition = np.asarray(condition, dtype=bool).reshape(-1)
+    if condition.size == 0:
+        return np.empty((0, 2), dtype=int)
+    # Find the indices of changes in "condition"
+    d = np.diff(condition, n=1, axis=0)
+    idx = np.flatnonzero(d)
     # We need to start things after the change in "condition". Therefore,
     # we'll shift the index by 1 to the right.
     # Copy idx to a mutable array before incrementing (np.diff output is read-only).
@@ -113,16 +269,19 @@ def extract_blocks(arr, DMR_length_threshold=5, cov_threshold=0.1):
         An array containing the start and stop indices of the extracted blocks.
 
     """
-    match_bools = np.array(arr).reshape((-1, 1)) >= cov_threshold
+    if DMR_length_threshold < 2:
+        raise ValueError("DMR_length_threshold must be at least 2 CpGs")
+    match_bools = np.asarray(arr, dtype=float) >= cov_threshold
     out = np.empty((0), int)
     for start, stop in contiguous_regions(match_bools):
-        if (stop - start >= DMR_length_threshold):
+        # A run of E adjacent passing covariance values spans E + 1 CpGs.
+        if stop - start + 1 >= DMR_length_threshold:
             out = np.append(out, [start, stop])
     out.shape = (-1, 2)
     return out
 
 
-# Correction functions (unchanged)
+### rare-group prevalence corrections
 def f_rare_gaussian(p_obs, p_target, sigma):
     return np.exp(-((p_obs - p_target) ** 2) / (2 * sigma ** 2))
 
@@ -392,10 +551,21 @@ def find_separators(df, region, meta,
     return result
 
 def fdr(p_vals):
-    ranked_p_values = stats.rankdata(p_vals)
-    fdr = p_vals * len(p_vals) / ranked_p_values
-    fdr[fdr > 1] = 1
-    return fdr
+    """Monotone Benjamini-Hochberg adjustment with NaN preservation."""
+    values = np.asarray(p_vals, dtype=float)
+    adjusted = np.full(values.shape, np.nan, dtype=float)
+    valid = np.isfinite(values)
+    if not np.any(valid):
+        return adjusted
+    p = np.clip(values[valid], 0.0, 1.0)
+    order = np.argsort(p, kind="mergesort")
+    ranked = p[order]
+    raw = ranked * len(ranked) / np.arange(1, len(ranked) + 1)
+    monotone = np.minimum.accumulate(raw[::-1])[::-1]
+    restored = np.empty_like(monotone)
+    restored[order] = np.clip(monotone, 0.0, 1.0)
+    adjusted[valid] = restored
+    return adjusted
 
 def expand_averages_column(df, averages_column='averages', sample_names=None):
     """
@@ -448,11 +618,24 @@ def compute_laplacian_score(X, neighbor_size=5):
       laplacian_scores : array of shape (n_features,)
           The Laplacian Score for each feature.
     """
+    X = np.asarray(X, dtype=float)
     n_samples, n_features = X.shape
+    if n_features == 0:
+        return np.empty(0, dtype=float)
+    if n_samples < 2:
+        return np.zeros(n_features, dtype=float)
+    neighbor_size = max(1, min(int(neighbor_size), n_samples - 1))
 
     # Construct the k-nearest neighbor graph.
     # Note: kneighbors_graph returns a sparse matrix (n_samples x n_samples).
-    S = kneighbors_graph(X, neighbor_size + 1, mode='distance', metric='euclidean')
+    S = kneighbors_graph(
+        X,
+        neighbor_size,
+        mode='connectivity',
+        metric='euclidean',
+        include_self=False,
+    )
+    S = (S + S.T) * 0.5
 
     # Compute the degree matrix D (as a sparse diagonal matrix)
     # S.sum(axis=1) returns a (n_samples x 1) matrix.
@@ -470,7 +653,10 @@ def compute_laplacian_score(X, neighbor_size=5):
     # Use a ones vector (n_samples x 1) rather than an (n_samples x n_features) ones matrix.
     ones = np.ones((n_samples, 1))
     # weighted_mean: shape (1, n_features)
-    weighted_mean = (ones.T @ D_dense @ X) / (ones.T @ D_dense @ ones)
+    degree_sum = ones.T @ D_dense @ ones
+    if float(degree_sum[0, 0]) == 0.0:
+        return np.zeros(n_features, dtype=float)
+    weighted_mean = (ones.T @ D_dense @ X) / degree_sum
 
     # Center each feature by subtracting its weighted mean.
     # Broadcasting: weighted_mean (1 x n_features) is subtracted from X (n_samples x n_features)

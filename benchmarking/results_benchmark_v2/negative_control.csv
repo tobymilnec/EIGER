@@ -1,0 +1,251 @@
+scenario,seed,method,n_cpg,n_samples,false_regions,false_regions_per_10k_cpg,false_calls_per_mb,any_call,megabases,candidate_regions,threshold,n_latent_removed
+clean,0,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,0,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,0,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,0,EIGER 2 correlation,20000,80,3,1.5,75.0,True,0.04,3.0,0.11871438421707367,0.0
+clean,0,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,3.0,0.00019141512119241551,0.0
+clean,1,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,1,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,1,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,1,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.11905986037422565,0.0
+clean,1,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,1.0,0.0001892540864403973,0.0
+clean,2,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,2,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,2,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,2,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.11809404425179995,0.0
+clean,2,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,2.0,0.0001891027510887598,0.0
+clean,3,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,3,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,3,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,3,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,3.0,0.1184849585840694,0.0
+clean,3,EIGER 2 covariance,20000,80,3,1.5,75.0,True,0.04,3.0,0.0001911510181354779,0.0
+clean,4,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,4,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,4,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,4,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.11832706960855831,0.0
+clean,4,EIGER 2 covariance,20000,80,2,1.0,50.0,True,0.04,2.0,0.00018999270218461874,0.0
+clean,5,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,5,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,5,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,5,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.11903935720601598,1.0
+clean,5,EIGER 2 covariance,20000,80,1,0.5,25.0,True,0.04,1.0,0.00018912156811752193,1.0
+clean,6,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,6,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,6,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,6,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,0.0,0.11795127176427753,0.0
+clean,6,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,0.0,0.00018974824383605847,0.0
+clean,7,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,7,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,7,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,7,EIGER 2 correlation,20000,80,4,2.0,100.0,True,0.04,4.0,0.11751503655781942,0.0
+clean,7,EIGER 2 covariance,20000,80,4,2.0,100.0,True,0.04,4.0,0.0001892382903923296,0.0
+clean,8,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,8,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,8,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,8,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.11935803637329251,1.0
+clean,8,EIGER 2 covariance,20000,80,4,2.0,100.0,True,0.04,4.0,0.00018949368077354878,1.0
+clean,9,EIGER 1 @ 0.002,20000,80,0,0.0,0.0,False,0.04,,,
+clean,9,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+clean,9,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+clean,9,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.11845652372788454,1.0
+clean,9,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,3.0,0.00018744402816700355,1.0
+nuisance,0,EIGER 1 @ 0.002,20000,80,68,34.0,1700.0,True,0.04,,,
+nuisance,0,EIGER 1 @ 0.004,20000,80,23,11.5,575.0,True,0.04,,,
+nuisance,0,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,0,EIGER 2 correlation,20000,80,1,0.5,25.0,True,0.04,1.0,0.12067229102172045,2.0
+nuisance,0,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,1.0,0.00019022167908877967,2.0
+nuisance,1,EIGER 1 @ 0.002,20000,80,79,39.5,1975.0,True,0.04,,,
+nuisance,1,EIGER 1 @ 0.004,20000,80,22,11.0,550.0,True,0.04,,,
+nuisance,1,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,1,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.12055373657863326,2.0
+nuisance,1,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,1.0,0.00018854317866874375,2.0
+nuisance,2,EIGER 1 @ 0.002,20000,80,39,19.5,975.0,True,0.04,,,
+nuisance,2,EIGER 1 @ 0.004,20000,80,7,3.5,175.0,True,0.04,,,
+nuisance,2,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,2,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,1.0,0.11897728442762749,2.0
+nuisance,2,EIGER 2 covariance,20000,80,1,0.5,25.0,True,0.04,3.0,0.00018703838299800199,2.0
+nuisance,3,EIGER 1 @ 0.002,20000,80,64,32.0,1600.0,True,0.04,,,
+nuisance,3,EIGER 1 @ 0.004,20000,80,9,4.5,225.0,True,0.04,,,
+nuisance,3,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,3,EIGER 2 correlation,20000,80,1,0.5,25.0,True,0.04,3.0,0.120307808545784,2.0
+nuisance,3,EIGER 2 covariance,20000,80,3,1.5,75.0,True,0.04,3.0,0.00018990733848546224,2.0
+nuisance,4,EIGER 1 @ 0.002,20000,80,50,25.0,1250.0,True,0.04,,,
+nuisance,4,EIGER 1 @ 0.004,20000,80,3,1.5,75.0,True,0.04,,,
+nuisance,4,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,4,EIGER 2 correlation,20000,80,4,2.0,100.0,True,0.04,4.0,0.11930016038081478,2.0
+nuisance,4,EIGER 2 covariance,20000,80,2,1.0,50.0,True,0.04,2.0,0.00018836145317127203,2.0
+nuisance,5,EIGER 1 @ 0.002,20000,80,63,31.5,1575.0,True,0.04,,,
+nuisance,5,EIGER 1 @ 0.004,20000,80,13,6.5,325.0,True,0.04,,,
+nuisance,5,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,5,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,0.0,0.11915803141964691,2.0
+nuisance,5,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,0.0,0.00018801584412962965,2.0
+nuisance,6,EIGER 1 @ 0.002,20000,80,66,33.0,1650.0,True,0.04,,,
+nuisance,6,EIGER 1 @ 0.004,20000,80,13,6.5,325.0,True,0.04,,,
+nuisance,6,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,6,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,0.0,0.1186342688110944,2.0
+nuisance,6,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,0.0,0.00018699242259049526,2.0
+nuisance,7,EIGER 1 @ 0.002,20000,80,62,31.0,1550.0,True,0.04,,,
+nuisance,7,EIGER 1 @ 0.004,20000,80,11,5.5,275.0,True,0.04,,,
+nuisance,7,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,7,EIGER 2 correlation,20000,80,3,1.5,75.0,True,0.04,3.0,0.11921425807325414,2.0
+nuisance,7,EIGER 2 covariance,20000,80,5,2.5,125.0,True,0.04,5.0,0.00018829798158757525,2.0
+nuisance,8,EIGER 1 @ 0.002,20000,80,75,37.5,1875.0,True,0.04,,,
+nuisance,8,EIGER 1 @ 0.004,20000,80,18,9.0,450.0,True,0.04,,,
+nuisance,8,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+nuisance,8,EIGER 2 correlation,20000,80,1,0.5,25.0,True,0.04,1.0,0.12019548304590308,2.0
+nuisance,8,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,2.0,0.00019129933487741933,2.0
+nuisance,9,EIGER 1 @ 0.002,20000,80,104,52.0,2600.0,True,0.04,,,
+nuisance,9,EIGER 1 @ 0.004,20000,80,23,11.5,575.0,True,0.04,,,
+nuisance,9,EIGER 1 @ 0.012,20000,80,1,0.5,25.0,True,0.04,,,
+nuisance,9,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.1181298833815641,2.0
+nuisance,9,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,3.0,0.00018621199242431678,2.0
+missingness,0,EIGER 1 @ 0.002,20000,80,28,14.0,700.0,True,0.04,,,
+missingness,0,EIGER 1 @ 0.004,20000,80,4,2.0,100.0,True,0.04,,,
+missingness,0,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,0,EIGER 2 correlation,20000,80,52,26.0,1300.0,True,0.04,52.0,0.4916378725978883,1.0
+missingness,0,EIGER 2 covariance,20000,80,16,8.0,400.0,True,0.04,16.0,0.004088080702999294,1.0
+missingness,1,EIGER 1 @ 0.002,20000,80,18,9.0,450.0,True,0.04,,,
+missingness,1,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,1,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,1,EIGER 2 correlation,20000,80,53,26.5,1325.0,True,0.04,53.0,0.5677046551469995,1.0
+missingness,1,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,14.0,0.006561469208776749,1.0
+missingness,2,EIGER 1 @ 0.002,20000,80,5,2.5,125.0,True,0.04,,,
+missingness,2,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,2,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,2,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.16910987715415005,2.0
+missingness,2,EIGER 2 covariance,20000,80,6,3.0,150.0,True,0.04,6.0,0.00026812484746633117,2.0
+missingness,3,EIGER 1 @ 0.002,20000,80,11,5.5,275.0,True,0.04,,,
+missingness,3,EIGER 1 @ 0.004,20000,80,2,1.0,50.0,True,0.04,,,
+missingness,3,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,3,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,2.0,0.16886322521307184,2.0
+missingness,3,EIGER 2 covariance,20000,80,0,0.0,0.0,False,0.04,1.0,0.0002709736908710429,2.0
+missingness,4,EIGER 1 @ 0.002,20000,80,7,3.5,175.0,True,0.04,,,
+missingness,4,EIGER 1 @ 0.004,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,4,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,4,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.17070626989165819,2.0
+missingness,4,EIGER 2 covariance,20000,80,3,1.5,75.0,True,0.04,3.0,0.0002710704777224868,2.0
+missingness,5,EIGER 1 @ 0.002,20000,80,14,7.0,350.0,True,0.04,,,
+missingness,5,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,5,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,5,EIGER 2 correlation,20000,80,61,30.5,1525.0,True,0.04,61.0,0.5297914746804969,1.0
+missingness,5,EIGER 2 covariance,20000,80,19,9.5,475.0,True,0.04,19.0,0.0049370595994191295,1.0
+missingness,6,EIGER 1 @ 0.002,20000,80,8,4.0,200.0,True,0.04,,,
+missingness,6,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,6,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,6,EIGER 2 correlation,20000,80,0,0.0,0.0,False,0.04,0.0,0.17028583340881145,2.0
+missingness,6,EIGER 2 covariance,20000,80,2,1.0,50.0,True,0.04,2.0,0.00027114219772865787,2.0
+missingness,7,EIGER 1 @ 0.002,20000,80,12,6.0,300.0,True,0.04,,,
+missingness,7,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,7,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,7,EIGER 2 correlation,20000,80,43,21.5,1075.0,True,0.04,43.0,0.5170618191361472,1.0
+missingness,7,EIGER 2 covariance,20000,80,15,7.5,375.0,True,0.04,15.0,0.004731912235970196,1.0
+missingness,8,EIGER 1 @ 0.002,20000,80,23,11.5,575.0,True,0.04,,,
+missingness,8,EIGER 1 @ 0.004,20000,80,1,0.5,25.0,True,0.04,,,
+missingness,8,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,8,EIGER 2 correlation,20000,80,1,0.5,25.0,True,0.04,2.0,0.16788652643366112,2.0
+missingness,8,EIGER 2 covariance,20000,80,5,2.5,125.0,True,0.04,5.0,0.0002724702994765599,2.0
+missingness,9,EIGER 1 @ 0.002,20000,80,37,18.5,925.0,True,0.04,,,
+missingness,9,EIGER 1 @ 0.004,20000,80,4,2.0,100.0,True,0.04,,,
+missingness,9,EIGER 1 @ 0.012,20000,80,0,0.0,0.0,False,0.04,,,
+missingness,9,EIGER 2 correlation,20000,80,2,1.0,50.0,True,0.04,2.0,0.17059768332776942,2.0
+missingness,9,EIGER 2 covariance,20000,80,2,1.0,50.0,True,0.04,2.0,0.00027254367867226274,2.0
+small_n,0,EIGER 1 @ 0.002,20000,12,37,18.5,925.0,True,0.04,,,
+small_n,0,EIGER 1 @ 0.004,20000,12,9,4.5,225.0,True,0.04,,,
+small_n,0,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,0,EIGER 2 correlation,20000,12,2,1.0,50.0,True,0.04,2.0,0.328587589350761,1.0
+small_n,0,EIGER 2 covariance,20000,12,0,0.0,0.0,False,0.04,3.0,0.0005010053064077074,1.0
+small_n,1,EIGER 1 @ 0.002,20000,12,38,19.0,950.0,True,0.04,,,
+small_n,1,EIGER 1 @ 0.004,20000,12,7,3.5,175.0,True,0.04,,,
+small_n,1,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,1,EIGER 2 correlation,20000,12,3,1.5,75.0,True,0.04,3.0,0.3278520291425122,1.0
+small_n,1,EIGER 2 covariance,20000,12,5,2.5,125.0,True,0.04,5.0,0.0004965880612122131,1.0
+small_n,2,EIGER 1 @ 0.002,20000,12,40,20.0,1000.0,True,0.04,,,
+small_n,2,EIGER 1 @ 0.004,20000,12,13,6.5,325.0,True,0.04,,,
+small_n,2,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,2,EIGER 2 correlation,20000,12,6,3.0,150.0,True,0.04,6.0,0.3261266243353158,1.0
+small_n,2,EIGER 2 covariance,20000,12,8,4.0,200.0,True,0.04,8.0,0.000501183836556775,1.0
+small_n,3,EIGER 1 @ 0.002,20000,12,30,15.0,750.0,True,0.04,,,
+small_n,3,EIGER 1 @ 0.004,20000,12,8,4.0,200.0,True,0.04,,,
+small_n,3,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,3,EIGER 2 correlation,20000,12,7,3.5,175.0,True,0.04,7.0,0.32614391482968164,1.0
+small_n,3,EIGER 2 covariance,20000,12,3,1.5,75.0,True,0.04,3.0,0.0004997632213799466,1.0
+small_n,4,EIGER 1 @ 0.002,20000,12,17,8.5,425.0,True,0.04,,,
+small_n,4,EIGER 1 @ 0.004,20000,12,1,0.5,25.0,True,0.04,,,
+small_n,4,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,4,EIGER 2 correlation,20000,12,3,1.5,75.0,True,0.04,3.0,0.32801595628157404,1.0
+small_n,4,EIGER 2 covariance,20000,12,4,2.0,100.0,True,0.04,4.0,0.0005044507184858377,1.0
+small_n,5,EIGER 1 @ 0.002,20000,12,58,29.0,1450.0,True,0.04,,,
+small_n,5,EIGER 1 @ 0.004,20000,12,13,6.5,325.0,True,0.04,,,
+small_n,5,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,5,EIGER 2 correlation,20000,12,3,1.5,75.0,True,0.04,3.0,0.330946550079249,1.0
+small_n,5,EIGER 2 covariance,20000,12,6,3.0,150.0,True,0.04,6.0,0.0005051813039425282,1.0
+small_n,6,EIGER 1 @ 0.002,20000,12,60,30.0,1500.0,True,0.04,,,
+small_n,6,EIGER 1 @ 0.004,20000,12,17,8.5,425.0,True,0.04,,,
+small_n,6,EIGER 1 @ 0.012,20000,12,1,0.5,25.0,True,0.04,,,
+small_n,6,EIGER 2 correlation,20000,12,5,2.5,125.0,True,0.04,5.0,0.32956904502651,1.0
+small_n,6,EIGER 2 covariance,20000,12,0,0.0,0.0,False,0.04,2.0,0.0005052556356211045,1.0
+small_n,7,EIGER 1 @ 0.002,20000,12,56,28.0,1400.0,True,0.04,,,
+small_n,7,EIGER 1 @ 0.004,20000,12,17,8.5,425.0,True,0.04,,,
+small_n,7,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,7,EIGER 2 correlation,20000,12,8,4.0,200.0,True,0.04,8.0,0.330297752222059,1.0
+small_n,7,EIGER 2 covariance,20000,12,5,2.5,125.0,True,0.04,10.0,0.0005004826148078533,1.0
+small_n,8,EIGER 1 @ 0.002,20000,12,55,27.5,1375.0,True,0.04,,,
+small_n,8,EIGER 1 @ 0.004,20000,12,11,5.5,275.0,True,0.04,,,
+small_n,8,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,8,EIGER 2 correlation,20000,12,0,0.0,0.0,False,0.04,1.0,0.3283112554940271,1.0
+small_n,8,EIGER 2 covariance,20000,12,3,1.5,75.0,True,0.04,5.0,0.0004995327303502972,1.0
+small_n,9,EIGER 1 @ 0.002,20000,12,35,17.5,875.0,True,0.04,,,
+small_n,9,EIGER 1 @ 0.004,20000,12,12,6.0,300.0,True,0.04,,,
+small_n,9,EIGER 1 @ 0.012,20000,12,0,0.0,0.0,False,0.04,,,
+small_n,9,EIGER 2 correlation,20000,12,7,3.5,175.0,True,0.04,7.0,0.3284916367557254,1.0
+small_n,9,EIGER 2 covariance,20000,12,0,0.0,0.0,False,0.04,4.0,0.0005000864401029652,1.0
+high_noise,0,EIGER 1 @ 0.002,20000,40,125,62.5,3125.0,True,0.04,,,
+high_noise,0,EIGER 1 @ 0.004,20000,40,54,27.0,1350.0,True,0.04,,,
+high_noise,0,EIGER 1 @ 0.012,20000,40,5,2.5,125.0,True,0.04,,,
+high_noise,0,EIGER 2 correlation,20000,40,4,2.0,100.0,True,0.04,4.0,0.17210294196942916,2.0
+high_noise,0,EIGER 2 covariance,20000,40,4,2.0,100.0,True,0.04,4.0,0.001070455432104267,2.0
+high_noise,1,EIGER 1 @ 0.002,20000,40,158,79.0,3950.0,True,0.04,,,
+high_noise,1,EIGER 1 @ 0.004,20000,40,92,46.0,2300.0,True,0.04,,,
+high_noise,1,EIGER 1 @ 0.012,20000,40,12,6.0,300.0,True,0.04,,,
+high_noise,1,EIGER 2 correlation,20000,40,3,1.5,75.0,True,0.04,3.0,0.17164854516142433,2.0
+high_noise,1,EIGER 2 covariance,20000,40,3,1.5,75.0,True,0.04,3.0,0.001064700106060328,2.0
+high_noise,2,EIGER 1 @ 0.002,20000,40,139,69.5,3475.0,True,0.04,,,
+high_noise,2,EIGER 1 @ 0.004,20000,40,57,28.5,1425.0,True,0.04,,,
+high_noise,2,EIGER 1 @ 0.012,20000,40,2,1.0,50.0,True,0.04,,,
+high_noise,2,EIGER 2 correlation,20000,40,3,1.5,75.0,True,0.04,3.0,0.1732434919067183,2.0
+high_noise,2,EIGER 2 covariance,20000,40,3,1.5,75.0,True,0.04,3.0,0.0010659914511932551,2.0
+high_noise,3,EIGER 1 @ 0.002,20000,40,180,90.0,4500.0,True,0.04,,,
+high_noise,3,EIGER 1 @ 0.004,20000,40,105,52.5,2625.0,True,0.04,,,
+high_noise,3,EIGER 1 @ 0.012,20000,40,13,6.5,325.0,True,0.04,,,
+high_noise,3,EIGER 2 correlation,20000,40,3,1.5,75.0,True,0.04,3.0,0.17304085728560947,2.0
+high_noise,3,EIGER 2 covariance,20000,40,2,1.0,50.0,True,0.04,2.0,0.0010682801445181787,2.0
+high_noise,4,EIGER 1 @ 0.002,20000,40,126,63.0,3150.0,True,0.04,,,
+high_noise,4,EIGER 1 @ 0.004,20000,40,44,22.0,1100.0,True,0.04,,,
+high_noise,4,EIGER 1 @ 0.012,20000,40,1,0.5,25.0,True,0.04,,,
+high_noise,4,EIGER 2 correlation,20000,40,3,1.5,75.0,True,0.04,3.0,0.17274382868839278,2.0
+high_noise,4,EIGER 2 covariance,20000,40,3,1.5,75.0,True,0.04,3.0,0.0010774252575793052,2.0
+high_noise,5,EIGER 1 @ 0.002,20000,40,152,76.0,3800.0,True,0.04,,,
+high_noise,5,EIGER 1 @ 0.004,20000,40,85,42.5,2125.0,True,0.04,,,
+high_noise,5,EIGER 1 @ 0.012,20000,40,7,3.5,175.0,True,0.04,,,
+high_noise,5,EIGER 2 correlation,20000,40,0,0.0,0.0,False,0.04,1.0,0.16949602345099896,2.0
+high_noise,5,EIGER 2 covariance,20000,40,0,0.0,0.0,False,0.04,2.0,0.0010480646203641615,2.0
+high_noise,6,EIGER 1 @ 0.002,20000,40,143,71.5,3575.0,True,0.04,,,
+high_noise,6,EIGER 1 @ 0.004,20000,40,75,37.5,1875.0,True,0.04,,,
+high_noise,6,EIGER 1 @ 0.012,20000,40,9,4.5,225.0,True,0.04,,,
+high_noise,6,EIGER 2 correlation,20000,40,2,1.0,50.0,True,0.04,2.0,0.17315468181727245,2.0
+high_noise,6,EIGER 2 covariance,20000,40,3,1.5,75.0,True,0.04,3.0,0.0010727651465150352,2.0
+high_noise,7,EIGER 1 @ 0.002,20000,40,162,81.0,4050.0,True,0.04,,,
+high_noise,7,EIGER 1 @ 0.004,20000,40,69,34.5,1725.0,True,0.04,,,
+high_noise,7,EIGER 1 @ 0.012,20000,40,2,1.0,50.0,True,0.04,,,
+high_noise,7,EIGER 2 correlation,20000,40,0,0.0,0.0,False,0.04,2.0,0.17180015637854865,2.0
+high_noise,7,EIGER 2 covariance,20000,40,3,1.5,75.0,True,0.04,3.0,0.0010555132447074085,2.0
+high_noise,8,EIGER 1 @ 0.002,20000,40,143,71.5,3575.0,True,0.04,,,
+high_noise,8,EIGER 1 @ 0.004,20000,40,57,28.5,1425.0,True,0.04,,,
+high_noise,8,EIGER 1 @ 0.012,20000,40,4,2.0,100.0,True,0.04,,,
+high_noise,8,EIGER 2 correlation,20000,40,3,1.5,75.0,True,0.04,3.0,0.17286521409928482,2.0
+high_noise,8,EIGER 2 covariance,20000,40,1,0.5,25.0,True,0.04,1.0,0.0010658269884562279,2.0
+high_noise,9,EIGER 1 @ 0.002,20000,40,154,77.0,3850.0,True,0.04,,,
+high_noise,9,EIGER 1 @ 0.004,20000,40,87,43.5,2175.0,True,0.04,,,
+high_noise,9,EIGER 1 @ 0.012,20000,40,6,3.0,150.0,True,0.04,,,
+high_noise,9,EIGER 2 correlation,20000,40,0,0.0,0.0,False,0.04,1.0,0.17345009960789473,2.0
+high_noise,9,EIGER 2 covariance,20000,40,0,0.0,0.0,False,0.04,3.0,0.0010773047507016006,2.0

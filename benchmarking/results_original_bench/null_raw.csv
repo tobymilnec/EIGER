@@ -1,0 +1,141 @@
+seed,method,null_calls,false_calls_per_mb
+0,"Original @ 0.01, complete case",0,0.0
+0,"Original @ 0.01, adjacent gap",2,25.0
+0,"Original @ 0.01, cluster mean",49,612.5
+0,"Original @ 0.01, no effect gate",49,612.5
+0,"Original @ 0.012, complete case",0,0.0
+0,"Original @ 0.012, adjacent gap",1,12.5
+0,"Original @ 0.012, cluster mean",30,375.0
+0,"Original @ 0.012, no effect gate",30,375.0
+0,"Original @ 0.015, complete case",0,0.0
+0,"Original @ 0.015, adjacent gap",1,12.5
+0,"Original @ 0.015, cluster mean",13,162.5
+0,"Original @ 0.015, no effect gate",13,162.5
+0,EIGER 2 covariance,2,25.0
+0,EIGER 2 correlation,0,0.0
+1,"Original @ 0.01, complete case",0,0.0
+1,"Original @ 0.01, adjacent gap",0,0.0
+1,"Original @ 0.01, cluster mean",34,425.0
+1,"Original @ 0.01, no effect gate",34,425.0
+1,"Original @ 0.012, complete case",0,0.0
+1,"Original @ 0.012, adjacent gap",1,12.5
+1,"Original @ 0.012, cluster mean",25,312.5
+1,"Original @ 0.012, no effect gate",25,312.5
+1,"Original @ 0.015, complete case",0,0.0
+1,"Original @ 0.015, adjacent gap",1,12.5
+1,"Original @ 0.015, cluster mean",15,187.5
+1,"Original @ 0.015, no effect gate",15,187.5
+1,EIGER 2 covariance,21,262.5
+1,EIGER 2 correlation,21,262.5
+2,"Original @ 0.01, complete case",0,0.0
+2,"Original @ 0.01, adjacent gap",1,12.5
+2,"Original @ 0.01, cluster mean",27,337.5
+2,"Original @ 0.01, no effect gate",28,350.0
+2,"Original @ 0.012, complete case",0,0.0
+2,"Original @ 0.012, adjacent gap",1,12.5
+2,"Original @ 0.012, cluster mean",10,125.0
+2,"Original @ 0.012, no effect gate",10,125.0
+2,"Original @ 0.015, complete case",0,0.0
+2,"Original @ 0.015, adjacent gap",1,12.5
+2,"Original @ 0.015, cluster mean",6,75.0
+2,"Original @ 0.015, no effect gate",6,75.0
+2,EIGER 2 covariance,13,162.5
+2,EIGER 2 correlation,11,137.5
+3,"Original @ 0.01, complete case",0,0.0
+3,"Original @ 0.01, adjacent gap",1,12.5
+3,"Original @ 0.01, cluster mean",13,162.5
+3,"Original @ 0.01, no effect gate",13,162.5
+3,"Original @ 0.012, complete case",0,0.0
+3,"Original @ 0.012, adjacent gap",0,0.0
+3,"Original @ 0.012, cluster mean",6,75.0
+3,"Original @ 0.012, no effect gate",6,75.0
+3,"Original @ 0.015, complete case",0,0.0
+3,"Original @ 0.015, adjacent gap",1,12.5
+3,"Original @ 0.015, cluster mean",3,37.5
+3,"Original @ 0.015, no effect gate",3,37.5
+3,EIGER 2 covariance,3,37.5
+3,EIGER 2 correlation,4,50.0
+4,"Original @ 0.01, complete case",0,0.0
+4,"Original @ 0.01, adjacent gap",0,0.0
+4,"Original @ 0.01, cluster mean",29,362.5
+4,"Original @ 0.01, no effect gate",29,362.5
+4,"Original @ 0.012, complete case",0,0.0
+4,"Original @ 0.012, adjacent gap",0,0.0
+4,"Original @ 0.012, cluster mean",19,237.5
+4,"Original @ 0.012, no effect gate",19,237.5
+4,"Original @ 0.015, complete case",0,0.0
+4,"Original @ 0.015, adjacent gap",0,0.0
+4,"Original @ 0.015, cluster mean",5,62.5
+4,"Original @ 0.015, no effect gate",5,62.5
+4,EIGER 2 covariance,1,12.5
+4,EIGER 2 correlation,1,12.5
+5,"Original @ 0.01, complete case",0,0.0
+5,"Original @ 0.01, adjacent gap",1,12.5
+5,"Original @ 0.01, cluster mean",21,262.5
+5,"Original @ 0.01, no effect gate",21,262.5
+5,"Original @ 0.012, complete case",0,0.0
+5,"Original @ 0.012, adjacent gap",1,12.5
+5,"Original @ 0.012, cluster mean",15,187.5
+5,"Original @ 0.012, no effect gate",15,187.5
+5,"Original @ 0.015, complete case",0,0.0
+5,"Original @ 0.015, adjacent gap",0,0.0
+5,"Original @ 0.015, cluster mean",5,62.5
+5,"Original @ 0.015, no effect gate",5,62.5
+5,EIGER 2 covariance,20,250.0
+5,EIGER 2 correlation,12,150.0
+6,"Original @ 0.01, complete case",1,12.5
+6,"Original @ 0.01, adjacent gap",1,12.5
+6,"Original @ 0.01, cluster mean",56,700.0
+6,"Original @ 0.01, no effect gate",57,712.5
+6,"Original @ 0.012, complete case",0,0.0
+6,"Original @ 0.012, adjacent gap",1,12.5
+6,"Original @ 0.012, cluster mean",36,450.0
+6,"Original @ 0.012, no effect gate",36,450.0
+6,"Original @ 0.015, complete case",0,0.0
+6,"Original @ 0.015, adjacent gap",0,0.0
+6,"Original @ 0.015, cluster mean",17,212.5
+6,"Original @ 0.015, no effect gate",17,212.5
+6,EIGER 2 covariance,6,75.0
+6,EIGER 2 correlation,0,0.0
+7,"Original @ 0.01, complete case",0,0.0
+7,"Original @ 0.01, adjacent gap",0,0.0
+7,"Original @ 0.01, cluster mean",33,412.5
+7,"Original @ 0.01, no effect gate",33,412.5
+7,"Original @ 0.012, complete case",0,0.0
+7,"Original @ 0.012, adjacent gap",0,0.0
+7,"Original @ 0.012, cluster mean",23,287.5
+7,"Original @ 0.012, no effect gate",23,287.5
+7,"Original @ 0.015, complete case",0,0.0
+7,"Original @ 0.015, adjacent gap",0,0.0
+7,"Original @ 0.015, cluster mean",12,150.0
+7,"Original @ 0.015, no effect gate",12,150.0
+7,EIGER 2 covariance,4,50.0
+7,EIGER 2 correlation,1,12.5
+8,"Original @ 0.01, complete case",0,0.0
+8,"Original @ 0.01, adjacent gap",0,0.0
+8,"Original @ 0.01, cluster mean",21,262.5
+8,"Original @ 0.01, no effect gate",22,275.0
+8,"Original @ 0.012, complete case",0,0.0
+8,"Original @ 0.012, adjacent gap",0,0.0
+8,"Original @ 0.012, cluster mean",11,137.5
+8,"Original @ 0.012, no effect gate",11,137.5
+8,"Original @ 0.015, complete case",0,0.0
+8,"Original @ 0.015, adjacent gap",0,0.0
+8,"Original @ 0.015, cluster mean",4,50.0
+8,"Original @ 0.015, no effect gate",4,50.0
+8,EIGER 2 covariance,7,87.5
+8,EIGER 2 correlation,5,62.5
+9,"Original @ 0.01, complete case",0,0.0
+9,"Original @ 0.01, adjacent gap",0,0.0
+9,"Original @ 0.01, cluster mean",23,287.5
+9,"Original @ 0.01, no effect gate",24,300.0
+9,"Original @ 0.012, complete case",0,0.0
+9,"Original @ 0.012, adjacent gap",0,0.0
+9,"Original @ 0.012, cluster mean",13,162.5
+9,"Original @ 0.012, no effect gate",13,162.5
+9,"Original @ 0.015, complete case",0,0.0
+9,"Original @ 0.015, adjacent gap",0,0.0
+9,"Original @ 0.015, cluster mean",8,100.0
+9,"Original @ 0.015, no effect gate",8,100.0
+9,EIGER 2 covariance,8,100.0
+9,EIGER 2 correlation,8,100.0

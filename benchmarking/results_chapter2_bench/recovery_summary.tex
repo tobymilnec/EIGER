@@ -1,0 +1,21 @@
+\begin{table}[htbp]
+\centering
+\caption{Recovery on the Chapter~2 signal design at 24 samples, mean over 10 replicates. Region matches require 50\% reciprocal overlap.}
+\label{tab:eiger2_recovery}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+method & calls & region\_precision & region\_recall & region\_f1 & bp\_precision & bp\_recall \\
+\midrule
+EIGER 1 @ 0.01 (complete-case) & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+EIGER 1 @ 0.01 (mean-imputed) & 24.700 & 0.279 & 0.217 & 0.237 & 0.592 & 0.279 \\
+EIGER 1 @ 0.012 (complete-case) & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+EIGER 1 @ 0.012 (mean-imputed) & 16.500 & 0.299 & 0.153 & 0.197 & 0.673 & 0.211 \\
+EIGER 1 @ 0.015 (complete-case) & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+EIGER 1 @ 0.015 (mean-imputed) & 8.600 & 0.380 & 0.100 & 0.151 & 0.779 & 0.122 \\
+EIGER 2 correlation & 32.000 & 0.466 & 0.453 & 0.448 & 0.842 & 0.499 \\
+EIGER 2 covariance & 37.000 & 0.459 & 0.520 & 0.477 & 0.809 & 0.565 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

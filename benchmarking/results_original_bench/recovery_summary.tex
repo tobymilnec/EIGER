@@ -1,0 +1,27 @@
+\begin{table}[htbp]
+\centering
+\caption{Recovery of planted DMRs at 24 samples, mean over 10 replicates. The original caller is invoked from \texttt{functions/processing.py}.}
+\label{tab:original_recovery}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+method & calls & region\_precision & region\_recall & region\_f1 & bp\_precision & bp\_recall \\
+\midrule
+EIGER 2 correlation & 32.000 & 0.466 & 0.453 & 0.448 & 0.842 & 0.499 \\
+EIGER 2 covariance & 37.000 & 0.459 & 0.520 & 0.477 & 0.809 & 0.565 \\
+Original @ 0.01, adjacent gap & 2.400 & 0.556 & 0.043 & 0.079 & 0.647 & 0.026 \\
+Original @ 0.01, cluster mean & 38.700 & 0.211 & 0.247 & 0.221 & 0.494 & 0.308 \\
+Original @ 0.01, complete case & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+Original @ 0.01, no effect gate & 38.800 & 0.212 & 0.250 & 0.223 & 0.495 & 0.310 \\
+Original @ 0.012, adjacent gap & 1.900 & 0.654 & 0.037 & 0.068 & 0.746 & 0.023 \\
+Original @ 0.012, cluster mean & 26.200 & 0.222 & 0.180 & 0.192 & 0.574 & 0.243 \\
+Original @ 0.012, complete case & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+Original @ 0.012, no effect gate & 26.300 & 0.224 & 0.183 & 0.194 & 0.575 & 0.245 \\
+Original @ 0.015, adjacent gap & 1.200 & 0.708 & 0.027 & 0.050 & 0.789 & 0.017 \\
+Original @ 0.015, cluster mean & 14.800 & 0.247 & 0.113 & 0.148 & 0.646 & 0.148 \\
+Original @ 0.015, complete case & 0.000 & -- & 0.000 & 0.000 & -- & 0.000 \\
+Original @ 0.015, no effect gate & 14.900 & 0.250 & 0.117 & 0.151 & 0.647 & 0.150 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

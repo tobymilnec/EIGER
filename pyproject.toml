@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eiger"
+version = "2.0.0"
+description = "Label-free discovery of regionally coordinated DNA methylation, with a region-level empirical false discovery rate"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Toby Milne-Clark" }]
+keywords = [
+    "DNA methylation", "WGBS", "differentially methylated regions",
+    "false discovery rate", "unsupervised",
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+legacy = ["numba>=0.57", "scikit-learn>=1.1"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff"]
+
+[project.scripts]
+eiger2 = "eiger2.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "Python" }
+
+[tool.setuptools.packages.find]
+where = ["Python"]
+# Only the library ships. The benchmark harness (benchmarking/), the superseded
+# 2026 beta (old_code/) and the cohort-specific analysis scripts (scripts/) are
+# in the repository for review and reproducibility but are not installed.
+include = ["eiger2*", "functions*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# old_code/tests covers the superseded beta and is run explicitly:
+#   pytest old_code/tests
+filterwarnings = ["ignore::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["Python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+ignore = [
+    # "Python" is the source root declared above, not an importable module.
+    "N999",
+    # int(round(x)) is deliberate: round() on a numpy scalar returns a numpy
+    # scalar, not a Python int, and these values index arrays.
+    "RUF046",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Superseded code and the benchmark harness are kept verbatim for
+# reproducibility and are not held to the shipped package's lint standard.
+"old_code/**" = ["ALL"]
+# The published 2023 implementation, invoked verbatim by --legacy. It is the
+# baseline the revised method is compared against and is deliberately NOT
+# reformatted: any edit here would weaken the claim that --legacy runs the
+# original code rather than a paraphrase of it.
+"Python/functions/**" = ["ALL"]
+"benchmarking/**" = ["E501", "F401", "B023", "C408", "E402", "E731", "B905"]

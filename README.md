@@ -2,129 +2,146 @@
 
 # EIGER: Estimating Interdependent Genome-wide Epigenetic Regions
 
-**Covariance-based differentially methylated region (DMR) calling for whole-genome bisulfite sequencing data.**
+**Label-free discovery of regionally coordinated DNA methylation, with a
+region-level empirical false discovery rate.**
 
-EIGER identifies DMRs by computing the covariance between adjacent CpG sites across samples, grouping sites into contiguous high-covariance blocks, and scoring each block for sample-, cell-type-, and tissue-level methylation separation. Blocks are ranked using a Laplacian score and corrected for rare-group prevalence.
+EIGER segments the genome into blocks in which neighbouring CpGs co-vary across
+samples, without requiring predefined sample groups. Conventional DMR callers
+test a specified contrast between known classes; EIGER discovers the structure
+first and lets labels be applied afterwards, so cell types, tumour status and
+unanticipated subgroups can be found in one pass without any of them being
+specified in advance.
 
-<img width="1360" height="1010" alt="Example DMR plot (GSTP1)" src="https://github.com/user-attachments/assets/b733b5a6-230c-454d-9a79-5037cefa1803" />
-
----
-
-## Features
-
-- Covariance-based block segmentation of CpG sites (Numba-accelerated)
-- Sample-level, cell-type-level, and tissue-level separation scoring
-- Rare-group prevalence correction (Gaussian and logistic)
-- Laplacian score ranking of DMR blocks
-- Benjamini-Hochberg FDR correction
-- Parallel processing via `joblib`
-- Input: wgbstools `.beta` / `.lbeta` files, with optional `.bed`, `.bedgraph`, and `.cov` support via `wgbstools`
-- Output: annotated DMR table with genomic coordinates as a CSV
-
----
-
-## Requirements
-
-- Python ≥ 3.10
-- [wgbstools](https://github.com/nloyfer/wgbs_tools) (must be on `PATH` for `.bed`/`.cov` input)
-- R packages: `ggplot2`, `dplyr`, `tidyr`, `grid`, `gtable` (for the plotting script)
-
-See [requirements.txt](requirements.txt) for the full Python dependency list.
-
----
-
-## Installation
+Both the method as originally published and the revised method are in this
+repository and run from one command, so their outputs can be compared directly
+on identical inputs.
 
 ```bash
-git clone https://github.com/your-username/EIGER.git
-cd EIGER
-pip install -r requirements.txt
+conda env create -f environment.yml && conda activate eiger
+pip install -e . --no-deps
+
+python examples/make_example_data.py
+eiger2 call --betas examples/data/betas.tsv \
+            --locations examples/data/cpgs.bed --out results/
 ```
+
+Installation, input formats and every option: **[QUICKSTART.md](QUICKSTART.md)**.
 
 ---
 
-## Usage
+## What changed in version 2, and why
 
-```bash
-python Python/dmr_pipeline.py \
-    --meta        samples.csv \
-    --beta-dir    /path/to/beta/files \
-    --location-file cpg_sites.bed.gz \
-    --output      DMRs_with_coords.csv
-```
+The original caller thresholds the adjacent-CpG **covariance**. For a two-group
+structure with minor fraction *f* and effect δ that quantity is exactly
+*f*(1−*f*)δ², so what is thresholded is not the effect size but the effect size
+scaled by group imbalance. At the published threshold the smallest detectable
+effect is 0.22 at *f* = 0.50 and 0.50 at *f* = 0.05: rare subgroups are
+undetectable by construction, and the prevalence corrections applied downstream
+operate only on regions that the filter has already excluded.
 
-### Arguments
+Four changes follow from that diagnosis.
 
-| Argument | Required | Description |
-|---|---|---|
-| `--meta` | Yes | CSV file; first column must contain beta file names (relative to `--beta-dir`) |
-| `--beta-dir` | Yes | Directory containing `.beta` / `.lbeta` files |
-| `--location-file` | Yes | Gzipped BED file mapping CpG index to genomic coordinates |
-| `--output` | No | Output CSV file name (default: `DMRs_with_coords.csv`) |
-
-### Meta file format
-
-The meta CSV must have at least the following columns (0-indexed):
-
-| Column index | Content |
+| Change | Reason |
 |---|---|
-| 0 | Beta file name |
-| 2 | Cell type label |
-| 3 | Tissue label |
+| **Pairwise-complete estimation** | Removes the (1−*m*)² covariance deflation caused by mean imputation. At 5% missingness with 24 samples, complete-case estimation reports *no regions at all*, so every earlier result depends on imputation. |
+| **Correlation as the default statistic** | ρ = *f*(1−*f*)δ² / (*f*(1−*f*)δ² + σ²) saturates for any *f* once δ clears the noise, removing the prevalence ceiling. |
+| **A locality-breaking null** | Pairs CpGs far apart on the same chromosome, so every cross-sample dependency survives and only adjacency is destroyed. That is the hypothesis the caller actually tests. |
+| **A region-level empirical FDR** | Null tracks are pushed through the *identical* segmenter and region areas compared within CpG-count strata. The published method defines no error rate; this supplies one. |
 
-### Output
+Measured effects, and the conditions under which each claim holds, are in
+**[docs/](docs/)**. Two limitations bound the method and are stated here because
+they matter as much as the improvements:
 
-The output CSV contains one row per DMR with columns including:
+- **Structured missingness defeats the locality-breaking null.** Under 25%
+  dropout the realised FDR is 0.24–0.35 against a nominal 0.05 and is
+  insensitive to every segmentation parameter — a constant bias, not a tuning
+  problem.
+- **The per-region evidence score is not calibrated.** It is reported as a
+  ranking and explicitly not as a probability. `docs/PROBABILITY.md` reports the
+  measurement that established this.
 
-- `chr`, `start`, `end` — genomic coordinates
-- `CpG_start`, `CpG_end` — CpG index range
-- `classification` — separation class (e.g. `"grouped celltype separation"`)
-- `direction` — `Hypomethylation` or `Hypermethylation`
-- `delta_minmax`, `delta_celltype_next`, `delta_tissue_next` — methylation gap metrics
-- `pvalue_sample`, `pvalue_cell`, `pvalue_tissue` — t-test p-values
-- `score_*_gaussian`, `score_*_logistic` — prevalence-corrected scores
-- `laplacian_score` — Laplacian feature score
-- `fdr` — Benjamini-Hochberg corrected p-value (sample level)
-- One column per sample containing the per-block average methylation
+### Large cohorts
 
----
+Above roughly 100 samples the default null asks a question that has become
+trivially true — regional coordination exists nearly everywhere — and q-values
+saturate at zero. Use the permutation null, which preserves the observed
+marginal distribution of coordination exactly and randomises only its
+arrangement along the chromosome:
 
-## Repository structure
-
-```
-EIGER/
-├── Python/
-│   ├── dmr_pipeline.py          # Main entry point
-│   └── functions/
-│       ├── load_functions.py    # Beta file loading utilities
-│       ├── processing.py        # DMR calling and scoring functions
-│       ├── plotting.py          # Python DMR plotting (methylation + tracks + covariance)
-│       └── DMR_plotting_TMC.R   # R equivalent of plotting.py
-├── data/
-│   └── ref/                     # Reference files
-├── requirements.txt
-└── README.md
+```bash
+eiger2 call --betas betas.tsv --locations cpgs.bed --out results/ \
+    --null-mode permutation --min-prevalence-samples 3
 ```
 
----
-
-## Citation
-
-If you use EIGER in your work, please cite:
-
-> Milne-Clark T. *EIGER: Estimating Interdependent Genome-wide Epigenetic Regions*. GitHub (2024). https://github.com/your-username/EIGER
+On a 519-sample cohort the default null gave q = 0 for all 73,784 regions it
+called; the permutation null gave a genuine split, 41,636 at q ≤ 0.05 against
+32,224 above it. The exact commands, and the reason the two runs do not call
+quite the same region set, are in [analysis/](analysis/README.md).
 
 ---
 
-## Planned features
+## Running the method as originally published
 
-- Methrix object input support
-- rpy2 integration for inline R annotation
-- Multi-omic integration (e.g. scRNA-seq overlay)
-- Network propagation-based DMR refinement
+`--legacy` invokes `Python/functions/processing.py` directly rather than
+reimplementing it, so the baseline cannot be a paraphrase.
+
+```bash
+eiger2 call    --betas betas.tsv --locations cpgs.bed --out legacy/ --legacy
+eiger2 compare --betas betas.tsv --locations cpgs.bed --out both/
+```
+
+**Concordance with the published prostate cohort calls: all 8,915 published
+regions are recovered, at every region size** — 100% at ≤200 bp, at 200 bp–10 kb
+and at >10 kb. `--legacy` reports more regions than the published set because
+the published analysis applied further filtering downstream; no published call
+is lost.
+
+An FDR can be attached to the published method without changing which regions it
+reports, by permuting its own covariance track:
+
+```bash
+eiger2 call --betas betas.tsv --locations cpgs.bed --out legacy/ \
+    --legacy --fdr-replicates 50
+```
 
 ---
 
-## Licence
+## Repository layout
 
-This project is licensed under the MIT Licence — see [LICENSE](LICENSE) for details.
+```
+Python/eiger2/        the installable package: core, cli, io, probability,
+                      and the simulator used for validation
+Python/functions/     the original 2023 implementation, invoked by --legacy
+benchmarking/         benchmark and validation harness, plus generated results
+old_code/             the superseded 2026 beta, its tests, and review scripts
+scripts/              cohort-specific analysis, kept out of the package
+analysis/             the exact commands behind every published number
+examples/             a runnable example dataset generator
+tests/                tests for the shipped package
+docs/                 method design, benchmarks, and the probability layer
+```
+
+Only `Python/eiger2` and `Python/functions` are installed. The benchmark
+harness, the superseded beta and the analysis scripts are present for review and
+reproducibility but are deliberately not shipped as library code.
+
+```bash
+pytest tests -q             # 48 tests, the shipped package
+pytest old_code/tests -q    # 27 tests, the superseded beta
+```
+
+---
+
+## Outputs
+
+`regions.csv` carries one row per region. **`region_qvalue` is the only field
+that expresses confidence that a region is real.** Every `*_descriptive`
+field — delta beta, direction, the inferred sample split — is computed *after*
+the region was selected, on the same data, and is for reading rather than
+filtering. `run_manifest.json` records the resolved configuration, input
+checksums, package versions and the realised null diagnostics for every run, so
+a result can always be traced to the code and data that produced it.
+
+## Licence and citation
+
+MIT. See [LICENSE](LICENSE) and [CITATION.cff](CITATION.cff).

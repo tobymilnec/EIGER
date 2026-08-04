@@ -1,0 +1,28 @@
+# Conda environment for EIGER.
+#
+#   conda env create -f environment.yml     # or mamba env create -f ...
+#   conda activate eiger
+#   pip install -e . --no-deps              # registers the `eiger2` command
+#
+# Every dependency is pinned here, so the pip step installs nothing further.
+# numba, scikit-learn and joblib are required only by the LEGACY caller
+# (Python/functions/processing.py); the revised caller needs numpy, pandas and
+# scipy alone.
+name: eiger
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  # revised caller
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.14.1
+  # legacy caller only
+  - numba=0.60.0
+  - scikit-learn=1.5.2
+  - joblib=1.4.2
+  # development
+  - pytest=8.3
+  - pip
