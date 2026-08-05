@@ -2,146 +2,200 @@
 
 # EIGER: Estimating Interdependent Genome-wide Epigenetic Regions
 
-**Label-free discovery of regionally coordinated DNA methylation, with a
-region-level empirical false discovery rate.**
+**Unsupervised discovery of coordinated DNA methylation regions, with region-level empirical false discovery rate estimation.**
 
-EIGER segments the genome into blocks in which neighbouring CpGs co-vary across
-samples, without requiring predefined sample groups. Conventional DMR callers
-test a specified contrast between known classes; EIGER discovers the structure
-first and lets labels be applied afterwards, so cell types, tumour status and
-unanticipated subgroups can be found in one pass without any of them being
-specified in advance.
+EIGER identifies genomic regions in which neighbouring CpGs show coordinated methylation patterns across samples. Unlike conventional DMR callers, it does not require predefined groups or a specified comparison before regions are identified.
 
-Both the method as originally published and the revised method are in this
-repository and run from one command, so their outputs can be compared directly
-on identical inputs.
+This means that the underlying methylation structure is discovered first. Sample labels can then be applied afterwards to determine whether the resulting regions distinguish cell types, tumour and benign tissue, molecular subtypes, or previously unrecognised sample groups.
+
+The repository contains both the original EIGER implementation and the revised EIGER2 method. Both can be run through the same command-line interface, allowing their outputs to be compared directly using identical input data.
 
 ```bash
-conda env create -f environment.yml && conda activate eiger
+conda env create -f environment.yml
+conda activate eiger
 pip install -e . --no-deps
 
 python examples/make_example_data.py
-eiger2 call --betas examples/data/betas.tsv \
-            --locations examples/data/cpgs.bed --out results/
+
+eiger2 call \
+    --betas examples/data/betas.tsv \
+    --locations examples/data/cpgs.bed \
+    --out results/
 ```
 
-Installation, input formats and every option: **[QUICKSTART.md](QUICKSTART.md)**.
+Full installation instructions, input formats, and command-line options are provided in **[QUICKSTART.md](QUICKSTART.md)**.
 
 ---
 
-## What changed in version 2, and why
+## What changed in EIGER2?
 
-The original caller thresholds the adjacent-CpG **covariance**. For a two-group
-structure with minor fraction *f* and effect δ that quantity is exactly
-*f*(1−*f*)δ², so what is thresholded is not the effect size but the effect size
-scaled by group imbalance. At the published threshold the smallest detectable
-effect is 0.22 at *f* = 0.50 and 0.50 at *f* = 0.05: rare subgroups are
-undetectable by construction, and the prevalence corrections applied downstream
-operate only on regions that the filter has already excluded.
+The original EIGER method identifies coordinated regions by thresholding the covariance between adjacent CpGs. This works well when the underlying methylation pattern is present in a substantial proportion of samples, but covariance depends on both the magnitude of the methylation difference and the prevalence of the subgroup carrying it.
 
-Four changes follow from that diagnosis.
+For a two-group structure with minor-group fraction *f* and methylation difference δ, the covariance is:
 
-| Change | Reason |
+*f*(1−*f*)δ²
+
+The practical consequence is that the same biological effect becomes progressively harder to detect as the subgroup becomes rarer. At the published covariance threshold, the smallest detectable effect is approximately 0.22 when *f* = 0.50, but approximately 0.50 when *f* = 0.05. Rare but potentially meaningful methylation states can therefore be excluded before downstream prevalence-based analyses are applied.
+
+EIGER2 was developed to address this limitation and to provide a clearer statistical interpretation of the regions it reports.
+
+| Change | Rationale |
 |---|---|
-| **Pairwise-complete estimation** | Removes the (1−*m*)² covariance deflation caused by mean imputation. At 5% missingness with 24 samples, complete-case estimation reports *no regions at all*, so every earlier result depends on imputation. |
-| **Correlation as the default statistic** | ρ = *f*(1−*f*)δ² / (*f*(1−*f*)δ² + σ²) saturates for any *f* once δ clears the noise, removing the prevalence ceiling. |
-| **A locality-breaking null** | Pairs CpGs far apart on the same chromosome, so every cross-sample dependency survives and only adjacency is destroyed. That is the hypothesis the caller actually tests. |
-| **A region-level empirical FDR** | Null tracks are pushed through the *identical* segmenter and region areas compared within CpG-count strata. The published method defines no error rate; this supplies one. |
+| **Pairwise-complete estimation** | Avoids the covariance reduction introduced by mean imputation. Under 5% missingness in a 24-sample simulation, complete-case estimation detected no regions, meaning that the original result depended strongly on how missing values were handled. |
+| **Correlation as the default statistic** | Correlation normalises covariance by the variance of the CpGs and is therefore less directly constrained by subgroup prevalence once the methylation difference exceeds the background noise. |
+| **A locality-breaking null model** | CpGs are paired with distant sites on the same chromosome. This preserves cross-sample structure while removing local genomic adjacency, directly testing whether neighbouring CpGs are more coordinated than expected from the wider methylation structure. |
+| **Region-level empirical FDR estimation** | Null coordination tracks are processed through the same segmentation procedure as the observed data. Region areas are then compared within CpG-count strata, providing an empirical region-level false discovery rate. |
 
-Measured effects, and the conditions under which each claim holds, are in
-**[docs/](docs/)**. Two limitations bound the method and are stated here because
-they matter as much as the improvements:
-
-- **Structured missingness defeats the locality-breaking null.** Under 25%
-  dropout the realised FDR is 0.24–0.35 against a nominal 0.05 and is
-  insensitive to every segmentation parameter — a constant bias, not a tuning
-  problem.
-- **The per-region evidence score is not calibrated.** It is reported as a
-  ranking and explicitly not as a probability. `docs/PROBABILITY.md` reports the
-  measurement that established this.
-
-### Large cohorts
-
-Above roughly 100 samples the default null asks a question that has become
-trivially true — regional coordination exists nearly everywhere — and q-values
-saturate at zero. Use the permutation null, which preserves the observed
-marginal distribution of coordination exactly and randomises only its
-arrangement along the chromosome:
-
-```bash
-eiger2 call --betas betas.tsv --locations cpgs.bed --out results/ \
-    --null-mode permutation --min-prevalence-samples 3
-```
-
-On a 519-sample cohort the default null gave q = 0 for all 73,784 regions it
-called; the permutation null gave a genuine split, 41,636 at q ≤ 0.05 against
-32,224 above it. The exact commands, and the reason the two runs do not call
-quite the same region set, are in [analysis/](analysis/README.md).
+The validation analyses, assumptions, and commands underlying these changes are documented in **[docs/](docs/)** and **[analysis/](analysis/README.md)**.
 
 ---
 
-## Running the method as originally published
+## Important limitations
 
-`--legacy` invokes `Python/functions/processing.py` directly rather than
-reimplementing it, so the baseline cannot be a paraphrase.
+EIGER2 improves the interpretation of coordinated methylation regions, but it does not remove every limitation of unsupervised regional calling.
 
-```bash
-eiger2 call    --betas betas.tsv --locations cpgs.bed --out legacy/ --legacy
-eiger2 compare --betas betas.tsv --locations cpgs.bed --out both/
-```
+### Structured missingness
 
-**Concordance with the published prostate cohort calls: all 8,915 published
-regions are recovered, at every region size** — 100% at ≤200 bp, at 200 bp–10 kb
-and at >10 kb. `--legacy` reports more regions than the published set because
-the published analysis applied further filtering downstream; no published call
-is lost.
+The locality-breaking null assumes that missing data do not contain strong genomic structure. When dropout is spatially or biologically structured, this assumption can fail.
 
-An FDR can be attached to the published method without changing which regions it
-reports, by permuting its own covariance track:
+In simulations with 25% structured dropout, the realised false discovery rate was approximately 0.24–0.35 at a nominal threshold of 0.05. This remained largely unchanged across segmentation settings, suggesting a systematic bias rather than a parameter-tuning problem.
 
-```bash
-eiger2 call --betas betas.tsv --locations cpgs.bed --out legacy/ \
-    --legacy --fdr-replicates 50
-```
+Datasets with substantial structured missingness should therefore be interpreted cautiously and assessed using the diagnostics written to the run manifest.
+
+### Per-region evidence score
+
+The per-region evidence score is intended for ranking regions. It is **not** calibrated as a posterior probability or as the probability that an individual region is biologically real.
+
+The analyses used to assess this behaviour are described in **[docs/PROBABILITY.md](docs/PROBABILITY.md)**.
 
 ---
 
-## Repository layout
+## Large cohorts
 
-```
-Python/eiger2/        the installable package: core, cli, io, probability,
-                      and the simulator used for validation
-Python/functions/     the original 2023 implementation, invoked by --legacy
-benchmarking/         benchmark and validation harness, plus generated results
-old_code/             the superseded 2026 beta, its tests, and review scripts
-scripts/              cohort-specific analysis, kept out of the package
-analysis/             the exact commands behind every published number
-examples/             a runnable example dataset generator
-tests/                tests for the shipped package
-docs/                 method design, benchmarks, and the probability layer
-```
+In large cohorts, the default locality-breaking null can become overly permissive. With enough samples, coordinated methylation can be detected across a large proportion of the genome, making the comparison against distant CpG pairs relatively easy to satisfy. In this setting, empirical q-values may saturate close to zero.
 
-Only `Python/eiger2` and `Python/functions` are installed. The benchmark
-harness, the superseded beta and the analysis scripts are present for review and
-reproducibility but are deliberately not shipped as library code.
+For cohorts above approximately 100 samples, the permutation null is generally more informative:
 
 ```bash
-pytest tests -q             # 48 tests, the shipped package
-pytest old_code/tests -q    # 27 tests, the superseded beta
+eiger2 call \
+    --betas betas.tsv \
+    --locations cpgs.bed \
+    --out results/ \
+    --null-mode permutation \
+    --min-prevalence-samples 3
 ```
+
+The permutation null preserves the observed marginal distribution of coordination values and randomises only their genomic arrangement.
+
+In a cohort of 519 samples, the default null assigned q = 0 to all 73,784 reported regions. Using the permutation null produced a more informative separation, with 41,636 regions at q ≤ 0.05 and 32,224 above this threshold.
+
+The exact commands, outputs, and explanation for differences in the called region sets are provided in **[analysis/](analysis/README.md)**.
+
+---
+
+## Running the original EIGER method
+
+The `--legacy` option invokes the original implementation directly from `Python/functions/processing.py`. It does not reproduce or reinterpret the original algorithm in new code.
+
+```bash
+eiger2 call \
+    --betas betas.tsv \
+    --locations cpgs.bed \
+    --out legacy/ \
+    --legacy
+
+eiger2 compare \
+    --betas betas.tsv \
+    --locations cpgs.bed \
+    --out both/
+```
+
+Comparison with the published prostate cancer analysis recovered all 8,915 published regions across every tested size category:
+
+- ≤200 bp
+- 200 bp–10 kb
+- >10 kb
+
+The legacy command reports additional regions because the published analysis included further downstream filtering. No region in the published set was lost.
+
+An empirical FDR can also be estimated for the legacy caller without changing the regions produced by the original algorithm:
+
+```bash
+eiger2 call \
+    --betas betas.tsv \
+    --locations cpgs.bed \
+    --out legacy/ \
+    --legacy \
+    --fdr-replicates 50
+```
+
+This applies permutation-based FDR estimation to the covariance track generated by the original method.
+
+---
+
+## Repository structure
+
+```text
+Python/eiger2/        Installable EIGER2 package, including the core caller,
+                      command-line interface, input/output functions,
+                      probability utilities, and validation simulator
+
+Python/functions/     Original EIGER implementation used by --legacy
+
+benchmarking/         Benchmarking and validation framework, together with
+                      generated benchmark outputs
+
+old_code/             Superseded EIGER2 beta implementation, retained with its
+                      tests and review scripts for transparency
+
+scripts/              Cohort-specific analysis scripts that are not part of
+                      the installable package
+
+analysis/             Exact commands and analyses underlying the reported
+                      validation results
+
+examples/             Example dataset generator and runnable input files
+
+tests/                Tests for the current installable package
+
+docs/                 Method design, validation results, and statistical notes
+```
+
+Only `Python/eiger2` and `Python/functions` are installed as package code. The benchmarking framework, superseded beta implementation, and cohort-specific analyses are retained for review and reproducibility but are not shipped as part of the library.
+
+```bash
+pytest tests -q
+pytest old_code/tests -q
+```
+
+At the time of writing, the current package contains 48 tests and the superseded beta implementation contains 27 tests.
 
 ---
 
 ## Outputs
 
-`regions.csv` carries one row per region. **`region_qvalue` is the only field
-that expresses confidence that a region is real.** Every `*_descriptive`
-field — delta beta, direction, the inferred sample split — is computed *after*
-the region was selected, on the same data, and is for reading rather than
-filtering. `run_manifest.json` records the resolved configuration, input
-checksums, package versions and the realised null diagnostics for every run, so
-a result can always be traced to the code and data that produced it.
+The principal region-level output is `regions.csv`, with one row per detected region.
+
+**`region_qvalue` is the principal field used to assess region-level statistical support.**
+
+Other fields, including methylation difference, direction, and inferred sample grouping, are descriptive. These values are calculated after region selection using the same data and should not be treated as independent statistical evidence or used as additional significance filters without further validation.
+
+Each run also produces `run_manifest.json`, which records:
+
+- the resolved analysis configuration
+- input file checksums
+- software and package versions
+- random seeds
+- null-model diagnostics
+- the parameters used for segmentation and FDR estimation
+
+This allows each result to be traced back to the code, inputs, and settings that generated it.
+
+---
 
 ## Licence and citation
 
-MIT. See [LICENSE](LICENSE) and [CITATION.cff](CITATION.cff).
+EIGER is released under the MIT licence. See **[LICENSE](LICENSE)** for details.
+
+Citation metadata are provided in **[CITATION.cff](CITATION.cff)**.
+
