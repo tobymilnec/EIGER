@@ -649,11 +649,18 @@ def test_region_fdr_result_length_stratified_maps_back_to_original_rows():
         observed_lengths=observed_lengths, null_length_sets=null_length_sets,
     )
     # short-stratum regions (indices 0, 2) must not be compared against the
-    # long-stratum null: their q-values should differ from a pooled-only run
+    # long-stratum null. These particular observed areas are deliberately far
+    # outside the null's exceedance range (two saturate the qvalue==1 cap, two
+    # floor at qvalue==0 with K=0), so the CAPPED qvalue can coincide between
+    # the stratified and pooled runs by coincidence even though a materially
+    # different null pool was used -- assert on null_exceedances instead,
+    # which is unaffected by the min(1.0, ...) cap and must differ whenever
+    # the pooled-per-stratum count (120) differs from the fully pooled count
+    # (240).
     pooled_result = region_fdr_result(
         observed_areas, null_area_sets, observed_edges=100, null_edges=240,
     )
-    assert not np.array_equal(result.qvalue, pooled_result.qvalue)
+    assert not np.array_equal(result.null_exceedances, pooled_result.null_exceedances)
 
 
 def test_region_fdr_result_weak_candidates_do_not_inherit_a_leading_zero():
