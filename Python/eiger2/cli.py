@@ -515,6 +515,18 @@ def command_call(args: argparse.Namespace) -> int:
         print(f"[eiger2] significant: {significant} at q <= {args.target_fdr}")
     else:
         print("[eiger2] significant: n/a (legacy defines no error rate)")
+    overdispersion_ratio = (caller_manifest.get("fdr") or {}).get(
+        "null_count_overdispersion_warning"
+    )
+    if overdispersion_ratio is not None:
+        print(
+            f"[eiger2] WARNING: pooled null region counts are overdispersed\n"
+            f"         (variance/mean = {overdispersion_ratio:.2f}, Poisson assumes "
+            f"1.0).\n"
+            f"         region_qvalue_upper_95 is a LOWER BOUND on the true "
+            f"uncertainty.",
+            file=sys.stderr,
+        )
     warning = caller_manifest.get("null", {}).get("warning") \
         if isinstance(caller_manifest.get("null"), dict) else None
     if warning:

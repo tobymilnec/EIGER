@@ -1106,7 +1106,32 @@ def length_stratum(n_cpg: int) -> str:
 def _overdispersion_diagnostic(
     per_replicate_null_areas: list[np.ndarray], cutoffs: np.ndarray
 ) -> tuple[str, float | None]:
-    return "not_yet_implemented", None
+    """Poisson-vs-observed dispersion check on pooled null exceedance counts.
+
+    ``region_qvalue_upper_95`` assumes a Poisson count model (Garwood). If the
+    replicate-to-replicate exceedance counts are overdispersed relative to Poisson,
+    the Garwood interval understates the true uncertainty -- it becomes a LOWER
+    bound on the real interval, not a correct one. This is reported, never silently
+    corrected (spec §1.5: no uncalibrated dispersion correction in this release).
+    """
+
+    b = len(per_replicate_null_areas)
+    if b < 5 or cutoffs.size == 0:
+        return "unavailable", None
+
+    counts = np.empty((b, cutoffs.size), dtype=float)
+    for row, areas in enumerate(per_replicate_null_areas):
+        sorted_areas = np.sort(areas)
+        counts[row] = areas.size - np.searchsorted(sorted_areas, cutoffs, side="left")
+
+    usable = np.mean(counts, axis=0) > 0
+    if not np.any(usable):
+        return "unavailable", None
+
+    means = np.mean(counts[:, usable], axis=0)
+    variances = np.var(counts[:, usable], axis=0, ddof=1)
+    ratios = variances / means
+    return "computed", float(np.median(ratios))
 
 
 def region_fdr_result(
@@ -1235,12 +1260,22 @@ def region_fdr_result(
             per_replicate, piece["cutoffs"]
         )
 
+    dispersion_ratios = [
+        ratio for status, ratio in overdispersion_by_stratum.values()
+        if status == "computed"
+    ]
+    overdispersion_warning = (
+        max(dispersion_ratios) if dispersion_ratios and max(dispersion_ratios) > 1.5
+        else None
+    )
+
     diagnostics = {
         "fdr_interval_bonferroni_m": m_bonferroni,
         "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
         "fdr_interval_family": "per_stratum",
         "pooled_fallback_strata": pooled_fallback_strata,
         "null_count_dispersion_by_stratum": overdispersion_by_stratum,
+        "null_count_overdispersion_warning": overdispersion_warning,
         "scale": scale,
     }
     return RegionFdrResult(

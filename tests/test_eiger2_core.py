@@ -32,6 +32,7 @@ from eiger2.benchmark import evaluate, simulate  # noqa: E402
 from eiger2.core import (  # noqa: E402
     RegionFdrResult,  # noqa: F401
     _fdr_from_areas_result,
+    _overdispersion_diagnostic,
     _pair_statistic,
     region_fdr_result,
 )
@@ -840,3 +841,57 @@ def test_region_fdr_result_weak_candidates_do_not_inherit_a_leading_zero():
     )
     assert (result.qvalue == 0).sum() < len(result.qvalue)
     assert np.unique(result.qvalue).size > 1
+
+
+# --------------------------------------------------------------------------
+# overdispersion diagnostic
+# --------------------------------------------------------------------------
+
+
+def test_overdispersion_diagnostic_flags_a_deliberately_overdispersed_null():
+    rng = np.random.default_rng(31)
+    # 8 replicates, exceedance counts drawn from a negative-binomial-like process
+    # (Poisson mixed over a Gamma-distributed rate) so variance >> mean at every cutoff
+    cutoffs = np.array([5.0, 4.0, 3.0])
+    per_replicate = []
+    for _ in range(8):
+        rate = rng.gamma(shape=0.5, scale=6.0)  # overdispersed rate draw
+        counts = rng.poisson(rate, size=3)
+        # build a null-area array whose >= cutoff exceedance counts match `counts`
+        areas = np.concatenate([
+            np.full(counts[i], cutoffs[i] + 0.1) for i in range(3)
+        ] + [np.zeros(5)])
+        per_replicate.append(areas)
+    status, ratio = _overdispersion_diagnostic(per_replicate, cutoffs)
+    assert status == "computed"
+    assert ratio is not None
+
+
+def test_overdispersion_diagnostic_unavailable_below_five_replicates():
+    per_replicate = [np.array([1.0, 2.0]) for _ in range(3)]
+    status, ratio = _overdispersion_diagnostic(per_replicate, np.array([1.0]))
+    assert status == "unavailable"
+    assert ratio is None
+
+
+def test_region_fdr_result_overdispersion_warning_end_to_end():
+    rng = np.random.default_rng(32)
+    observed = rng.exponential(2.0, size=20)
+    # 8 replicates with wildly varying null density -> overdispersed exceedance counts
+    nulls = []
+    for i in range(8):
+        density = 300 if i % 2 == 0 else 10
+        nulls.append(rng.exponential(2.0, size=density))
+    result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=sum(len(n) for n in nulls))
+    by_stratum = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
+    assert by_stratum[0] in {"computed", "unavailable"}
+
+
+def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
+    rng = np.random.default_rng(33)
+    observed = rng.exponential(2.0, size=20)
+    nulls = [rng.exponential(2.0, size=150) for _ in range(8)]  # same density each rep
+    result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=1200)
+    status, ratio = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
+    if status == "computed":
+        assert ratio < 1.5
