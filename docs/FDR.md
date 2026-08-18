@@ -252,8 +252,8 @@ U_j = ½ · χ²_{2(K_j+1), 1−α*/2}
 
 This is the standard exact (Clopper–Pearson-style) confidence interval for a Poisson
 rate given an observed count, expressed via the chi-squared distribution. **It assumes
-the null exceedance count `K_j` is Poisson-distributed** — i.e. that replicate-to-
-replicate variance in the exceedance count equals its mean. This is the reason a
+the null exceedance count `K_j` is Poisson-distributed** — i.e. that
+replicate-to-replicate variance in the exceedance count equals its mean. This is the reason a
 zero point estimate (`K_j = 0`) still has a strictly positive upper bound: a Poisson
 process with rate zero would never produce any variability, but a Poisson process with
 a small positive rate can easily produce zero counts in a finite sample, and the
@@ -314,8 +314,9 @@ what the Garwood formula reports, and `region_qvalue_upper_95` becomes an
 cutoff with positive mean exceedance count across replicates, it computes
 `ratio_j = var(K_{.,j}, ddof=1) / mean(K_{.,j})` and takes `median_ratio` across usable
 cutoffs (`_overdispersion_diagnostic` in `core.py`, requiring >= 5 replicates and >= 1
-usable cutoff; otherwise it reports `"unavailable"` rather than guessing). If
-`median_ratio > 1.5`, `null_count_overdispersion_warning` is appended to
+usable cutoff; otherwise it reports `"unavailable"` rather than guessing). If the
+**largest** `median_ratio` across strata exceeds `1.5`,
+`null_count_overdispersion_warning` is appended to
 `manifest["warnings"]` and printed to stderr by `eiger2 call`:
 
 ```
