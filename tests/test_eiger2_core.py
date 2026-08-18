@@ -1066,3 +1066,36 @@ def test_confidence_level_other_than_95_returns_arrays_but_is_not_csv_exportable
     _require_default_confidence_level(None)  # no raise
     with pytest.raises(ValueError, match="95%"):
         _require_default_confidence_level(0.90)
+
+
+# --------------------------------------------------------------------------
+# Task 10: invariant-preservation regression test -- proves Stage 1's FDR
+# corrections (Tasks 2-9) changed only q-value/evidence-score/significant
+# columns, leaving every other region column byte-identical to v2.0.0.
+# --------------------------------------------------------------------------
+
+
+def test_stage1_preserves_the_invariant_column_set():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "generate_stage1_invariant_fixture",
+        Path(__file__).parent / "fixtures" / "generate_stage1_invariant_fixture.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    matrix, locs, config = module.generate_inputs()
+
+    fixture_path = (
+        Path(__file__).parent / "fixtures" / "stage1_invariant_fixture_v200.csv"
+    )
+    # float_precision="round_trip" is required: pandas's default C float
+    # parser does not exactly round-trip full-precision (17-significant-digit)
+    # floats, which would otherwise corrupt statistic_min etc. on read and
+    # make an exact comparison spuriously fail.
+    expected = pd.read_csv(fixture_path, float_precision="round_trip").reset_index(
+        drop=True
+    )
+    regions, _values, _manifest = call_dmrs(matrix, locs, config=config)
+    actual = regions[list(expected.columns)].reset_index(drop=True)
+    pd.testing.assert_frame_equal(actual, expected, check_exact=True)

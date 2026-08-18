@@ -31,12 +31,17 @@ INVARIANT_COLUMNS = [
 ]
 
 
-def main() -> None:
-    matrix, locs, planted = simulate(
+def generate_inputs():
+    matrix, locs, _planted = simulate(
         n_samples=60, strata=[(0.15, 0.35)], replicates=4,
         spacing=300, dmr_length=12, missing_rate=0.02, seed=1701,
     )
     config = Eiger2Config(window=4, null_replicates=8, random_seed=1701)
+    return matrix, locs, config
+
+
+def main() -> None:
+    matrix, locs, config = generate_inputs()
     regions, _values, _manifest = call_dmrs(matrix, locs, config=config)
     out = Path(__file__).parent / "stage1_invariant_fixture_v200.csv"
     regions[INVARIANT_COLUMNS].to_csv(out, index=False)
