@@ -814,11 +814,15 @@ def test_region_fdr_result_length_stratified_maps_back_to_original_rows():
         observed_lengths=observed_lengths, null_length_sets=null_length_sets,
     )
     # short-stratum regions (indices 0, 2) must not be compared against the
-    # long-stratum null: their q-values should differ from a pooled-only run
+    # long-stratum null: their null-exceedance counts should differ from a
+    # pooled-only run (qvalue itself can coincidentally saturate at the
+    # min(1.0, ...) cap for these areas, so exceedances is the field that
+    # actually distinguishes a 120-element per-stratum pool from the
+    # 240-element fully-pooled null)
     pooled_result = region_fdr_result(
         observed_areas, null_area_sets, observed_edges=100, null_edges=240,
     )
-    assert not np.array_equal(result.qvalue, pooled_result.qvalue)
+    assert not np.array_equal(result.null_exceedances, pooled_result.null_exceedances)
 
 
 def test_region_fdr_result_weak_candidates_do_not_inherit_a_leading_zero():
