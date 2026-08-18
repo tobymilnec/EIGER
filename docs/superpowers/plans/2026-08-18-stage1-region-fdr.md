@@ -1595,7 +1595,13 @@ def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
     )
     for mode in ("point", "upper"):
         config = Eiger2Config(
-            window=4, null_replicates=100, random_seed=51, fdr_decision=mode,
+            # null_replicates=300, not 100: at these simulate() parameters the
+        # vacuity guard's best achievable upper_95 (~0.13-0.14 at B=100,
+        # m_bonferroni=4) exceeds the default target_fdr=0.05, so B=100 makes
+        # --fdr-decision upper correctly refuse to run. 300 clears the guard
+        # (best_upper ~0.045) while keeping the test's actual intent (point vs
+        # upper determinism) rather than accidentally testing the guard here.
+        window=4, null_replicates=300, random_seed=51, fdr_decision=mode,
         )
         first, _, _ = call_dmrs(matrix, locs, config=config)
         second, _, _ = call_dmrs(matrix, locs, config=config)
@@ -1608,11 +1614,13 @@ def test_upper_decision_uses_upper_bound_not_point_estimate():
         n_samples=60, strata=[(0.15, 0.35)], replicates=4,
         spacing=300, dmr_length=12, seed=52,
     )
+    # null_replicates=300 for the same reason as the test above -- clears the
+    # vacuity guard at this seed's m_bonferroni/scale.
     point_config = Eiger2Config(
-        window=4, null_replicates=100, random_seed=52, fdr_decision="point",
+        window=4, null_replicates=300, random_seed=52, fdr_decision="point",
     )
     upper_config = Eiger2Config(
-        window=4, null_replicates=100, random_seed=52, fdr_decision="upper",
+        window=4, null_replicates=300, random_seed=52, fdr_decision="upper",
     )
     point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
     upper_regions, _, _ = call_dmrs(matrix, locs, config=upper_config)
