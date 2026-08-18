@@ -1,0 +1,102 @@
+{
+  "timestamp_utc": "2026-08-18T20:07:26.159051+00:00",
+  "command": "calibration",
+  "arguments": {
+    "command": "calibration",
+    "out_dir": "results_v201/benchmark_suite",
+    "seeds": 3,
+    "scaling_seeds": 3,
+    "scenarios": [
+      "clean",
+      "nuisance",
+      "missingness",
+      "small_n",
+      "high_noise"
+    ],
+    "statistic": "correlation",
+    "null_replicates": 200
+  },
+  "python": "3.12.13",
+  "numpy": "1.26.4",
+  "pandas": "2.2.2",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "default_config": {
+    "statistic": "correlation",
+    "window": 4,
+    "deflate_components": null,
+    "deflation_thin": 50,
+    "deflation_max_concentration": 0.1,
+    "deflation_concentration_quantile": 0.01,
+    "deflation_max_components": 20,
+    "deflation_min_rows": 20,
+    "deflation_min_observed_fraction": 0.8,
+    "deflation_floor_observed_fraction": 0.5,
+    "parallel_analysis_replicates": 5,
+    "parallel_analysis_quantile": 0.99,
+    "deflation_missing": "exact",
+    "null_replicates": 100,
+    "null_quantile": 0.995,
+    "null_min_lag": 1000,
+    "null_stride": 1,
+    "null_mode": "lag",
+    "min_cpgs": 4,
+    "max_gap_edges": 0,
+    "min_paired_samples": 5,
+    "min_paired_fraction": 0.0,
+    "max_cpg_gap_bp": 300,
+    "min_observed_samples": 2,
+    "min_prevalence_samples": 0,
+    "min_sample_fraction": 0.0,
+    "length_stratified_fdr": true,
+    "target_fdr": 0.05,
+    "random_seed": 1,
+    "fdr_decision": "point",
+    "min_null_values": 1000,
+    "min_null_coverage": 0.25,
+    "compute_posterior": false,
+    "min_null_regions_for_posterior": 50
+  },
+  "schema_version": "2.1",
+  "software_version": "2.0.0",
+  "git_commit": "6d66d52da1cff92799994c7ff5545a5946b5dbc4",
+  "parent_run_id": null,
+  "parent_manifest_checksum": null,
+  "input_checksums": {},
+  "resolved_configuration": {
+    "command": "calibration",
+    "out_dir": "results_v201/benchmark_suite",
+    "seeds": 3,
+    "scaling_seeds": 3,
+    "scenarios": [
+      "clean",
+      "nuisance",
+      "missingness",
+      "small_n",
+      "high_noise"
+    ],
+    "statistic": "correlation",
+    "null_replicates": 200
+  },
+  "random_seed": 0,
+  "derived_seeds": {
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "scaling_seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "runtime_seconds": 503.1806817909237,
+  "peak_memory_mb": 890.328125,
+  "package_versions": {
+    "numpy": "1.26.4",
+    "pandas": "2.2.2",
+    "scipy": "1.14.1"
+  },
+  "warnings": [],
+  "fdr_decision": "point"
+}
