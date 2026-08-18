@@ -978,6 +978,12 @@ def test_overdispersion_diagnostic_flags_a_deliberately_overdispersed_null():
     status, ratio = _overdispersion_diagnostic(per_replicate, cutoffs)
     assert status == "computed"
     assert ratio is not None
+    # the construction's per-cutoff counts are Poisson mixed over a Gamma(0.5, 6)
+    # rate, which is substantially overdispersed (variance/mean well above the
+    # Poisson value of 1.0) -- assert the elevated ratio itself, not merely that
+    # some ratio was returned, or a broken implementation returning any non-None
+    # float would pass this test unchanged.
+    assert ratio > 1.5
 
 
 def test_overdispersion_diagnostic_unavailable_below_five_replicates():
@@ -998,6 +1004,12 @@ def test_region_fdr_result_overdispersion_warning_end_to_end():
     result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=sum(len(n) for n in nulls))
     by_stratum = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
     assert by_stratum[0] in {"computed", "unavailable"}
+    # the 300-vs-10 alternating null density is a deliberately extreme
+    # replicate-to-replicate swing, which must actually surface as the
+    # top-level warning -- assert the warning fires, not merely that a status
+    # string came back, or the manifest-level wiring could be silently broken
+    # while this test still passed.
+    assert result.diagnostics["null_count_overdispersion_warning"] is not None
 
 
 def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
