@@ -1192,8 +1192,18 @@ def test_region_evidence_score_exercises_corrected_tail_area_fdr():
         n_samples=50, strata=[(0.2, 0.4)], replicates=3,
         spacing=250, dmr_length=10, seed=99,
     )
+    # null_replicates=8 (the Stage-1-default-adjacent value used elsewhere in this
+    # plan) never reaches min_null_regions_for_posterior (default 50) at this
+    # genome size, so local_fdr short-circuits before ever calling
+    # _tail_area_fdr and evidence_score_extrapolated stays all-False regardless
+    # of the fix -- confirmed empirically. Use null_replicates=500 with
+    # min_null_regions_for_posterior=5 so the extrapolated path is actually
+    # reached (this makes the test a wiring/coverage check that the path is
+    # exercised without erroring; value-correctness of the fix itself is
+    # covered by the two dedicated test_tail_area_fdr_* hand-calc tests above).
     config = Eiger2Config(
-        window=4, null_replicates=8, random_seed=99, compute_posterior=True,
+        window=4, null_replicates=500, random_seed=99, compute_posterior=True,
+        min_null_regions_for_posterior=5,
     )
     regions, _values, manifest = call_dmrs(matrix, locs, config=config)
     assert "posterior" in manifest
@@ -1207,9 +1217,11 @@ def test_estimate_pi0_output_is_unchanged_by_the_tail_area_fdr_fix():
     pooled = rng.exponential(2.0, size=600)
     # estimate_pi0 uses counts, not the cummin -- confirm it takes no code path
     # through _tail_area_fdr by checking its result matches a hand re-derivation
-    # from its own (unedited) counting logic.
-    result_a = estimate_pi0(observed, pooled, observed_edges=500, null_edges=3000)
-    result_b = estimate_pi0(observed, pooled, observed_edges=500, null_edges=3000)
+    # from its own (unedited) counting logic. Its real signature takes COUNTS
+    # (n_observed, n_pooled_null), not arrays -- pass len(...), not the arrays
+    # themselves, or it raises on the array truth-value check.
+    result_a = estimate_pi0(len(observed), len(pooled), observed_edges=500, null_edges=3000)
+    result_b = estimate_pi0(len(observed), len(pooled), observed_edges=500, null_edges=3000)
     assert result_a == pytest.approx(result_b)
 ```
 
