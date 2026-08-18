@@ -29,7 +29,12 @@ from eiger2 import (  # noqa: E402
     segment,
 )
 from eiger2.benchmark import evaluate, simulate  # noqa: E402
-from eiger2.core import _fdr_from_areas_result, _pair_statistic  # noqa: E402
+from eiger2.core import (  # noqa: E402
+    RegionFdrResult,  # noqa: F401
+    _fdr_from_areas_result,
+    _pair_statistic,
+    region_fdr_result,
+)
 
 FAST = {"null_replicates": 6}
 
@@ -696,3 +701,138 @@ def test_fdr_from_areas_result_exact_tie_areas_share_every_field():
     for key in ("qvalue", "tail_fdr", "qvalue_lower", "qvalue_upper",
                 "qvalue_resolution", "null_exceedances", "qvalue_cutoff_rank"):
         assert result[key][1] == result[key][2], key
+
+
+def _null_sets(rng, n_replicates, n_per_replicate, scale_hint=2.0):
+    return [
+        rng.exponential(scale_hint, size=n_per_replicate) for _ in range(n_replicates)
+    ]
+
+
+def test_region_fdr_result_matches_region_fdr_exactly():
+    rng = np.random.default_rng(21)
+    observed = rng.exponential(2.0, size=40)
+    nulls = _null_sets(rng, 6, 90)
+    result = region_fdr_result(
+        observed, nulls, observed_edges=500, null_edges=3000,
+    )
+    legacy = region_fdr(observed, nulls, observed_edges=500, null_edges=3000)
+    assert np.array_equal(result.qvalue, legacy)
+
+
+def test_region_fdr_result_empty_inputs():
+    result = region_fdr_result(
+        np.empty(0), [], observed_edges=0, null_edges=0,
+    )
+    for field in (result.qvalue, result.tail_fdr, result.qvalue_lower,
+                  result.qvalue_upper, result.qvalue_resolution):
+        assert field.shape == (0,)
+    assert result.diagnostics["pooled_fallback_strata"] == []
+
+
+def test_region_fdr_result_zero_replicates_is_all_nan():
+    result = region_fdr_result(
+        np.array([1.0, 2.0]), [], observed_edges=10, null_edges=0,
+    )
+    assert np.all(np.isnan(result.qvalue))
+    assert np.all(result.null_exceedances == -1)
+    assert np.all(result.qvalue_cutoff_rank == -1)
+    assert "status" in result.diagnostics
+
+
+def test_region_fdr_result_pooled_fallback_stratum_uses_all_six_fields():
+    rng = np.random.default_rng(22)
+    # one stratum ("4-5", n_cpg<=5) has zero null regions of that length
+    observed_lengths = np.array([4, 4, 30, 30])
+    observed_areas = np.array([5.0, 3.0, 9.0, 6.0])
+    null_area_sets = [rng.exponential(2.0, size=20) for _ in range(5)]
+    null_length_sets = [np.full(20, 30, dtype=int) for _ in range(5)]
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=200, null_edges=100,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert "4-5" in result.diagnostics["pooled_fallback_strata"]
+    assert not np.any(np.isnan(result.qvalue[:2]))
+    assert not np.any(result.null_exceedances[:2] == -1)
+
+
+def test_region_fdr_result_row_order_survives_permutation():
+    rng = np.random.default_rng(23)
+    observed = rng.exponential(2.0, size=25)
+    lengths = rng.integers(4, 60, size=25)
+    nulls = _null_sets(rng, 5, 80)
+    null_lengths = [rng.integers(4, 60, size=80) for _ in range(5)]
+    baseline = region_fdr_result(
+        observed, nulls, observed_edges=300, null_edges=400,
+        observed_lengths=lengths, null_length_sets=null_lengths,
+    )
+    perm = rng.permutation(25)
+    inv = np.argsort(perm)
+    permuted = region_fdr_result(
+        observed[perm], nulls, observed_edges=300, null_edges=400,
+        observed_lengths=lengths[perm], null_length_sets=null_lengths,
+    )
+    for a, b in (
+        (baseline.qvalue, permuted.qvalue[inv]),
+        (baseline.qvalue_lower, permuted.qvalue_lower[inv]),
+        (baseline.qvalue_upper, permuted.qvalue_upper[inv]),
+        (baseline.qvalue_resolution, permuted.qvalue_resolution[inv]),
+        (baseline.null_exceedances, permuted.null_exceedances[inv]),
+        (baseline.qvalue_cutoff_rank, permuted.qvalue_cutoff_rank[inv]),
+    ):
+        assert np.array_equal(a, b)
+
+
+def test_region_fdr_result_common_bonferroni_m_is_max_across_strata():
+    rng = np.random.default_rng(24)
+    observed_lengths = np.array([4] * 3 + [30] * 10)
+    observed_areas = rng.exponential(2.0, size=13)
+    null_area_sets = [rng.exponential(2.0, size=40) for _ in range(6)]
+    null_length_sets = [
+        np.concatenate([np.full(15, 4), np.full(25, 30)]) for _ in range(6)
+    ]
+    result = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=200, null_edges=240,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    by_stratum = result.diagnostics["fdr_interval_cutoffs_by_stratum"]
+    assert result.diagnostics["fdr_interval_bonferroni_m"] == max(by_stratum.values())
+    assert result.diagnostics["fdr_interval_family"] == "per_stratum"
+
+
+def test_region_fdr_result_length_stratified_maps_back_to_original_rows():
+    rng = np.random.default_rng(25)
+    observed_lengths = np.array([4, 30, 4, 30])
+    observed_areas = np.array([1.0, 100.0, 2.0, 50.0])
+    null_area_sets = [rng.exponential(2.0, size=60) for _ in range(4)]
+    null_length_sets = [
+        np.concatenate([np.full(30, 4), np.full(30, 30)]) for _ in range(4)
+    ]
+    result = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=100, null_edges=240,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    # short-stratum regions (indices 0, 2) must not be compared against the
+    # long-stratum null: their q-values should differ from a pooled-only run
+    pooled_result = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=100, null_edges=240,
+    )
+    assert not np.array_equal(result.qvalue, pooled_result.qvalue)
+
+
+def test_region_fdr_result_weak_candidates_do_not_inherit_a_leading_zero():
+    # spec §1.10 item 17: this is the defect's actual symptom end-to-end -- the
+    # old forward-cummin propagated the strongest region's zero to every weaker
+    # one. With plenty of weaker, genuinely null-comparable candidates, q must
+    # not be all zero or constant.
+    rng = np.random.default_rng(26)
+    strong = np.array([40.0])
+    weak = rng.exponential(2.0, size=80)  # comparable in scale to the null
+    observed = np.concatenate([strong, weak])
+    nulls = [rng.exponential(2.0, size=90) for _ in range(10)]
+    result = region_fdr_result(
+        observed, nulls, observed_edges=1000, null_edges=900,
+    )
+    assert (result.qvalue == 0).sum() < len(result.qvalue)
+    assert np.unique(result.qvalue).size > 1

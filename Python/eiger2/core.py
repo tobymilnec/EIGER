@@ -982,6 +982,26 @@ def region_area(
     return areas
 
 
+def _n_distinct(values: np.ndarray) -> int:
+    if values.size == 0:
+        return 0
+    ordered = np.sort(values)
+    return int(1 + np.sum(ordered[1:] != ordered[:-1]))
+
+
+@dataclass(frozen=True)
+class RegionFdrResult:
+    qvalue: np.ndarray
+    tail_fdr: np.ndarray
+    qvalue_lower: np.ndarray
+    qvalue_upper: np.ndarray
+    qvalue_resolution: np.ndarray
+    null_exceedances: np.ndarray
+    qvalue_cutoff_rank: np.ndarray
+    confidence_level: float
+    diagnostics: dict
+
+
 def _fdr_from_areas_result(
     observed_areas: np.ndarray,
     pooled_null: np.ndarray,
@@ -1083,7 +1103,13 @@ def length_stratum(n_cpg: int) -> str:
     return "50+"
 
 
-def region_fdr(
+def _overdispersion_diagnostic(
+    per_replicate_null_areas: list[np.ndarray], cutoffs: np.ndarray
+) -> tuple[str, float | None]:
+    return "not_yet_implemented", None
+
+
+def region_fdr_result(
     observed_areas: np.ndarray,
     null_area_sets: Sequence[np.ndarray],
     *,
@@ -1091,8 +1117,11 @@ def region_fdr(
     null_edges: int,
     observed_lengths: np.ndarray | None = None,
     null_length_sets: Sequence[np.ndarray] | None = None,
-) -> np.ndarray:
-    """Monotone region-level empirical FDR.
+    confidence_level: float = 0.95,
+) -> RegionFdrResult:
+    """Region-level empirical FDR: point estimate, resolution, and simultaneous
+    Garwood Monte Carlo bounds, computed within length strata with a common
+    Bonferroni ``m`` (spec §1.4) so ``qvalue_upper`` is comparable across strata.
 
     For a cut-off ``a``, the expected number of null regions at least as extreme
     is the mean count across replicates, rescaled to the size of the real
@@ -1104,49 +1133,141 @@ def region_fdr(
     worse than long ones and pushes the caller towards a minimum-length cutoff.
     A 4-CpG DMR is real biology; it should compete against 4-CpG null regions,
     not against 50-CpG ones.
+
+    See ``docs/FDR.md`` for the derivation and the three distinct quantities this
+    keeps apart: the point estimate, the empirical resolution, and the Monte Carlo
+    interval.
     """
 
     observed_areas = np.asarray(observed_areas, dtype=float)
-    if observed_areas.size == 0:
-        return np.empty(0, dtype=float)
+    m = observed_areas.size
+    empty_f = np.empty(0, dtype=float)
+    empty_i = np.empty(0, dtype=np.int64)
+    if m == 0:
+        return RegionFdrResult(
+            qvalue=empty_f, tail_fdr=empty_f, qvalue_lower=empty_f,
+            qvalue_upper=empty_f, qvalue_resolution=empty_f,
+            null_exceedances=empty_i, qvalue_cutoff_rank=empty_i,
+            confidence_level=confidence_level,
+            diagnostics={"pooled_fallback_strata": []},
+        )
+
     replicates = len(null_area_sets)
     if replicates == 0 or null_edges <= 0:
-        return np.full(observed_areas.shape, np.nan, dtype=float)
-    # ``null_edges`` is the TOTAL number of null edges summed over replicates,
-    # and ``null_area_sets`` are likewise pooled over replicates, so the two
-    # already correspond. Converting a pooled null count into an expectation for
-    # a genome of ``observed_edges`` edges therefore requires only the edge
-    # ratio. Dividing by ``replicates`` as well would discount the expectation a
-    # second time and make every q-value ``replicates``-fold too small; see
-    # tests/test_probability.py::test_region_fdr_scale_is_not_double_discounted.
-    scale = observed_edges / null_edges
-
-    if observed_lengths is None or null_length_sets is None:
-        pooled = np.concatenate(
-            [np.asarray(a, dtype=float) for a in null_area_sets]
+        nan_f = np.full(m, np.nan, dtype=float)
+        neg_i = np.full(m, -1, dtype=np.int64)
+        status = (
+            "no null replicates available" if replicates == 0 else "null_edges <= 0"
         )
-        return _fdr_from_areas(observed_areas, pooled, scale)
+        return RegionFdrResult(
+            qvalue=nan_f, tail_fdr=nan_f, qvalue_lower=nan_f,
+            qvalue_upper=nan_f, qvalue_resolution=nan_f,
+            null_exceedances=neg_i, qvalue_cutoff_rank=neg_i,
+            confidence_level=confidence_level,
+            diagnostics={"status": status, "pooled_fallback_strata": []},
+        )
 
-    observed_lengths = np.asarray(observed_lengths, dtype=int)
-    null_areas = np.concatenate([np.asarray(a, float) for a in null_area_sets])
-    null_lengths = np.concatenate([np.asarray(a, int) for a in null_length_sets])
-    observed_strata = np.array(
-        [length_stratum(int(n)) for n in observed_lengths], dtype=object
-    )
-    null_strata = np.array(
-        [length_stratum(int(n)) for n in null_lengths], dtype=object
-    )
+    # ``null_edges`` is the TOTAL number of null edges summed over replicates, and
+    # ``null_area_sets`` are likewise pooled over replicates, so the two already
+    # correspond -- see the identical comment preserved on the old region_fdr.
+    scale = observed_edges / null_edges
+    null_area_sets = [np.asarray(a, dtype=float) for a in null_area_sets]
 
-    result = np.full(observed_areas.shape, np.nan, dtype=float)
-    for stratum in np.unique(observed_strata):
+    stratified = observed_lengths is not None and null_length_sets is not None
+    if stratified:
+        observed_lengths = np.asarray(observed_lengths, dtype=int)
+        null_length_sets = [np.asarray(a, dtype=int) for a in null_length_sets]
+        observed_strata = np.array(
+            [length_stratum(int(n)) for n in observed_lengths], dtype=object
+        )
+        null_strata_by_replicate = [
+            np.array([length_stratum(int(n)) for n in lengths], dtype=object)
+            for lengths in null_length_sets
+        ]
+    else:
+        observed_strata = np.full(m, "_pooled", dtype=object)
+        null_strata_by_replicate = [
+            np.full(areas.size, "_pooled", dtype=object) for areas in null_area_sets
+        ]
+
+    strata = np.unique(observed_strata)
+
+    # --- Pass A: distinct-cutoff count per stratum, then the common m_bonferroni
+    cutoffs_by_stratum = {
+        str(s): _n_distinct(observed_areas[observed_strata == s]) for s in strata
+    }
+    m_bonferroni = max(cutoffs_by_stratum.values())
+
+    # --- Pass B: run the estimator per stratum with that common m
+    qvalue = np.empty(m, dtype=float)
+    tail_fdr = np.empty(m, dtype=float)
+    qvalue_lower = np.empty(m, dtype=float)
+    qvalue_upper = np.empty(m, dtype=float)
+    qvalue_resolution = np.empty(m, dtype=float)
+    null_exceedances = np.empty(m, dtype=np.int64)
+    qvalue_cutoff_rank = np.empty(m, dtype=np.int64)
+    pooled_fallback_strata: list[str] = []
+    overdispersion_by_stratum: dict[str, dict] = {}
+
+    for stratum in strata:
         rows = np.flatnonzero(observed_strata == stratum)
-        pooled = null_areas[null_strata == stratum]
+        per_replicate = [
+            null_area_sets[b][null_strata_by_replicate[b] == stratum]
+            for b in range(replicates)
+        ]
+        pooled = np.concatenate(per_replicate) if per_replicate else np.empty(0)
         if pooled.size == 0:
-            # no null region of this length ever formed; fall back to the pooled
-            # null so the stratum is scored conservatively rather than as q = 0
-            pooled = null_areas
-        result[rows] = _fdr_from_areas(observed_areas[rows], pooled, scale)
-    return result
+            pooled_fallback_strata.append(str(stratum))
+            pooled = np.concatenate(null_area_sets)
+            per_replicate = null_area_sets
+        piece = _fdr_from_areas_result(
+            observed_areas[rows], pooled, scale,
+            confidence_level=confidence_level, m_bonferroni=m_bonferroni,
+        )
+        qvalue[rows] = piece["qvalue"]
+        tail_fdr[rows] = piece["tail_fdr"]
+        qvalue_lower[rows] = piece["qvalue_lower"]
+        qvalue_upper[rows] = piece["qvalue_upper"]
+        qvalue_resolution[rows] = piece["qvalue_resolution"]
+        null_exceedances[rows] = piece["null_exceedances"].astype(np.int64)
+        qvalue_cutoff_rank[rows] = piece["qvalue_cutoff_rank"]
+        overdispersion_by_stratum[str(stratum)] = _overdispersion_diagnostic(
+            per_replicate, piece["cutoffs"]
+        )
+
+    diagnostics = {
+        "fdr_interval_bonferroni_m": m_bonferroni,
+        "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
+        "fdr_interval_family": "per_stratum",
+        "pooled_fallback_strata": pooled_fallback_strata,
+        "null_count_dispersion_by_stratum": overdispersion_by_stratum,
+        "scale": scale,
+    }
+    return RegionFdrResult(
+        qvalue=qvalue, tail_fdr=tail_fdr, qvalue_lower=qvalue_lower,
+        qvalue_upper=qvalue_upper, qvalue_resolution=qvalue_resolution,
+        null_exceedances=null_exceedances, qvalue_cutoff_rank=qvalue_cutoff_rank,
+        confidence_level=confidence_level, diagnostics=diagnostics,
+    )
+
+
+def region_fdr(
+    observed_areas: np.ndarray,
+    null_area_sets: Sequence[np.ndarray],
+    *,
+    observed_edges: int,
+    null_edges: int,
+    observed_lengths: np.ndarray | None = None,
+    null_length_sets: Sequence[np.ndarray] | None = None,
+) -> np.ndarray:
+    """Monotone region-level empirical FDR. Signature frozen; see region_fdr_result
+    for the resolution and Garwood-bound fields."""
+
+    return region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=observed_edges, null_edges=null_edges,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    ).qvalue
 
 
 def qvalues_from_track(

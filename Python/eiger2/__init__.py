@@ -13,6 +13,7 @@ __version__ = "2.0.0"
 
 from .core import (
     Eiger2Config,
+    RegionFdrResult,
     call_dmrs,
     centre_cpgs,
     characterise_region,
@@ -21,6 +22,7 @@ from .core import (
     estimate_latent_basis,
     null_threshold,
     region_fdr,
+    region_fdr_result,
     segment,
 )
 from .probability import (
@@ -36,6 +38,7 @@ __all__ = [
     "# probability layer",
     "Eiger2Config",
     "LocalFdrResult",
+    "RegionFdrResult",
     "calibration_error",
     "call_dmrs",
     "centre_cpgs",
@@ -47,6 +50,7 @@ __all__ = [
     "local_fdr",
     "null_threshold",
     "region_fdr",
+    "region_fdr_result",
     "reliability_table",
     "segment",
 ]
