@@ -29,7 +29,7 @@ from eiger2 import (  # noqa: E402
     segment,
 )
 from eiger2.benchmark import evaluate, simulate  # noqa: E402
-from eiger2.core import _pair_statistic  # noqa: E402
+from eiger2.core import _fdr_from_areas_result, _pair_statistic  # noqa: E402
 
 FAST = {"null_replicates": 6}
 
@@ -551,3 +551,148 @@ def test_latent_basis_is_not_estimated_from_mean_filled_rows():
     assert diagnostics["thin_rows_used"] <= diagnostics["thin_rows_offered"]
     if diagnostics["basis_source"] == "complete_rows":
         assert diagnostics["thin_rows_used"] == diagnostics["thin_rows_complete"]
+
+
+def test_fdr_from_areas_result_four_distinct_areas():
+    observed = np.array([10.0, 8.0, 6.0, 4.0])
+    pooled = np.array([9.0, 7.0, 5.0, 3.0])
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=1.0, confidence_level=0.95, m_bonferroni=4,
+    )
+    assert result["tail_fdr"] == pytest.approx([0.0, 0.5, 2 / 3, 0.75])
+    assert result["qvalue"] == pytest.approx([0.0, 0.5, 2 / 3, 0.75])
+    assert result["null_exceedances"] == pytest.approx([0, 1, 2, 3])
+    assert result["qvalue_cutoff_rank"] == pytest.approx([1, 2, 3, 4])
+
+
+def test_fdr_from_areas_result_tie_group():
+    observed = np.array([10.0, 8.0, 8.0, 4.0])
+    pooled = np.array([9.0, 7.5, 5.0, 3.0])
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=1.0, confidence_level=0.95, m_bonferroni=3,
+    )
+    assert result["tail_fdr"] == pytest.approx([0.0, 1 / 3, 1 / 3, 0.75])
+    assert result["qvalue"] == pytest.approx([0.0, 1 / 3, 1 / 3, 0.75])
+    assert result["qvalue_cutoff_rank"] == pytest.approx([1, 3, 3, 4])
+    assert result["_n_cutoffs"] == 3
+
+
+def test_fdr_from_areas_result_qvalue_is_nondecreasing_as_area_weakens():
+    rng = np.random.default_rng(11)
+    observed = rng.exponential(2.0, size=60)
+    pooled = rng.exponential(2.0, size=400)
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=0.3, confidence_level=0.95, m_bonferroni=60,
+    )
+    order = np.argsort(-observed, kind="mergesort")
+    q = result["qvalue"][order]
+    assert np.all(np.diff(q) >= -1e-12)
+
+
+def test_fdr_from_areas_result_bounds_bracket_the_point_estimate():
+    rng = np.random.default_rng(12)
+    observed = rng.exponential(2.0, size=50)
+    pooled = rng.exponential(2.0, size=300)
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=0.4, confidence_level=0.95, m_bonferroni=50,
+    )
+    assert np.all(result["qvalue_lower"] <= result["qvalue"] + 1e-12)
+    assert np.all(result["qvalue"] <= result["qvalue_upper"] + 1e-12)
+
+
+def test_fdr_from_areas_result_zero_exceedances_has_nonzero_upper_bound():
+    observed = np.array([50.0, 3.0])
+    pooled = np.array([1.0, 0.5])
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=1.0, confidence_level=0.95, m_bonferroni=2,
+    )
+    assert result["qvalue"][0] == 0.0
+    assert result["qvalue_lower"][0] == 0.0
+    assert result["qvalue_upper"][0] > 0.0
+
+
+def test_fdr_from_areas_result_more_null_exposure_narrows_the_interval():
+    # spec §1.10 item 8: increasing null exposure at a fixed rate (same scale,
+    # more pooled null observations at the same relative density) must narrow
+    # [lower, upper] because larger K gives a tighter Garwood interval.
+    observed = np.array([9.0, 7.0, 5.0, 3.0])
+    rng = np.random.default_rng(15)
+    sparse_null = rng.exponential(2.0, size=40)
+    dense_null = np.concatenate([sparse_null, rng.exponential(2.0, size=400)])
+    sparse = _fdr_from_areas_result(
+        observed, sparse_null, scale=0.5, confidence_level=0.95, m_bonferroni=4,
+    )
+    dense = _fdr_from_areas_result(
+        observed, dense_null, scale=0.5, confidence_level=0.95, m_bonferroni=4,
+    )
+    sparse_width = sparse["qvalue_upper"] - sparse["qvalue_lower"]
+    dense_width = dense["qvalue_upper"] - dense["qvalue_lower"]
+    assert np.all(dense_width <= sparse_width + 1e-9)
+    assert np.any(dense_width < sparse_width - 1e-9)
+
+
+def test_fdr_from_areas_result_resolution_matches_scale_over_rank():
+    rng = np.random.default_rng(13)
+    observed = rng.exponential(1.0, size=30)
+    pooled = rng.exponential(1.0, size=200)
+    scale = 0.5
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=scale, confidence_level=0.95, m_bonferroni=30,
+    )
+    expected = np.minimum(1.0, scale / result["qvalue_cutoff_rank"])
+    assert result["qvalue_resolution"] == pytest.approx(expected)
+
+
+def test_fdr_from_areas_result_vectorised_argmin_matches_naive_reverse_loop():
+    rng = np.random.default_rng(14)
+    for _ in range(200):
+        n = rng.integers(3, 25)
+        observed = rng.choice(np.round(rng.exponential(2.0, size=n), 2), size=n)
+        pooled = rng.exponential(2.0, size=rng.integers(5, 60))
+        vectorised = _fdr_from_areas_result(
+            observed, pooled, scale=0.6, confidence_level=0.95,
+            m_bonferroni=int(np.unique(observed).size),
+        )
+
+        # naive reverse loop over the same grouped structure
+        order = np.argsort(-observed, kind="mergesort")
+        ranked = observed[order]
+        pooled_sorted = np.sort(pooled)
+        m = ranked.size
+        new_group = np.empty(m, dtype=bool)
+        new_group[0] = True
+        new_group[1:] = ranked[1:] != ranked[:-1]
+        group_of_row = np.cumsum(new_group) - 1
+        G = int(group_of_row[-1]) + 1
+        cutoff = ranked[new_group]
+        last_row_of_group = np.flatnonzero(np.append(new_group[1:], True))
+        R = (last_row_of_group + 1).astype(float)
+        K = (pooled_sorted.size - np.searchsorted(pooled_sorted, cutoff)).astype(float)
+        raw = np.minimum(1.0, 0.6 * K / R)
+        q_group = np.empty(G)
+        arg_group = np.empty(G, dtype=int)
+        running_min = raw[G - 1]
+        running_arg = G - 1
+        for g in range(G - 1, -1, -1):
+            if raw[g] <= running_min:
+                running_min = raw[g]
+                running_arg = g
+            q_group[g] = running_min
+            arg_group[g] = running_arg
+        assert arg_group[-1] != -1  # spec's own sanity check, restated
+
+        expanded_q = q_group[group_of_row]
+        out = np.empty(m)
+        out[order] = expanded_q
+        assert vectorised["qvalue"] == pytest.approx(out)
+
+
+def test_fdr_from_areas_result_exact_tie_areas_share_every_field():
+    observed = np.array([10.0, 8.0, 8.0, 4.0])
+    pooled = np.array([9.0, 7.5, 5.0, 3.0])
+    result = _fdr_from_areas_result(
+        observed, pooled, scale=1.0, confidence_level=0.95, m_bonferroni=3,
+    )
+    for key in ("qvalue", "tail_fdr", "qvalue_lower", "qvalue_upper",
+                "qvalue_resolution", "null_exceedances", "qvalue_cutoff_rank"):
+        assert result[key][1] == result[key][2], key

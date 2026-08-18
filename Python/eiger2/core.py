@@ -35,6 +35,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
+from scipy.stats import chi2
 
 __all__ = [
     "Eiger2Config",
@@ -981,21 +982,91 @@ def region_area(
     return areas
 
 
+def _fdr_from_areas_result(
+    observed_areas: np.ndarray,
+    pooled_null: np.ndarray,
+    scale: float,
+    *,
+    confidence_level: float,
+    m_bonferroni: int,
+) -> dict:
+    """Tail-area FDR, Garwood bounds and resolution for one length stratum.
+
+    ``raw``/``qvalue`` are the corrected reverse-cumulative-minimum tail estimate:
+    the previous ``np.minimum.accumulate`` scanned strongest-to-weakest FORWARD,
+    which propagates the strongest region's near-universal zero exceedance count to
+    every weaker region. ``q_i = min_{j>=i} FDR_j`` requires the reverse scan.
+    Distinct-cutoff grouping (rather than sequential rank) makes tied areas share a
+    denominator, so two regions with identical area are not scored as if one were
+    stronger than the other.
+    """
+
+    m = observed_areas.size
+    pooled = np.sort(pooled_null[np.isfinite(pooled_null)])
+
+    # --- distinct cutoffs, strongest first. EXACT float equality; no rounding bins.
+    order = np.argsort(-observed_areas, kind="mergesort")
+    ranked = observed_areas[order]
+    new_group = np.empty(m, dtype=bool)
+    new_group[0] = True
+    new_group[1:] = ranked[1:] != ranked[:-1]
+    group_of_row = np.cumsum(new_group) - 1            # 0..G-1, per ranked row
+    G = int(group_of_row[-1]) + 1
+    cutoff = ranked[new_group]                          # strictly decreasing
+
+    # R_g: rows with area >= cutoff[g] == cumulative count through end of group g
+    last_row_of_group = np.flatnonzero(np.append(new_group[1:], True))
+    R = (last_row_of_group + 1).astype(float)
+    K = (pooled.size - np.searchsorted(pooled, cutoff, side="left")).astype(float)
+
+    raw   = np.minimum(1.0, scale * K / R)
+    delta = np.minimum(1.0, scale / R)
+
+    alpha  = 1.0 - confidence_level
+    astar  = alpha / max(int(m_bonferroni), 1)
+    L = np.where(K > 0, 0.5 * chi2.ppf(astar / 2.0, 2.0 * K), 0.0)
+    U = 0.5 * chi2.ppf(1.0 - astar / 2.0, 2.0 * (K + 1.0))
+    lo = np.minimum(1.0, scale * L / R)
+    hi = np.minimum(1.0, scale * U / R)
+
+    # --- reverse cumulative minimum, with argmin, over GROUPS
+    rev      = raw[::-1]
+    run_min  = np.minimum.accumulate(rev)
+    # index of the achieving cutoff; ties resolve to the STRONGER (later in rev order)
+    cand     = np.where(rev == run_min, np.arange(G), -1)
+    arg_rev  = np.maximum.accumulate(cand)
+    q_group     = run_min[::-1]
+    qarg_group  = (G - 1) - arg_rev[::-1]
+    q_lo_group  = np.minimum.accumulate(lo[::-1])[::-1]
+    q_hi_group  = np.minimum.accumulate(hi[::-1])[::-1]
+
+    # --- expand groups back to ranked rows, then restore original row order
+    def _expand(v):
+        out = np.empty(m, dtype=v.dtype)
+        out[order] = v[group_of_row]
+        return out
+
+    return {
+        "qvalue":            _expand(q_group),
+        "tail_fdr":          _expand(raw),          # region's OWN cutoff, not q-achieving
+        "qvalue_lower":      _expand(q_lo_group),
+        "qvalue_upper":      _expand(q_hi_group),
+        "qvalue_resolution": _expand(delta[qarg_group]),
+        "null_exceedances":  _expand(K[qarg_group]),
+        "qvalue_cutoff_rank":_expand(R[qarg_group].astype(np.int64)),
+        "cutoffs":           cutoff,
+        "_n_cutoffs":        G,
+    }
+
+
 def _fdr_from_areas(
     observed_areas: np.ndarray, pooled_null: np.ndarray, scale: float
 ) -> np.ndarray:
-    pooled = np.sort(pooled_null[np.isfinite(pooled_null)])
-    order = np.argsort(-observed_areas, kind="mergesort")
-    ranked = observed_areas[order]
-    expected_null = (
-        pooled.size - np.searchsorted(pooled, ranked, side="left")
-    ) * scale
-    observed_count = np.arange(1, ranked.size + 1, dtype=float)
-    raw = np.clip(expected_null / observed_count, 0.0, 1.0)
-    monotone = np.minimum.accumulate(raw)
-    result = np.empty_like(monotone)
-    result[order] = monotone
-    return result
+    m = observed_areas.size
+    return _fdr_from_areas_result(
+        observed_areas, pooled_null, scale,
+        confidence_level=0.95, m_bonferroni=int(np.unique(observed_areas).size) or 1,
+    )["qvalue"]
 
 
 def length_stratum(n_cpg: int) -> str:
