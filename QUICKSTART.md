@@ -201,7 +201,7 @@ coverage files is not yet wired into the CLI.
 
 | File | Contents |
 |---|---|
-| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue` and five related FDR columns (new in v2.0.1, see below), `significant`, and `*_descriptive` characterisation fields |
+| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue` and six related FDR columns (new in v2.0.1, see below), `significant`, and `*_descriptive` characterisation fields |
 | `region_sample_means.csv` | per-region mean methylation for each sample |
 | `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, `schema_version`, `fdr_decision`, and the realised null diagnostics |
 
@@ -213,7 +213,7 @@ for reading rather than filtering.
 In `--legacy` mode `region_qvalue` is `NA` by construction: the published method
 defines no false discovery rate. That is the point of the comparison.
 
-### New in v2.0.1: five columns alongside `region_qvalue`
+### New in v2.0.1: six columns alongside `region_qvalue`
 
 | Column | Meaning |
 |---|---|

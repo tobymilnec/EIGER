@@ -97,6 +97,13 @@ scenario tested, before Stage 1's FDR machinery existed at all.
   and re-running the full spec-scale benchmark grid (100 seeds x 5 scenarios x both
   `null_mode`s x windows {1,4,6,8} x `null_replicates` {20,100}), is the recommended
   next step before relying on this release's FDR control in these regimes.
+- This release's benchmarks ran at reduced scale — 3-5 seeds, a single discovery
+  statistic, no sweep over `null_mode`, `window`, or `null_replicates` (see
+  `results_v201/`) — so it is not only the miscalibration (criterion 3) that is
+  confirmed only at this reduced scale: the monotonicity and zero-q vacuity guard
+  checks reported above as "0 violations" (gate criteria 1 and 2) are likewise
+  confirmed only at the 3-5 seed scale actually run, not at the spec's full
+  100-seed design.
 
 ---
 
@@ -352,7 +359,15 @@ run.
 | — | `null_exceedances_at_cutoff` | new: pooled exceedance count `K` at the q-achieving cutoff (`-1` if unavailable) |
 | — | `region_qvalue_cutoff_rank` | new: `R` at the q-achieving cutoff (`-1` if unavailable) |
 | `region_evidence_score` | `region_evidence_score` | value changes for extrapolated-tail regions (uses the corrected `_tail_area_fdr`, see `docs/PROBABILITY.md`) |
+| `evidence_score_extrapolated` | `evidence_score_extrapolated` | value changes for extrapolated-tail regions, same reason as `region_evidence_score` above |
 | `significant` | `significant` | value changes (derived from the corrected q-value; conditionally from the upper bound under `--fdr-decision upper`) |
+
+Spec §0.3.3 names six values that change by design in total; the six rows above cover
+four of them (`region_qvalue`, `region_evidence_score`, `evidence_score_extrapolated`,
+`significant`). The remaining two, `n_significant` and `n_passing_qvalue`, are not
+`regions.csv` columns — they are manifest-level counts (`manifest["n_significant"]`,
+`manifest["n_passing_qvalue"]` in `core.py`) — but they change by design for the same
+reason: they are derived from the corrected `significant` / `region_qvalue` values.
 
 The following are bit-for-bit invariant between v2.0.0 and v2.0.1 for a default
 fixed-window run and are **not** in the table above because they do not change:

@@ -200,7 +200,7 @@ pytest tests -q
 pytest old_code/tests -q
 ```
 
-At the time of writing (v2.0.1), the current package contains 86 tests and the superseded beta implementation contains 27 tests.
+At the time of writing (v2.0.1), the current package contains 87 tests and the superseded beta implementation contains 27 tests.
 
 ---
 
@@ -240,8 +240,10 @@ Full derivation and worked examples are in [docs/FDR.md](docs/FDR.md); summary:
 | `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
 | `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
 
-`region_qvalue`, `region_evidence_score`, and `significant` all change value from
-v2.0.0 by design (see the migration note above).
+Six values change from v2.0.0 by design (spec §0.3.3; see the migration note above):
+the `regions.csv` columns `region_qvalue`, `region_evidence_score`,
+`evidence_score_extrapolated`, and `significant`, plus the manifest-level counts
+`n_significant` and `n_passing_qvalue`.
 
 ### `--fdr-decision {point,upper}`
 

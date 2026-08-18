@@ -1,5 +1,13 @@
 # EIGER benchmark: original vs EIGER 2
 
+> **Historical — produced with EIGER v2.0.0 (commit `b8e4a19`).** All EIGER 2
+> region-level metrics below derive from the pre-v2.0.1 q-value calculation, which
+> had a confirmed direction/tie defect (see [docs/FDR.md](FDR.md)) and understated
+> the realised false discovery rate. See
+> [docs/FDR.md's "Known limitation" section](FDR.md#known-limitation-fdr-calibration-under-missingness-small-n-and-high-noise)
+> for the corrected, measured figures. Do not use these numbers to assess v2.0.1's
+> calibration.
+
 Seeds per scenario: 3. All values are means across seeds. The original method's covariance threshold is swept; EIGER 2 runs once at its automatic operating point.
 
 
