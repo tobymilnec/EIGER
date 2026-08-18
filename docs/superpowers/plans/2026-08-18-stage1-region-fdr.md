@@ -2302,18 +2302,8 @@ envelope fields alongside them rather than replacing them, since other code read
     }
 ```
 
-Add `_peak_memory_mb()`:
-
-```python
-def _peak_memory_mb() -> float:
-    import resource
-    peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Linux reports KiB, macOS reports bytes -- normalise via platform check.
-    return peak_kb / 1024.0 if sys.platform == "darwin" else peak_kb / 1024.0
-```
-
-macOS `ru_maxrss` is in bytes, Linux in KiB — correct this: on Darwin divide by
-`1024*1024` (bytes → MB), on Linux divide by `1024` (KiB → MB):
+Add `_peak_memory_mb()`. `ru_maxrss` is bytes on macOS/Darwin and KiB on Linux, so the
+divisor differs by platform:
 
 ```python
 def _peak_memory_mb() -> float:
