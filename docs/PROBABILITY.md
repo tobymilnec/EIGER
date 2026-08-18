@@ -225,7 +225,30 @@ column name and the manifest all say so.
   posterior is wrong in the same direction and by the same amount as the
   q-value. It is not an independent check.
 
-## 7. A bug fixed at the same time
+## 7. The v2.0.1 `_tail_area_fdr` direction/tie correction
+
+`_tail_area_fdr` (`probability.py`) is the fallback used for the **extrapolated tail**
+of `local_fdr` — i.e. it governs the regions with the strongest area, beyond the
+support of the pooled null, where the density-ratio estimate in Sections 1-4 cannot be
+evaluated. Through v2.0.0 it carried the identical defect as `core._fdr_from_areas`:
+a forward (rather than reverse) cumulative minimum over strongest-to-weakest areas,
+and a sequential-rank (rather than tie-aware) denominator.
+
+v2.0.1 applies the identical fix: `q = np.minimum.accumulate(raw[::-1])[::-1]` in
+place of a forward `np.minimum.accumulate(raw)`, and a distinct-cutoff `R` (tie group
+included) in place of sequential rank `1, 2, 3, ...`. The corrected function returns a
+**point estimate only** — no Garwood bounds are attached on this path, since it is a
+one-shot fallback rather than the primary per-region estimator. See
+[`docs/FDR.md`](FDR.md) for the full derivation, the worked hand-calculation examples,
+and why the direction and tie-aware denominator matter; it is not re-derived here.
+
+**Consequence for this module's output:** `region_evidence_score` and
+`evidence_score_extrapolated` change for regions that fall on the extrapolated-tail
+path, because they are computed from the corrected `_tail_area_fdr` from this release
+onward. This is listed in the v2.0.0-to-v2.0.1 invariant/non-invariant column table in
+`docs/FDR.md` and in the release migration note.
+
+## 8. A bug fixed at the same time
 
 `core.region_fdr` computed its scale as `(observed_edges / null_edges) /
 replicates`, while `call_dmrs` passes `null_edges` **summed over replicates**.

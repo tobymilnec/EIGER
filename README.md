@@ -54,13 +54,45 @@ The validation analyses, assumptions, and commands underlying these changes are 
 
 EIGER2 improves the interpretation of coordinated methylation regions, but it does not remove every limitation of unsupervised regional calling.
 
-### Structured missingness
+### Structured missingness, small samples, and high noise — FDR miscalibration (v2.0.1)
 
-The locality-breaking null assumes that missing data do not contain strong genomic structure. When dropout is spatially or biologically structured, this assumption can fail.
+**Known limitation:** with v2.0.1's corrected region-level q-values (see below and
+[docs/FDR.md](docs/FDR.md)), the realised false discovery rate at the default
+`target_fdr = 0.05` and `--fdr-decision point` has been measured — on genuinely
+null (DMR-free) simulated data, three independent ways — to substantially exceed the
+5% nominal target in three of five tested scenarios:
 
-In simulations with 25% structured dropout, the realised false discovery rate was approximately 0.24–0.35 at a nominal threshold of 0.05. This remained largely unchanged across segmentation settings, suggesting a systematic bias rather than a parameter-tuning problem.
+| scenario | realised FDR (nominal target: 5%) |
+|---|---|
+| clean | ~9–10% |
+| nuisance | ~9% |
+| high_noise | ~56–70% |
+| small_n | ~55–71% |
+| missingness | **~99%** |
 
-Datasets with substantial structured missingness should therefore be interpreted cautiously and assessed using the diagnostics written to the run manifest.
+This supersedes the earlier structured-missingness figure previously reported here
+(0.24–0.35 under 25% dropout, produced under the old, defective forward-cummin q-value
+machinery). The corrected estimator did not introduce this problem — it revealed it:
+under v2.0.0's defect, nearly every candidate region in every scenario was assigned
+q ≈ 0 regardless of its actual evidence, which hid the underlying miscalibration
+entirely. The monotonicity invariant and the zero-q vacuity guard that the corrected
+estimator is responsible for both hold with zero violations across every check run
+against real data — this is not a defect in the FDR-correction code itself. It points
+upstream, to the discovery statistic's and null-track construction's behaviour under
+missingness, small sample size, and high noise, which is out of scope for this release
+(v2.0.1 explicitly does not change the discovery statistic, threshold rule, or
+segmentation) and is flagged here for follow-up investigation.
+
+**Treat `region_qvalue` and `significant` with caution in these regimes** — high
+missingness, small sample size, or high measurement noise — until this is
+investigated further. `clean` and `nuisance` scenarios are close to nominal at the
+scale tested, but have not been confirmed at a larger simulation scale either.
+
+Full data, three independent measurement paths, and the release-gate assessment are
+recorded in [docs/FDR.md](docs/FDR.md#known-limitation-fdr-calibration-under-missingness-small-n-and-high-noise).
+Datasets with substantial structured missingness, small sample size, or high noise
+should be interpreted cautiously and assessed using the diagnostics written to the run
+manifest.
 
 ### Per-region evidence score
 
@@ -168,17 +200,73 @@ pytest tests -q
 pytest old_code/tests -q
 ```
 
-At the time of writing, the current package contains 48 tests and the superseded beta implementation contains 27 tests.
+At the time of writing (v2.0.1), the current package contains 86 tests and the superseded beta implementation contains 27 tests.
 
 ---
 
 ## Outputs
+
+> **Migration note (v2.0.1):** corrected q-values differ from v2.0.0 even though
+> candidate region boundaries are unchanged. Results generated with v2.0.0 must be
+> regenerated before use — the direction of the region-level FDR's monotone step was
+> reversed, which under-called false discoveries in v2.0.0 (see
+> [docs/FDR.md](docs/FDR.md)). Some scenarios remain poorly calibrated even after this
+> correction — see the callout immediately below and
+> [docs/FDR.md](docs/FDR.md#known-limitation-fdr-calibration-under-missingness-small-n-and-high-noise).
+
+> **Known limitation:** realised FDR control has been found to be substantially
+> miscalibrated under high-missingness, small-sample, and high-noise conditions (see
+> [docs/FDR.md](docs/FDR.md), and the "Structured missingness, small samples, and high
+> noise" section above). Treat `region_qvalue`/`significant` with caution in these
+> regimes until this is investigated further.
 
 The principal region-level output is `regions.csv`, with one row per detected region.
 
 **`region_qvalue` is the principal field used to assess region-level statistical support.**
 
 Other fields, including methylation difference, direction, and inferred sample grouping, are descriptive. These values are calculated after region selection using the same data and should not be treated as independent statistical evidence or used as additional significance filters without further validation.
+
+### New in v2.0.1: FDR resolution and Monte Carlo bounds
+
+Six columns were added to `regions.csv`, inserted immediately after `region_qvalue`.
+Full derivation and worked examples are in [docs/FDR.md](docs/FDR.md); summary:
+
+| Column | Meaning |
+|---|---|
+| `region_tail_fdr` | point FDR at the region's own area cutoff |
+| `region_qvalue_lower_95` | simultaneous Garwood lower Monte Carlo bound |
+| `region_qvalue_upper_95` | simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| `region_qvalue_resolution` | one scaled null exceedance's worth of change at the q-achieving cutoff |
+| `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
+| `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
+
+`region_qvalue`, `region_evidence_score`, and `significant` all change value from
+v2.0.0 by design (see the migration note above).
+
+### `--fdr-decision {point,upper}`
+
+```bash
+eiger2 call --betas betas.tsv --locations cpgs.bed --out results/ \
+    --fdr-decision upper
+```
+
+`point` (default) calls a region significant when `region_qvalue <= target_fdr` —
+unchanged in spirit from v2.0.0. `upper` instead requires
+`region_qvalue_upper_95 <= target_fdr`: the conservative decision under finite-null
+estimation uncertainty, useful when few null replicates are available and a point
+estimate of exactly zero should not, on its own, be trusted as a call. `upper` refuses
+to run (rather than silently returning zero significant regions) if the replicate
+count can't achieve the target even in the best case; the error names the required
+replicate count.
+
+### Null replicate default: 20 → 100
+
+`Eiger2Config.null_replicates` now defaults to **100** (previously 20), giving a finer
+resolution at the decision boundary and a materially narrower `region_qvalue_upper_95`
+at zero exceedances. This costs runtime roughly linearly in replicate count: measured
+on a 200-sample, `dmr_length=20` synthetic input, `call_dmrs` took **0.197s at 20
+replicates** and **0.805s at 100 replicates** (~4.1x). Pass `--null-replicates 20` to
+restore the old default if runtime matters more than resolution for a given run.
 
 Each run also produces `run_manifest.json`, which records:
 

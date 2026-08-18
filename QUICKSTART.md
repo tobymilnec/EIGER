@@ -28,7 +28,7 @@ Check it:
 ```bash
 eiger2 --version
 python -c "import eiger2; print(eiger2.__version__)"
-pytest -q                               # 75 tests, ~4 s
+pytest -q                               # 86 tests, ~9 s
 ```
 
 ### Alternative: pip only
@@ -187,19 +187,45 @@ coverage files is not yet wired into the CLI.
 
 ## 5. Outputs
 
+> **Migration note (v2.0.1):** corrected q-values differ from v2.0.0 even though
+> candidate region boundaries are unchanged. Results generated with v2.0.0 must be
+> regenerated before use — the direction of the region-level FDR's monotone step was
+> reversed, which under-called false discoveries in v2.0.0 (see
+> [docs/FDR.md](docs/FDR.md)).
+>
+> **Known limitation:** realised FDR control has been found to be substantially
+> miscalibrated under high-missingness, small-sample, and high-noise conditions, even
+> with the corrected q-values above (see [docs/FDR.md](docs/FDR.md) and the README's
+> "Important limitations" section). Treat `region_qvalue`/`significant` with caution
+> in these regimes until this is investigated further.
+
 | File | Contents |
 |---|---|
-| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue`, `significant`, and `*_descriptive` characterisation fields |
+| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue` and five related FDR columns (new in v2.0.1, see below), `significant`, and `*_descriptive` characterisation fields |
 | `region_sample_means.csv` | per-region mean methylation for each sample |
-| `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, and the realised null diagnostics |
+| `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, `schema_version`, `fdr_decision`, and the realised null diagnostics |
 
-**`region_qvalue` is the only field that expresses confidence that a region is
+**`region_qvalue` is the principal field that expresses confidence that a region is
 real.** Every `*_descriptive` field — delta beta, direction, the inferred sample
 split — is computed *after* the region was selected, on the same data, and is
 for reading rather than filtering.
 
 In `--legacy` mode `region_qvalue` is `NA` by construction: the published method
 defines no false discovery rate. That is the point of the comparison.
+
+### New in v2.0.1: five columns alongside `region_qvalue`
+
+| Column | Meaning |
+|---|---|
+| `region_tail_fdr` | point FDR at the region's own area cutoff |
+| `region_qvalue_lower_95` | simultaneous Garwood lower Monte Carlo bound |
+| `region_qvalue_upper_95` | simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| `region_qvalue_resolution` | one scaled null exceedance's worth of change at the q-achieving cutoff |
+| `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
+| `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
+
+See [docs/FDR.md](docs/FDR.md) for the full derivation, the Garwood interval's Poisson
+assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneous).
 
 ---
 
@@ -212,10 +238,38 @@ defines no false discovery rate. That is the point of the comparison.
 --statistic correlation|covariance   # default correlation; see README
 --window 4                           # CpGs per window; use 1 above ~30 samples
 --min-cpgs 4                         # minimum region length
---null-replicates 20                 # raise to 100-300 for --compute-posterior
+--null-replicates 100                # default since v2.0.1 (was 20); raise further
+                                      # for --compute-posterior (100-300)
+--fdr-decision point|upper           # default point; upper decides on
+                                      # region_qvalue_upper_95 instead (conservative)
 --target-fdr 0.05
 --compute-posterior                  # per-region evidence SCORE, not a probability
 ```
+
+### `--null-replicates` default change (v2.0.1) and its runtime cost
+
+`--null-replicates` now defaults to **100** (previously 20). This gives a finer
+resolution at the significance boundary and a materially narrower
+`region_qvalue_upper_95` when the point estimate is zero (see
+[docs/FDR.md](docs/FDR.md)). It costs runtime roughly linearly in replicate count.
+Measured on a 200-sample, `dmr_length=20` synthetic input:
+
+- **20 replicates: 0.197 s**
+- **100 replicates: 0.805 s** (~4.1x)
+
+Pass `--null-replicates 20` explicitly to restore the old default when runtime matters
+more than resolution.
+
+### `--fdr-decision point|upper`
+
+`point` (default) calls a region significant when `region_qvalue <= target-fdr`,
+unchanged in spirit from v2.0.0. `upper` instead requires
+`region_qvalue_upper_95 <= target-fdr` — the conservative decision under finite-null
+estimation uncertainty. Use `upper` when few null replicates are available and a point
+estimate of exactly zero should not, on its own, be trusted as a call. If the current
+replicate count cannot achieve the target even in the best case, `upper` refuses to
+run rather than silently returning zero significant regions; the error names the
+replicate count required.
 
 ### Choosing a null: `--null-mode`
 
