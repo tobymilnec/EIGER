@@ -657,6 +657,9 @@ def test_fdr_from_areas_result_zero_exceedances_has_nonzero_upper_bound():
     assert result["qvalue"][0] == 0.0
     assert result["qvalue_lower"][0] == 0.0
     assert result["qvalue_upper"][0] > 0.0
+    # Spec §0.3.5: a zero point estimate must carry both a nonzero upper bound
+    # AND a nonzero resolution -- the upper bound alone isn't sufficient.
+    assert result["qvalue_resolution"][0] > 0.0
 
 
 def test_fdr_from_areas_result_more_null_exposure_narrows_the_interval():
@@ -925,9 +928,10 @@ def test_region_fdr_result_overdispersion_warning_end_to_end():
     for i in range(8):
         density = 300 if i % 2 == 0 else 10
         nulls.append(rng.exponential(2.0, size=density))
-    result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=sum(len(n) for n in nulls))
-    by_stratum = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
-    assert by_stratum[0] in {"computed", "unavailable"}
+    result = region_fdr_result(
+        observed, nulls, observed_edges=500,
+        null_edges=sum(len(n) for n in nulls),
+    )
     assert result.diagnostics["null_count_overdispersion_warning"] is not None
 
 
@@ -939,6 +943,10 @@ def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
     status, ratio = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
     if status == "computed":
         assert ratio < 1.5
+    # Spec 1.10 item 25: confirm the top-level warning does not fire for a
+    # Poisson null, unconditionally (not gated on whether the per-stratum
+    # diagnostic happened to be "computed" for this particular draw).
+    assert result.diagnostics["null_count_overdispersion_warning"] is None
 
 
 def test_null_replicates_default_is_100():
@@ -996,26 +1004,37 @@ def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
 
 
 def test_upper_decision_uses_upper_bound_not_point_estimate():
-    # null_replicates=300: see the comment in
-    # test_point_and_upper_decision_modes_are_deterministic_with_same_seed --
-    # at 100 replicates the vacuity guard correctly refuses "upper" mode for this
-    # simulation before any point-vs-upper comparison can be made.
+    # These parameters produce a real divergence between "point" and "upper"
+    # decision modes (13 vs 12 significant regions, measured on this branch) --
+    # unlike weaker parameter choices where both modes happen to call the same
+    # set of regions, which would let this test pass even if --fdr-decision
+    # were silently ignored.
     matrix, locs, _ = simulate(
-        n_samples=60, strata=[(0.15, 0.35)], replicates=4,
-        spacing=300, dmr_length=12, seed=52,
+        n_samples=80, strata=[(0.15, 0.25)], replicates=12,
+        spacing=300, dmr_length=10, seed=7,
     )
     point_config = Eiger2Config(
-        window=4, null_replicates=300, random_seed=52, fdr_decision="point",
+        window=4, null_replicates=400, random_seed=7, target_fdr=0.05,
+        fdr_decision="point",
     )
     upper_config = Eiger2Config(
-        window=4, null_replicates=300, random_seed=52, fdr_decision="upper",
+        window=4, null_replicates=400, random_seed=7, target_fdr=0.05,
+        fdr_decision="upper",
     )
     point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
     upper_regions, _, _ = call_dmrs(matrix, locs, config=upper_config)
-    # upper mode can only be as-or-more conservative than point mode
-    assert int(upper_regions["significant"].sum()) <= int(
+    # upper mode is strictly more conservative than point mode at these
+    # parameters -- a non-strict "<=" here would also pass if the decision
+    # mode were silently ignored, which is exactly the gap this test closes.
+    assert int(upper_regions["significant"].sum()) < int(
         point_regions["significant"].sum()
     )
+    # And directly confirm "upper" mode's significance is derived from the
+    # upper Garwood bound, not the point estimate.
+    assert (upper_regions["significant"] == (
+        (upper_regions["region_qvalue_upper_95"] <= 0.05)
+        & upper_regions["passes_prevalence"]
+    )).all()
 
 
 def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
@@ -1029,6 +1048,41 @@ def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
     )
     with pytest.raises(ValueError, match="B_required|null_replicates|Increase"):
         call_dmrs(matrix, locs, config=config)
+
+
+def test_run_legacy_upper_decision_uses_upper_bound_not_point_estimate():
+    """``cli.run_legacy`` carries its own, independent copy of the same
+    point-vs-upper decision logic as the ``call_dmrs`` path above (around
+    ``cli.py:409-414``). Confirm it too derives "significant" from
+    ``region_qvalue_upper_95`` under ``fdr_decision="upper"``, not from the
+    point estimate ``region_qvalue``."""
+
+    from eiger2.cli import run_legacy
+
+    matrix, locs, _ = simulate(
+        n_samples=60, strata=[(0.15, 0.35)], replicates=4,
+        spacing=300, dmr_length=12, seed=52,
+    )
+    sample_names = [f"s{i}" for i in range(matrix.shape[1])]
+
+    regions, _ = run_legacy(
+        matrix, locs, sample_names,
+        cov_threshold=0.002, delta_threshold=0.20, min_cpgs=5, impute=True,
+        fdr_replicates=200, target_fdr=0.05, min_prevalence=0, seed=52,
+        fdr_decision="upper",
+    )
+    assert len(regions) > 0
+    assert (regions["significant"] == (
+        (regions["region_qvalue_upper_95"] <= 0.05)
+        & regions["passes_prevalence"]
+    )).all()
+    # And confirm this genuinely diverges from what the point estimate would
+    # have decided -- otherwise the assertion above would pass identically
+    # even if fdr_decision were silently ignored.
+    point_based = (
+        (regions["region_qvalue"] <= 0.05) & regions["passes_prevalence"]
+    )
+    assert not (regions["significant"] == point_based).all()
 
 
 # --------------------------------------------------------------------------

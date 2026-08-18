@@ -14,11 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Python"))
 
 from eiger2 import Eiger2Config, call_dmrs
-import pandas as pd
+from eiger2.benchmark import simulate
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from test_eiger2_core import locations  # reuse the shared synthetic-locations helper
-from eiger2.benchmark import simulate
 
 INVARIANT_COLUMNS = [
     "region_id", "chr", "start", "end", "n_cpg", "cpg_index_start", "cpg_index_end",

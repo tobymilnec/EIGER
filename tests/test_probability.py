@@ -59,7 +59,7 @@ def test_region_fdr_is_monotone_in_area():
     null_sets = [rng.gamma(2.0, 1.0, 40) for _ in range(10)]
     q = region_fdr(observed, null_sets, observed_edges=5000, null_edges=50_000)
     # ``order`` lists regions strongest-area-first; q-values must be
-    # non-decreasing along that ordering, i.e. non-increasing as area weakens.
+    # non-decreasing along that ordering, i.e. non-decreasing as area weakens.
     order = np.argsort(-observed)
     assert np.all(np.diff(q[order]) >= -1e-12)
 
