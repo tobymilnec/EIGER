@@ -59,7 +59,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
-from .core import Eiger2Config, call_dmrs, qvalues_from_track
+from .core import Eiger2Config, call_dmrs, qvalue_result_from_track
 
 # --------------------------------------------------------------------------
 # input
@@ -280,15 +280,16 @@ def run_legacy(
         statistic, DMR_length_threshold=min_cpgs, cov_threshold=cov_threshold
     )
 
-    qvalues, fdr_diagnostics = None, None
+    fdr_result, fdr_diagnostics = None, None
     if fdr_replicates > 0 and len(blocks):
         chrom = locations["chr"].to_numpy()[: statistic.size]
-        qvalues, fdr_diagnostics = qvalues_from_track(
+        fdr_result, fdr_diagnostics = qvalue_result_from_track(
             statistic, np.asarray(blocks, dtype=int), cov_threshold,
             eligible=np.isfinite(statistic), chromosome=chrom,
             min_cpgs=min_cpgs, max_gap_edges=0,
             replicates=fdr_replicates, seed=seed,
         )
+    qvalues = fdr_result.qvalue if fdr_result is not None else None
 
     meta = np.full((matrix.shape[1], 5), "NA", dtype=object)
     rows = []

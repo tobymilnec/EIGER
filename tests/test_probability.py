@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 from eiger2.benchmark import simulate  # noqa: E402
 from eiger2.core import Eiger2Config, call_dmrs, region_fdr  # noqa: E402
 from eiger2.probability import (  # noqa: E402
+    _tail_area_fdr,
     calibration_error,
     estimate_pi0,
     local_fdr,
@@ -57,8 +58,29 @@ def test_region_fdr_is_monotone_in_area():
     observed = rng.gamma(3.0, 1.0, 200)
     null_sets = [rng.gamma(2.0, 1.0, 40) for _ in range(10)]
     q = region_fdr(observed, null_sets, observed_edges=5000, null_edges=50_000)
+    # ``order`` lists regions strongest-area-first; q-values must be
+    # non-decreasing along that ordering, i.e. non-increasing as area weakens.
     order = np.argsort(-observed)
-    assert np.all(np.diff(q[order]) <= 1e-12)
+    assert np.all(np.diff(q[order]) >= -1e-12)
+
+
+# --------------------------------------------------------------------------
+# tail-area fallback (extrapolated tail of local_fdr)
+# --------------------------------------------------------------------------
+
+
+def test_tail_area_fdr_four_distinct_areas():
+    observed = np.array([10.0, 8.0, 6.0, 4.0])
+    pooled = np.array([9.0, 7.0, 5.0, 3.0])
+    result = _tail_area_fdr(observed, pooled, scale=1.0)
+    assert result == pytest.approx([0.0, 0.5, 2 / 3, 0.75])
+
+
+def test_tail_area_fdr_tie_group():
+    observed = np.array([10.0, 8.0, 8.0, 4.0])
+    pooled = np.array([9.0, 7.5, 5.0, 3.0])
+    result = _tail_area_fdr(observed, pooled, scale=1.0)
+    assert result == pytest.approx([0.0, 1 / 3, 1 / 3, 0.75])
 
 
 # --------------------------------------------------------------------------

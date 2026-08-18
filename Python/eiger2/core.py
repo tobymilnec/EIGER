@@ -1305,7 +1305,7 @@ def region_fdr(
     ).qvalue
 
 
-def qvalues_from_track(
+def qvalue_result_from_track(
     statistic: np.ndarray,
     regions: np.ndarray,
     threshold: float,
@@ -1317,30 +1317,20 @@ def qvalues_from_track(
     replicates: int = 50,
     seed: int = 1,
     length_stratified: bool = True,
-) -> tuple[np.ndarray, dict]:
-    """Region-level empirical FDR for ANY caller, from its own statistic track.
-
-    Supplied so that the originally published caller can be given a false
-    discovery rate without altering how it discovers regions. It needs only the
-    per-edge statistic the caller already computes, the regions it called, and
-    the threshold it used; the null is obtained by permuting that same statistic
-    within each chromosome and pushing the permuted tracks through the identical
-    segmentation.
-
-    The published method defines no error rate, which was the substance of a
-    reviewer's objection to it. This adds one without changing a single call:
-    the regions are exactly those the method reported, and the q-value is an
-    annotation on them.
-
-    Returns ``(qvalues, diagnostics)``.
-    """
+) -> tuple[RegionFdrResult, dict]:
+    """Region-level FDR (point estimate, resolution, and Garwood bounds) for ANY
+    caller, from its own statistic track. See ``qvalues_from_track`` for the
+    thin-wrapper form used where only the point estimate is needed."""
 
     statistic = np.asarray(statistic, dtype=float)
     regions = np.asarray(regions, dtype=int).reshape(-1, 2)
     if eligible is None:
         eligible = np.isfinite(statistic)
     if regions.size == 0:
-        return np.empty(0, dtype=float), {"n_regions": 0}
+        empty = region_fdr_result(
+            np.empty(0), [], observed_edges=0, null_edges=0,
+        )
+        return empty, {"n_regions": 0}
 
     observed_areas = region_area(statistic, regions, threshold)
     observed_lengths = regions[:, 1] - regions[:, 0] + 1
@@ -1361,9 +1351,10 @@ def qvalues_from_track(
             else np.empty(0, dtype=int)
         )
 
-    qvalues = region_fdr(
+    observed_edges = int(np.sum(eligible & np.isfinite(statistic)))
+    result = region_fdr_result(
         observed_areas, null_areas,
-        observed_edges=int(np.sum(eligible & np.isfinite(statistic))),
+        observed_edges=observed_edges,
         null_edges=max(null_edges, 1),
         observed_lengths=observed_lengths if length_stratified else None,
         null_length_sets=null_lengths if length_stratified else None,
@@ -1377,8 +1368,41 @@ def qvalues_from_track(
             float(np.mean([len(a) for a in null_areas])) if null_areas else 0.0
         ),
         "threshold": float(threshold),
+        "observed_edges": observed_edges,
+        "null_edges": max(null_edges, 1),
+        "scale": observed_edges / max(null_edges, 1),
+        "null_count_overdispersion_warning": result.diagnostics.get(
+            "null_count_overdispersion_warning"
+        ),
     }
-    return qvalues, diagnostics
+    return result, diagnostics
+
+
+def qvalues_from_track(
+    statistic: np.ndarray,
+    regions: np.ndarray,
+    threshold: float,
+    *,
+    eligible: np.ndarray | None = None,
+    chromosome: np.ndarray | None = None,
+    min_cpgs: int = 5,
+    max_gap_edges: int = 0,
+    replicates: int = 50,
+    seed: int = 1,
+    length_stratified: bool = True,
+) -> tuple[np.ndarray, dict]:
+    """Thin wrapper over qvalue_result_from_track returning only the point estimate.
+
+    Kept for existing callers; signature unchanged.
+    """
+
+    result, diagnostics = qvalue_result_from_track(
+        statistic, regions, threshold,
+        eligible=eligible, chromosome=chromosome, min_cpgs=min_cpgs,
+        max_gap_edges=max_gap_edges, replicates=replicates, seed=seed,
+        length_stratified=length_stratified,
+    )
+    return result.qvalue, diagnostics
 
 
 # --------------------------------------------------------------------------

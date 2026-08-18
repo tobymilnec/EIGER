@@ -208,15 +208,33 @@ def estimate_pi0(
 def _tail_area_fdr(
     observed_areas: np.ndarray, pooled_null: np.ndarray, scale: float
 ) -> np.ndarray:
+    """Point tail-area FDR with the corrected reverse-cummin and tie-aware rank.
+
+    Fallback for the extrapolated tail of ``local_fdr`` -- governs the strongest
+    regions. Mirrors ``core._fdr_from_areas_result``'s point-estimate path exactly
+    (see that function's docstring for the direction/tie rationale); no Garwood
+    bounds here, since this fallback is a point estimate only.
+    """
+
     pooled = np.sort(pooled_null[np.isfinite(pooled_null)])
+    m = observed_areas.size
     order = np.argsort(-observed_areas, kind="mergesort")
     ranked = observed_areas[order]
-    expected = (pooled.size - np.searchsorted(pooled, ranked, side="left")) * scale
-    counts = np.arange(1, ranked.size + 1, dtype=float)
-    raw = np.clip(expected / counts, 0.0, 1.0)
-    monotone = np.minimum.accumulate(raw)
-    out = np.empty_like(monotone)
-    out[order] = monotone
+
+    new_group = np.empty(m, dtype=bool)
+    new_group[0] = True
+    new_group[1:] = ranked[1:] != ranked[:-1]
+    group_of_row = np.cumsum(new_group) - 1
+    last_row_of_group = np.flatnonzero(np.append(new_group[1:], True))
+    R = (last_row_of_group + 1).astype(float)
+    cutoff = ranked[new_group]
+    K = (pooled.size - np.searchsorted(pooled, cutoff, side="left")).astype(float)
+
+    raw = np.clip(scale * K / R, 0.0, 1.0)
+    q_group = np.minimum.accumulate(raw[::-1])[::-1]
+
+    out = np.empty(m, dtype=float)
+    out[order] = q_group[group_of_row]
     return out
 
 
