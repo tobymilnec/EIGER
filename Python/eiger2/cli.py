@@ -48,6 +48,7 @@ import argparse
 import hashlib
 import json
 import platform
+import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -65,6 +66,7 @@ from .core import (
     check_fdr_decision_vacuity,
     qvalue_result_from_track,
 )
+from .manifest_utils import build_manifest_envelope
 
 # --------------------------------------------------------------------------
 # input
@@ -98,6 +100,22 @@ def _checksum(path: Path, limit: int = 64 * 1024 * 1024) -> str:
                 digest.update(b"<truncated>")
                 break
     return digest.hexdigest()[:16]
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _peak_memory_mb() -> float:
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
 
 
 #: Column names recognised as coordinates rather than samples, in any case.
@@ -538,7 +556,31 @@ def command_call(args: argparse.Namespace) -> int:
     if len(values):
         values.to_csv(out / "region_sample_means.csv", index=False)
 
+    warnings_list: list[str] = []
+    if caller_manifest.get("fdr", {}).get("null_count_overdispersion_warning"):
+        ratio = caller_manifest["fdr"]["null_count_overdispersion_warning"]
+        warnings_list.append(
+            f"pooled null region counts are overdispersed (variance/mean="
+            f"{ratio:.2f})"
+        )
+
+    envelope = build_manifest_envelope(
+        config_dict=(
+            _config_from_args(args).to_dict() if not args.legacy else {}
+        ),
+        git_commit=_git_commit(),
+        input_checksums={
+            str(p): _checksum(p) for p in input_paths
+        },
+        random_seed=args.random_seed,
+        derived_seeds={},  # Stage 1 introduces no new derived randomness
+        runtime_seconds=elapsed,
+        peak_memory_mb=_peak_memory_mb(),
+        warnings=warnings_list,
+        fdr_decision=args.fdr_decision,
+    )
     manifest = {
+        **envelope,
         "eiger_version": __version__,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "command": " ".join(sys.argv),
@@ -551,7 +593,6 @@ def command_call(args: argparse.Namespace) -> int:
             "n_samples": int(matrix.shape[1]),
             "missing_fraction": float(np.mean(~np.isfinite(matrix))),
         },
-        "runtime_seconds": elapsed,
         "environment": {
             "python": platform.python_version(),
             "numpy": np.__version__,

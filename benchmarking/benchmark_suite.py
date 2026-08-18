@@ -52,7 +52,9 @@ import pandas as pd
 from compare import run_original
 
 from eiger2.benchmark import simulate
+from eiger2.cli import _git_commit, _peak_memory_mb
 from eiger2.core import Eiger2Config, call_dmrs
+from eiger2.manifest_utils import build_manifest_envelope
 from eiger2.probability import calibration_error, reliability_table
 
 # --------------------------------------------------------------------------
@@ -582,9 +584,37 @@ def main(argv: Iterable[str] | None = None) -> int:
         "calibration": command_calibration,
         "all": command_all,
     }
+    started = time.perf_counter()
     dispatch[args.command](args)
+    elapsed = time.perf_counter() - started
+
+    # ``args.seeds`` and ``args.scaling_seeds`` are both always present (they
+    # are parser-level defaults), regardless of which sub-command ran; every
+    # experiment enumerates its own seeds as range(0, N), so the base seed is
+    # always 0 and the two ranges together are the full derived-seed set.
+    envelope = build_manifest_envelope(
+        config_dict={
+            k: (list(v) if isinstance(v, tuple) else v)
+            for k, v in vars(args).items()
+            if not callable(v)
+        },
+        git_commit=_git_commit(),
+        # Every input is simulated in-process; nothing is read from disk.
+        input_checksums={},
+        random_seed=0,
+        derived_seeds={
+            "seeds": list(range(args.seeds)),
+            "scaling_seeds": list(range(args.scaling_seeds)),
+        },
+        runtime_seconds=elapsed,
+        peak_memory_mb=_peak_memory_mb(),
+        warnings=[],
+        # Every Eiger2Config built by this suite leaves fdr_decision at its
+        # 'point' default; none of the four experiments override it.
+        fdr_decision="point",
+    )
     (out / f"{args.command}_manifest.json").write_text(
-        json.dumps(_manifest(args), indent=2, default=str)
+        json.dumps(_manifest(args, extra=envelope), indent=2, default=str)
     )
     return 0
 

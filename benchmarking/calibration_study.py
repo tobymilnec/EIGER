@@ -44,6 +44,7 @@ import argparse
 import json
 import pathlib
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import numpy as np
 import pandas as pd
 
+from eiger2.cli import _git_commit, _peak_memory_mb
 from eiger2.core import (
     Eiger2Config,
     centre_cpgs,
@@ -66,6 +68,7 @@ from eiger2.core import (
     region_fdr,
     segment,
 )
+from eiger2.manifest_utils import build_manifest_envelope
 from eiger2.probability import calibration_error, local_fdr, reliability_table
 
 # --------------------------------------------------------------------------
@@ -409,6 +412,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     stages = (["overlap", "bandwidth", "pi0", "isotonic"]
               if args.stage == "all" else [args.stage])
 
+    started = time.perf_counter()
     verdict = {}
     for stage in stages:
         print(f"\n== {stage} ==")
@@ -443,13 +447,33 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("isotonic tables to decide which remedy to pursue.")
         print("=" * 70)
 
-    (out / "manifest.json").write_text(json.dumps({
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    elapsed = time.perf_counter() - started
+    resolved_configuration = {
         "stage": args.stage, "replicates": args.replicates,
         "overlap_effects": list(OVERLAP_EFFECTS),
         "overlap_lengths": list(OVERLAP_LENGTHS),
         "separated_effects": list(SEPARATED_EFFECTS),
         "separated_lengths": list(SEPARATED_LENGTHS),
+    }
+    envelope = build_manifest_envelope(
+        config_dict=resolved_configuration,
+        git_commit=_git_commit(),
+        # This study simulates every matrix it scores; nothing is read from disk.
+        input_checksums={},
+        random_seed=seeds[0] if seeds else 0,
+        derived_seeds={"replicate_seeds": seeds},
+        runtime_seconds=elapsed,
+        peak_memory_mb=_peak_memory_mb(),
+        warnings=[],
+        # Every Eiger2Config built by this study leaves fdr_decision at its
+        # 'point' default; the study characterises the evidence score itself
+        # rather than making a point/upper significance call.
+        fdr_decision="point",
+    )
+    (out / "manifest.json").write_text(json.dumps({
+        **envelope,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        **resolved_configuration,
         "verdict": verdict,
     }, indent=2))
     return 0
