@@ -314,6 +314,14 @@ def run_legacy(
             replicates=fdr_replicates, seed=seed,
         )
         if fdr_decision == "upper":
+            # Spec §1.8 frames this guard as running "before computing
+            # regions"; it actually runs here, after qvalue_result_from_track,
+            # because `scale` and `m_bonferroni` (both required by the guard)
+            # aren't known until that call completes. This is intentional:
+            # the guard still fires before any region is reported to the
+            # user as significant, which is the actual intent behind the
+            # spec's wording (never silently return zero significant
+            # regions).
             check_fdr_decision_vacuity(
                 fdr_result,
                 scale=fdr_diagnostics.get("scale", 0.0),
@@ -564,6 +572,21 @@ def command_call(args: argparse.Namespace) -> int:
             f"{ratio:.2f})"
         )
 
+    # Spec §0.3.4: record every derived seed. core.py derives its null-track
+    # RNGs from `random_seed` via fixed, documented additive offsets rather
+    # than by drawing a fresh independent seed per replicate: `null_tracks`
+    # (the fixed-window "lag" null, core.py) uses `random_seed + 977`, and
+    # `permutation_null_tracks` (used by both the "permutation" null_mode and
+    # unconditionally by the legacy caller's `qvalue_result_from_track`) uses
+    # `seed + 5209`. What is recorded below is that offset CONSTANT actually
+    # applied on this run -- not an enumerated list of per-replicate seeds,
+    # since replicates share one RNG stream seeded once from the offset
+    # rather than each having their own derived seed.
+    if args.legacy or _config_from_args(args).null_mode == "permutation":
+        derived_seeds = {"permutation_null_track_offset": 5209}
+    else:
+        derived_seeds = {"lag_null_track_offset": 977}
+
     envelope = build_manifest_envelope(
         config_dict=(
             _config_from_args(args).to_dict() if not args.legacy else {}
@@ -573,7 +596,7 @@ def command_call(args: argparse.Namespace) -> int:
             str(p): _checksum(p) for p in input_paths
         },
         random_seed=args.random_seed,
-        derived_seeds={},  # Stage 1 introduces no new derived randomness
+        derived_seeds=derived_seeds,
         runtime_seconds=elapsed,
         peak_memory_mb=_peak_memory_mb(),
         warnings=warnings_list,

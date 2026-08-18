@@ -1081,7 +1081,7 @@ def _fdr_from_areas_result(
 
     return {
         "qvalue":            _expand(q_group),
-        "tail_fdr":          _expand(raw),          # region's OWN cutoff, not q-achieving
+        "tail_fdr":          _expand(raw),  # region's OWN cutoff, not q-achieving
         "qvalue_lower":      _expand(q_lo_group),
         "qvalue_upper":      _expand(q_hi_group),
         "qvalue_resolution": _expand(delta[qarg_group]),
@@ -1095,7 +1095,6 @@ def _fdr_from_areas_result(
 def _fdr_from_areas(
     observed_areas: np.ndarray, pooled_null: np.ndarray, scale: float
 ) -> np.ndarray:
-    m = observed_areas.size
     return _fdr_from_areas_result(
         observed_areas, pooled_null, scale,
         confidence_level=0.95, m_bonferroni=int(np.unique(observed_areas).size) or 1,
@@ -1694,6 +1693,13 @@ def call_dmrs(
         null_length_sets=null_lengths if config.length_stratified_fdr else None,
     )
     if config.fdr_decision == "upper":
+        # Spec §1.8 frames this guard as running "before computing regions";
+        # it actually runs here, after region_fdr_result, because `scale` and
+        # `m_bonferroni` (both required by the guard) aren't known until that
+        # call completes. This is intentional: the guard still fires before
+        # any region is reported to the user as significant, which is the
+        # actual intent behind the spec's wording (never silently return zero
+        # significant regions).
         check_fdr_decision_vacuity(
             fdr_result,
             scale=fdr_result.diagnostics.get("scale", 0.0),
