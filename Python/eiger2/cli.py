@@ -726,8 +726,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--max-gap-edges", dest="max_gap_edges", type=int,
                        default=None)
         p.add_argument("--null-replicates", dest="null_replicates", type=int,
-                       default=None, help="null tracks (default 20; use "
-                                          "100-300 with --compute-posterior)")
+                       default=None, help="null tracks (default 100; use "
+                                          "200-300 with --compute-posterior)")
         p.add_argument("--null-min-lag", dest="null_min_lag", type=int,
                        default=None)
         p.add_argument("--target-fdr", dest="target_fdr", type=float,

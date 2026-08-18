@@ -143,7 +143,11 @@ class Eiger2Config:
     (per-CpG least squares on observed samples only)."""
 
     # --- null calibration
-    null_replicates: int = 20
+    null_replicates: int = 100
+    """Null tracks pooled for the region FDR. At B=20 the strongest region's
+    q-value is either exactly 0 or >= 0.05 (resolution = s/1, and s ~ 0.05 at this
+    replicate count) -- no resolution at a 0.05 decision boundary. B=100 gives
+    resolution ~0.01 and an R=1 upper_95 bound around 0.078; see docs/FDR.md."""
     null_quantile: float = 0.995
     null_min_lag: int = 1000
     """Minimum genomic separation, in retained CpG rows, between the CpGs paired
@@ -764,7 +768,7 @@ def permutation_null_tracks(
     eligible: np.ndarray,
     chromosome: np.ndarray | None = None,
     *,
-    replicates: int = 20,
+    replicates: int = 100,
     seed: int = 1,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Null tracks that preserve the marginal distribution and destroy the runs.
@@ -1314,7 +1318,7 @@ def qvalue_result_from_track(
     chromosome: np.ndarray | None = None,
     min_cpgs: int = 5,
     max_gap_edges: int = 0,
-    replicates: int = 50,
+    replicates: int = 100,
     seed: int = 1,
     length_stratified: bool = True,
 ) -> tuple[RegionFdrResult, dict]:
@@ -1387,7 +1391,7 @@ def qvalues_from_track(
     chromosome: np.ndarray | None = None,
     min_cpgs: int = 5,
     max_gap_edges: int = 0,
-    replicates: int = 50,
+    replicates: int = 100,
     seed: int = 1,
     length_stratified: bool = True,
 ) -> tuple[np.ndarray, dict]:

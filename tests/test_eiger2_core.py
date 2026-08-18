@@ -34,6 +34,9 @@ from eiger2.core import (  # noqa: E402
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
+    permutation_null_tracks,
+    qvalue_result_from_track,
+    qvalues_from_track,
     region_fdr_result,
 )
 
@@ -936,3 +939,21 @@ def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
     status, ratio = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
     if status == "computed":
         assert ratio < 1.5
+
+
+def test_null_replicates_default_is_100():
+    assert Eiger2Config().null_replicates == 100
+
+
+def test_permutation_null_tracks_default_replicates_is_100():
+    import inspect
+    sig = inspect.signature(permutation_null_tracks)
+    assert sig.parameters["replicates"].default == 100
+
+
+def test_qvalue_result_from_track_default_replicates_is_100():
+    import inspect
+    sig = inspect.signature(qvalue_result_from_track)
+    assert sig.parameters["replicates"].default == 100
+    sig2 = inspect.signature(qvalues_from_track)
+    assert sig2.parameters["replicates"].default == 100
