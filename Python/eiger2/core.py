@@ -29,6 +29,7 @@ post-selection and no q-value is attached to it.
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -260,6 +261,12 @@ class Eiger2Config:
     target_fdr: float = 0.05
     random_seed: int = 1
 
+    fdr_decision: str = "point"
+    """``"point"``: significant = region_qvalue <= target_fdr (unchanged from
+    v2.0.0). ``"upper"``: significant = region_qvalue_upper_95 <= target_fdr, the
+    conservative decision under finite-null uncertainty. Never switches silently --
+    always read from the manifest's ``fdr_decision`` field."""
+
     min_null_values: int = 1_000
     """Warn below this many usable null positions.
 
@@ -325,6 +332,8 @@ class Eiger2Config:
             raise ValueError("min_paired_fraction must lie in [0, 1]")
         if not 0 < self.target_fdr < 1:
             raise ValueError("target_fdr must lie in (0, 1)")
+        if self.fdr_decision not in {"point", "upper"}:
+            raise ValueError("fdr_decision must be 'point' or 'upper'")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1290,6 +1299,40 @@ def region_fdr_result(
     )
 
 
+def check_fdr_decision_vacuity(
+    result: RegionFdrResult,
+    *,
+    scale: float,
+    current_replicates: int,
+    target_fdr: float,
+) -> None:
+    """Refuse to silently return zero significant regions under --fdr-decision upper.
+
+    The best achievable upper_95 bound at the strongest possible cutoff (K=0, R=1)
+    is s * U(K=0). If that already exceeds target_fdr, no region in this run can
+    ever pass the upper-bound decision rule regardless of its area -- report the
+    replicate count that would fix it instead of returning an empty, misleading
+    result.
+    """
+
+    if scale <= 0:
+        return
+    alpha = 1.0 - result.confidence_level
+    m_bonferroni = result.diagnostics.get("fdr_interval_bonferroni_m", 1)
+    astar = alpha / max(int(m_bonferroni), 1)
+    u0 = 0.5 * chi2.ppf(1.0 - astar / 2.0, 2.0)
+    best_upper = min(1.0, scale * u0)
+    if best_upper <= target_fdr:
+        return
+    required = math.ceil(current_replicates * scale * u0 / target_fdr)
+    raise ValueError(
+        f"--fdr-decision upper cannot reach target_fdr={target_fdr}: current "
+        f"null_replicates={current_replicates} gives scale={scale:.6f} and the "
+        f"best achievable region_qvalue_upper_95 is {best_upper:.4f} at K=0, R=1. "
+        f"Increase --null-replicates to at least {required} (B_required)."
+    )
+
+
 def region_fdr(
     observed_areas: np.ndarray,
     null_area_sets: Sequence[np.ndarray],
@@ -1568,6 +1611,8 @@ def call_dmrs(
                 np.ceil(config.min_sample_fraction * n_samples))
         ),
         "n_samples": int(n_samples),
+        "schema_version": "2.1",
+        "fdr_decision": config.fdr_decision,
     }
     empty_regions = pd.DataFrame(columns=_REGION_COLUMNS)
     empty_values = pd.DataFrame(columns=["region_id", *sample_names])
@@ -1640,7 +1685,7 @@ def call_dmrs(
             else np.empty(0, dtype=int)
         )
     observed_lengths = regions[:, 1] - regions[:, 0] + 1
-    qvalues = region_fdr(
+    fdr_result = region_fdr_result(
         observed_areas,
         null_areas,
         observed_edges=int(np.sum(eligible & np.isfinite(statistic))),
@@ -1648,6 +1693,15 @@ def call_dmrs(
         observed_lengths=observed_lengths if config.length_stratified_fdr else None,
         null_length_sets=null_lengths if config.length_stratified_fdr else None,
     )
+    if config.fdr_decision == "upper":
+        check_fdr_decision_vacuity(
+            fdr_result,
+            scale=fdr_result.diagnostics.get("scale", 0.0),
+            current_replicates=config.null_replicates,
+            target_fdr=config.target_fdr,
+        )
+    qvalues = fdr_result.qvalue
+    manifest["fdr"] = fdr_result.diagnostics
     manifest["null_regions_per_replicate"] = (
         float(np.mean([len(a) for a in null_areas])) if null_areas else float("nan")
     )
@@ -1677,6 +1731,10 @@ def call_dmrs(
             "pi0": estimate.pi0,
             **estimate.diagnostics,
         }
+
+    decision_qvalue = (
+        fdr_result.qvalue_upper if config.fdr_decision == "upper" else fdr_result.qvalue
+    )
 
     rows = []
     value_rows = []
@@ -1716,13 +1774,25 @@ def call_dmrs(
                 "statistic_threshold": threshold,
                 "region_area": float(observed_areas[position]),
                 "region_qvalue": float(qvalues[position]),
+                "region_tail_fdr": float(fdr_result.tail_fdr[position]),
+                "region_qvalue_lower_95": float(fdr_result.qvalue_lower[position]),
+                "region_qvalue_upper_95": float(fdr_result.qvalue_upper[position]),
+                "region_qvalue_resolution": float(
+                    fdr_result.qvalue_resolution[position]
+                ),
+                "null_exceedances_at_cutoff": int(
+                    fdr_result.null_exceedances[position]
+                ),
+                "region_qvalue_cutoff_rank": int(
+                    fdr_result.qvalue_cutoff_rank[position]
+                ),
                 "region_evidence_score": float(posterior[position]),
                 "evidence_score_extrapolated": bool(posterior_extrapolated[position]),
                 "minority_size_descriptive": int(minority),
                 "minority_delta_descriptive": float(minority_delta),
                 "passes_prevalence": bool(minority >= config.min_prevalence_samples),
                 "significant": bool(
-                    qvalues[position] <= config.target_fdr
+                    decision_qvalue[position] <= config.target_fdr
                     and minority >= config.min_prevalence_samples
                 ),
                 "n_samples_observed": description["n_observed"],
@@ -1752,6 +1822,8 @@ def call_dmrs(
         (region_frame["region_qvalue"] <= config.target_fdr).sum()
     )
     manifest["n_passing_prevalence"] = int(region_frame["passes_prevalence"].sum())
+    manifest["schema_version"] = "2.1"
+    manifest["fdr_decision"] = config.fdr_decision
     return region_frame, values_frame, manifest
 
 
@@ -1770,6 +1842,12 @@ _REGION_COLUMNS = [
     "statistic_threshold",
     "region_area",
     "region_qvalue",
+    "region_tail_fdr",
+    "region_qvalue_lower_95",
+    "region_qvalue_upper_95",
+    "region_qvalue_resolution",
+    "null_exceedances_at_cutoff",
+    "region_qvalue_cutoff_rank",
     "region_evidence_score",
     "evidence_score_extrapolated",
     "minority_size_descriptive",

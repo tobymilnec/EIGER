@@ -59,7 +59,12 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
-from .core import Eiger2Config, call_dmrs, qvalue_result_from_track
+from .core import (
+    Eiger2Config,
+    call_dmrs,
+    check_fdr_decision_vacuity,
+    qvalue_result_from_track,
+)
 
 # --------------------------------------------------------------------------
 # input
@@ -254,6 +259,7 @@ def run_legacy(
     target_fdr: float = 0.05,
     min_prevalence: int = 0,
     seed: int = 1,
+    fdr_decision: str = "point",
 ) -> tuple[pd.DataFrame, dict]:
     """The originally published caller, invoked from ``processing.py``.
 
@@ -289,6 +295,13 @@ def run_legacy(
             min_cpgs=min_cpgs, max_gap_edges=0,
             replicates=fdr_replicates, seed=seed,
         )
+        if fdr_decision == "upper":
+            check_fdr_decision_vacuity(
+                fdr_result,
+                scale=fdr_diagnostics.get("scale", 0.0),
+                current_replicates=fdr_replicates,
+                target_fdr=target_fdr,
+            )
     qvalues = fdr_result.qvalue if fdr_result is not None else None
 
     meta = np.full((matrix.shape[1], 5), "NA", dtype=object)
@@ -332,6 +345,30 @@ def run_legacy(
             "region_qvalue": (
                 float(qvalues[block_index]) if qvalues is not None else np.nan
             ),
+            "region_tail_fdr": (
+                float(fdr_result.tail_fdr[block_index])
+                if fdr_result is not None else np.nan
+            ),
+            "region_qvalue_lower_95": (
+                float(fdr_result.qvalue_lower[block_index])
+                if fdr_result is not None else np.nan
+            ),
+            "region_qvalue_upper_95": (
+                float(fdr_result.qvalue_upper[block_index])
+                if fdr_result is not None else np.nan
+            ),
+            "region_qvalue_resolution": (
+                float(fdr_result.qvalue_resolution[block_index])
+                if fdr_result is not None else np.nan
+            ),
+            "null_exceedances_at_cutoff": (
+                int(fdr_result.null_exceedances[block_index])
+                if fdr_result is not None else -1
+            ),
+            "region_qvalue_cutoff_rank": (
+                int(fdr_result.qvalue_cutoff_rank[block_index])
+                if fdr_result is not None else -1
+            ),
             "minority_size_descriptive": int(minor.size),
             "delta_consecutive_gap_descriptive": float(
                 result.get("delta_minmax", 0.0) or 0.0
@@ -352,9 +389,12 @@ def run_legacy(
             frame["minority_size_descriptive"] >= min_prevalence
         )
         if qvalues is not None:
+            decision_series = (
+                frame["region_qvalue_upper_95"] if fdr_decision == "upper"
+                else frame["region_qvalue"]
+            )
             frame["significant"] = (
-                (frame["region_qvalue"] <= target_fdr)
-                & frame["passes_prevalence"]
+                (decision_series <= target_fdr) & frame["passes_prevalence"]
             )
     manifest = {
         "caller": "legacy",
@@ -366,6 +406,8 @@ def run_legacy(
         "n_blocks_before_effect_gate": len(blocks),
         "n_regions": len(frame),
         "fdr": fdr_diagnostics,
+        "schema_version": "2.1",
+        "fdr_decision": fdr_decision,
         "note": (
             "Discovery is exactly the published method. Where --fdr-replicates "
             "is set, region_qvalue is an annotation obtained by permuting the "
@@ -388,6 +430,24 @@ def _config_from_args(args: argparse.Namespace) -> Eiger2Config:
         k: v for k, v in vars(args).items() if k in names and v is not None
     }
     return Eiger2Config(**supplied)
+
+
+def _require_default_confidence_level(regions_confidence_level: float | None) -> None:
+    """Refuse to write ``regions.csv`` at a non-default confidence level.
+
+    ``confidence_level`` is a ``region_fdr_result`` keyword-only parameter, not an
+    ``Eiger2Config`` field, so no CLI flag can currently set it away from 0.95 --
+    this guard exists so that a future stage adding such a flag cannot silently
+    ship a CSV whose ``*_95`` suffixed columns lie about their own confidence level.
+    """
+
+    if regions_confidence_level is not None and regions_confidence_level != 0.95:
+        raise ValueError(
+            f"regions.csv export is fixed at the 95% confidence level; the "
+            f"requested level {regions_confidence_level} is a Python-API-only "
+            f"research setting and cannot be written to CSV. Generalised suffixes "
+            f"belong to a later schema version."
+        )
 
 
 def _write_manifest(out: Path, payload: dict) -> None:
@@ -455,6 +515,7 @@ def command_call(args: argparse.Namespace) -> int:
             target_fdr=args.target_fdr,
             min_prevalence=args.min_prevalence_samples or 0,
             seed=args.random_seed,
+            fdr_decision=args.fdr_decision,
         )
         values = pd.DataFrame()
     else:
@@ -472,6 +533,7 @@ def command_call(args: argparse.Namespace) -> int:
             if column in regions.columns:
                 regions[column] = kept[regions[column].to_numpy(dtype=int)]
 
+    _require_default_confidence_level(None if args.legacy else 0.95)
     regions.to_csv(out / "regions.csv", index=False)
     if len(values):
         values.to_csv(out / "region_sample_means.csv", index=False)
@@ -739,6 +801,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "unusual given how much coordination the genome "
                             "contains. Use permutation above ~100 samples, or "
                             "whenever q-values saturate at zero.")
+        p.add_argument("--fdr-decision", dest="fdr_decision",
+                       choices=["point", "upper"], default="point",
+                       help="'point' (default): significant iff region_qvalue <= "
+                            "target-fdr. 'upper': significant iff "
+                            "region_qvalue_upper_95 <= target-fdr -- the "
+                            "conservative decision under finite-null uncertainty.")
         p.add_argument("--min-prevalence-samples", dest="min_prevalence_samples",
                        type=int, default=None,
                        help="require at least this many samples to carry the "

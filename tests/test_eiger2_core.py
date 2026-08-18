@@ -957,3 +957,112 @@ def test_qvalue_result_from_track_default_replicates_is_100():
     assert sig.parameters["replicates"].default == 100
     sig2 = inspect.signature(qvalues_from_track)
     assert sig2.parameters["replicates"].default == 100
+
+
+# --------------------------------------------------------------------------
+# Task 7: --fdr-decision {point,upper} and the vacuity guard
+# --------------------------------------------------------------------------
+
+
+def test_fdr_decision_field_defaults_to_point():
+    assert Eiger2Config().fdr_decision == "point"
+
+
+def test_fdr_decision_rejects_invalid_value():
+    with pytest.raises(ValueError, match="fdr_decision"):
+        Eiger2Config(fdr_decision="maybe")
+
+
+def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
+    # null_replicates=300, not the brief's original 100: at 100 replicates this
+    # simulation's scale/m_bonferroni combination makes the best achievable
+    # region_qvalue_upper_95 (~0.14) exceed the default target_fdr (0.05), so
+    # check_fdr_decision_vacuity correctly refuses "upper" mode outright -- see
+    # test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required for
+    # a dedicated test of exactly that refusal. 300 replicates clears it (verified
+    # empirically) while keeping this test about determinism, not vacuity.
+    matrix, locs, _ = simulate(
+        n_samples=60, strata=[(0.15, 0.35)], replicates=4,
+        spacing=300, dmr_length=12, seed=51,
+    )
+    for mode in ("point", "upper"):
+        config = Eiger2Config(
+            window=4, null_replicates=300, random_seed=51, fdr_decision=mode,
+        )
+        first, _, _ = call_dmrs(matrix, locs, config=config)
+        second, _, _ = call_dmrs(matrix, locs, config=config)
+        assert first["significant"].tolist() == second["significant"].tolist()
+        assert first["region_qvalue"].tolist() == second["region_qvalue"].tolist()
+
+
+def test_upper_decision_uses_upper_bound_not_point_estimate():
+    # null_replicates=300: see the comment in
+    # test_point_and_upper_decision_modes_are_deterministic_with_same_seed --
+    # at 100 replicates the vacuity guard correctly refuses "upper" mode for this
+    # simulation before any point-vs-upper comparison can be made.
+    matrix, locs, _ = simulate(
+        n_samples=60, strata=[(0.15, 0.35)], replicates=4,
+        spacing=300, dmr_length=12, seed=52,
+    )
+    point_config = Eiger2Config(
+        window=4, null_replicates=300, random_seed=52, fdr_decision="point",
+    )
+    upper_config = Eiger2Config(
+        window=4, null_replicates=300, random_seed=52, fdr_decision="upper",
+    )
+    point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
+    upper_regions, _, _ = call_dmrs(matrix, locs, config=upper_config)
+    # upper mode can only be as-or-more conservative than point mode
+    assert int(upper_regions["significant"].sum()) <= int(
+        point_regions["significant"].sum()
+    )
+
+
+def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
+    matrix, locs, _ = simulate(
+        n_samples=40, strata=[(0.1, 0.2)], replicates=2,
+        spacing=250, dmr_length=8, seed=53,
+    )
+    config = Eiger2Config(
+        window=4, null_replicates=2, random_seed=53, fdr_decision="upper",
+        target_fdr=0.01,
+    )
+    with pytest.raises(ValueError, match="B_required|null_replicates|Increase"):
+        call_dmrs(matrix, locs, config=config)
+
+
+# --------------------------------------------------------------------------
+# Task 8: output schema -- six new region columns, call_dmrs wiring,
+# schema_version
+# --------------------------------------------------------------------------
+
+
+def test_schema_round_trip_has_documented_columns_in_documented_order():
+    matrix, locs, _ = simulate(
+        n_samples=60, strata=[(0.15, 0.35)], replicates=4,
+        spacing=300, dmr_length=12, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=20, random_seed=61)
+    regions, _values, manifest = call_dmrs(matrix, locs, config=config)
+    idx = list(regions.columns).index("region_qvalue")
+    expected_tail = [
+        "region_tail_fdr", "region_qvalue_lower_95", "region_qvalue_upper_95",
+        "region_qvalue_resolution", "null_exceedances_at_cutoff",
+        "region_qvalue_cutoff_rank",
+    ]
+    assert list(regions.columns)[idx + 1: idx + 1 + len(expected_tail)] == expected_tail
+    assert manifest["schema_version"] == "2.1"
+
+
+def test_confidence_level_other_than_95_returns_arrays_but_is_not_csv_exportable():
+    result = region_fdr_result(
+        np.array([5.0, 3.0]), [np.array([1.0, 2.0])],
+        observed_edges=10, null_edges=5, confidence_level=0.90,
+    )
+    assert not np.all(np.isnan(result.qvalue))  # Python API still returns arrays
+
+    from eiger2.cli import _require_default_confidence_level
+    _require_default_confidence_level(0.95)  # no raise
+    _require_default_confidence_level(None)  # no raise
+    with pytest.raises(ValueError, match="95%"):
+        _require_default_confidence_level(0.90)
