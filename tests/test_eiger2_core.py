@@ -865,6 +865,7 @@ def test_overdispersion_diagnostic_flags_a_deliberately_overdispersed_null():
     status, ratio = _overdispersion_diagnostic(per_replicate, cutoffs)
     assert status == "computed"
     assert ratio is not None
+    assert ratio > 1.5
 
 
 def test_overdispersion_diagnostic_unavailable_below_five_replicates():
@@ -885,6 +886,7 @@ def test_region_fdr_result_overdispersion_warning_end_to_end():
     result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=sum(len(n) for n in nulls))
     by_stratum = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
     assert by_stratum[0] in {"computed", "unavailable"}
+    assert result.diagnostics["null_count_overdispersion_warning"] is not None
 
 
 def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
