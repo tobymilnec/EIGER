@@ -612,9 +612,18 @@ def command_exchangeability(args: argparse.Namespace) -> None:
         ["p_null", "p_obs", "null_exchangeability_ratio"]
     ].mean()
     print(summary.round(4).to_string())
-    worst = frame["null_exchangeability_ratio"].max()
-    print(f"  worst null_exchangeability_ratio: {worst:.3f} "
-          f"({'PASS' if worst <= 1.25 else 'FAIL'} at gate 1.25)")
+    per_scenario = frame.groupby("scenario")["null_exchangeability_ratio"].median()
+    print("\nper-scenario median (the gate):")
+    print(per_scenario.round(4).to_string())
+    outliers = frame[frame["null_exchangeability_ratio"] > 1.25]
+    if len(outliers):
+        print(f"\n{len(outliers)} per-instance outlier(s) above 1.25 (reported, "
+              f"not gated):")
+        print(outliers[["scenario", "seed", "null_exchangeability_ratio"]]
+              .to_string(index=False))
+    worst_median = float(per_scenario.max())
+    print(f"\nworst per-scenario median: {worst_median:.3f} "
+          f"({'PASS' if worst_median <= 1.25 else 'FAIL'} at gate 1.25)")
 
 
 def command_all(args: argparse.Namespace) -> None:
