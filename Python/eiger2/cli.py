@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -476,8 +477,29 @@ def _require_default_confidence_level(regions_confidence_level: float | None) ->
         )
 
 
+def _json_safe(value):
+    """Replace NaN/Inf floats with None, recursively.
+
+    ``null_exchangeability`` can return NaN for p_null/ratio/calibration_threshold
+    when a null replicate's holdout half is empty (only reachable at the
+    edge case null_replicates=1); ``json.dumps(..., default=str)`` otherwise
+    writes those out as a bare, non-standard ``NaN`` token, which is not valid
+    strict JSON and breaks any downstream `json.load`.
+    """
+
+    if isinstance(value, (float, np.floating)):
+        return float(value) if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _write_manifest(out: Path, payload: dict) -> None:
-    (out / "run_manifest.json").write_text(json.dumps(payload, indent=2, default=str))
+    (out / "run_manifest.json").write_text(
+        json.dumps(_json_safe(payload), indent=2, default=str)
+    )
 
 
 def _resolve_inputs(args: argparse.Namespace):
@@ -661,9 +683,15 @@ def command_call(args: argparse.Namespace) -> int:
         print(
             f"[eiger2] WARNING: observed edges exceed the null threshold "
             f"{exchangeability_ratio:.2f}x more often than the null itself "
-            f"does (nominal 1.0x). The null is not exchangeable with the data; "
-            f"region_qvalue and significant are unreliable. See docs/FDR.md, "
-            f"'Null exchangeability'.",
+            f"does (nominal 1.0x).\n"
+            f"         Expected on data with real regional signal; only a "
+            f"red flag on genuinely\n"
+            f"         DMR-free data, where it means the null doesn't match "
+            f"the data's tail shape.\n"
+            f"         Check calibration properly with "
+            f"`benchmarking/benchmark_suite.py exchangeability`\n"
+            f"         on DMR-free synthetic data, not by reading this "
+            f"single-run number alone.",
             file=sys.stderr,
         )
     warning = caller_manifest.get("null", {}).get("warning") \
