@@ -1263,7 +1263,9 @@ def test_schema_round_trip_has_documented_columns_in_documented_order():
         "region_qvalue_cutoff_rank",
     ]
     assert list(regions.columns)[idx + 1: idx + 1 + len(expected_tail)] == expected_tail
-    assert manifest["schema_version"] == "2.1"
+    # Bumped to "2.2" by Task 7 (Stage 1c: region_support_median/
+    # region_threshold_mode columns added to _REGION_COLUMNS).
+    assert manifest["schema_version"] == "2.2"
 
 
 def test_confidence_level_other_than_95_returns_arrays_but_is_not_csv_exportable():
@@ -1793,6 +1795,62 @@ def test_support_binned_threshold_off_reproduces_scalar_path_bit_for_bit():
     assert manifest_off["support_binning"] == "forced_off"
     assert isinstance(regions_off["statistic_threshold"].iloc[0], float)
 
+    # The three assertions above hold identically even under forced_on --
+    # statistic_threshold was always a bare scalar float before Task 7's fix,
+    # regardless of region_threshold_mode, so `isinstance(..., float)` never
+    # actually distinguished the "off" scalar path from the "support_binned"
+    # path. Task 6's independent review flagged this as tautological. Fixed
+    # here with a genuine bit-identity assertion: hand-build the Stage 1b
+    # scalar pipeline directly (centre_cpgs -> estimate_latent_basis ->
+    # deflate -> edge_statistic -> eligible_edges -> null_threshold ->
+    # segment(scalar) -> region_area(scalar)), bypassing call_dmrs's Stage 1c
+    # support-binning branch entirely, and confirm it reproduces
+    # call_dmrs(..., support_binned_threshold="off")'s region bounds and
+    # region_area values exactly. Includes the same min_observed_samples/
+    # min_sample_fraction row-filtering call_dmrs applies before centre_cpgs
+    # (core.py, top of call_dmrs) so cpg_index_start/cpg_index_end line up
+    # even if that filter were ever to remove rows for this seed/config.
+    from eiger2.core import _standardise_locations
+    from eiger2.core import eligible_edges as _eligible_edges
+    from eiger2.core import null_threshold as _null_threshold
+    from eiger2.core import region_area as _region_area
+    from eiger2.core import segment as _segment
+
+    n_cpg, n_samples = matrix.shape
+    frame = _standardise_locations(locs, n_cpg)
+    observed_per_cpg = np.sum(np.isfinite(matrix), axis=1)
+    keep = observed_per_cpg >= base_config.min_observed_samples
+    if base_config.min_sample_fraction > 0:
+        keep &= observed_per_cpg >= np.ceil(
+            base_config.min_sample_fraction * n_samples
+        )
+    filtered_matrix = matrix[keep]
+    filtered_frame = frame.loc[keep].reset_index(drop=True)
+    source_index = np.flatnonzero(keep)
+
+    residuals = centre_cpgs(filtered_matrix)
+    basis, _ = estimate_latent_basis(residuals, base_config)
+    deflated = deflate(residuals, basis, missing=base_config.deflation_missing)
+    statistic = edge_statistic(deflated, base_config)
+    eligible = _eligible_edges(filtered_frame, base_config)
+    threshold, _ = _null_threshold(
+        deflated, base_config, filtered_frame,
+        statistic=statistic, eligible=eligible,
+    )
+    manual_regions = _segment(
+        statistic, eligible, threshold,
+        min_cpgs=base_config.min_cpgs, max_gap_edges=base_config.max_gap_edges,
+    )
+    manual_areas = _region_area(statistic, manual_regions, threshold)
+
+    assert threshold == pytest.approx(regions_off["statistic_threshold"].iloc[0])
+    expected_bounds = np.column_stack([
+        source_index[manual_regions[:, 0]], source_index[manual_regions[:, 1]],
+    ]) if manual_regions.size else np.empty((0, 2), dtype=int)
+    actual_bounds = regions_off[["cpg_index_start", "cpg_index_end"]].to_numpy()
+    assert np.array_equal(expected_bounds, actual_bounds)
+    assert np.array_equal(manual_areas, regions_off["region_area"].to_numpy())
+
 
 def test_support_dispersion_detector_computed_and_recorded():
     matrix, locs, _ = simulate(
@@ -1821,13 +1879,12 @@ def test_support_binned_threshold_on_produces_per_bin_thresholds():
     if manifest["support_binning"] == "forced_on":
         assert len(manifest["support_thresholds"]) >= 2
         assert len(regions) >= 0  # ran without error
-        # region_threshold_mode/region_support_median are computed internally in
-        # this task but only wired into _REGION_COLUMNS by Task 7 (per this
-        # stage's SDD ledger, Task 6 -> Task 7 row: "Task 6 computes these
-        # implicitly via the row-building context; Task 7 is the one that
-        # actually adds them to _REGION_COLUMNS and the row dict"), so this
-        # assertion is conditional on the column already existing.
-        if len(regions) and "region_threshold_mode" in regions.columns:
+        # Task 7 wires region_threshold_mode into _REGION_COLUMNS/the row dict,
+        # so the column always exists now -- no presence guard needed (a
+        # "col" in regions.columns check here would silently re-hide a future
+        # regression that dropped the column). no_regions truly has zero rows,
+        # so the len(regions) guard stays.
+        if len(regions):
             assert (regions["region_threshold_mode"] == "support_binned").all()
 
 
@@ -1874,3 +1931,70 @@ def test_null_tracks_returns_track_eligible_lag_triples():
     for track, eligible, lag in tracks:
         assert isinstance(lag, int)
         assert track.shape == eligible.shape
+
+
+# --------------------------------------------------------------------------
+# Task 7: output schema -- region_support_median/region_threshold_mode
+# columns, schema_version -> "2.2" (Stage 1c)
+# --------------------------------------------------------------------------
+
+
+def test_schema_v22_has_support_columns_and_version():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=51,
+    )
+    config = Eiger2Config(window=4, null_replicates=50, random_seed=51)
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert "region_support_median" in regions.columns
+    assert "region_threshold_mode" in regions.columns
+    assert manifest["schema_version"] == "2.2"
+    if len(regions):
+        assert regions["region_threshold_mode"].isin(["single", "support_binned"]).all()
+
+
+def test_statistic_threshold_is_mean_per_edge_threshold_when_support_binned():
+    # Task 6's independent review found statistic_threshold was written as the
+    # single unconditioned scalar `threshold` even when per-bin thresholds
+    # were actually applied to produce region_area -- confirmed empirically
+    # divergent on a forced_on run (column reported 0.7143 while the actually
+    # -applied per-bin thresholds were [0.7308, 0.7236, 0.7001, 0.7079]).
+    # Task 7 fixes this: when region_threshold_mode == "support_binned",
+    # statistic_threshold is the region's mean per-edge threshold (mean of
+    # per_edge_threshold over the same edge slice [first:last] that
+    # region_support_median uses); when region_threshold_mode == "single", it
+    # stays the existing scalar unchanged (asserted separately, below).
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=43,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=43,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    if manifest["support_binning"] != "forced_on" or not len(regions):
+        pytest.skip("this seed did not produce a forced_on run with regions")
+    binned = regions["region_threshold_mode"] == "support_binned"
+    assert binned.any()
+    # statistic_threshold must genuinely diverge from the unconditioned scalar
+    # threshold for at least one support_binned region -- otherwise this test
+    # would pass identically under the pre-fix behaviour it is meant to catch.
+    scalar_threshold = manifest["null"]["threshold"]
+    assert not np.allclose(
+        regions.loc[binned, "statistic_threshold"], scalar_threshold
+    )
+
+
+def test_statistic_threshold_stays_scalar_when_single_mode():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
+    )
+    config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
+                           support_binned_threshold="off")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert (regions["region_threshold_mode"] == "single").all()
+    scalar_threshold = manifest["null"]["threshold"]
+    assert np.array_equal(
+        regions["statistic_threshold"].to_numpy(),
+        np.full(len(regions), scalar_threshold),
+    )

@@ -1859,7 +1859,7 @@ def call_dmrs(
                 np.ceil(config.min_sample_fraction * n_samples))
         ),
         "n_samples": int(n_samples),
-        "schema_version": "2.1",
+        "schema_version": "2.2",
         "fdr_decision": config.fdr_decision,
     }
     empty_regions = pd.DataFrame(columns=_REGION_COLUMNS)
@@ -2047,10 +2047,9 @@ def call_dmrs(
     if support_binning_skipped_reason is not None:
         manifest["support_binning_skipped_reason"] = support_binning_skipped_reason
 
-    # region_support_median/region_threshold_mode are computed here (needed by
-    # Task 9 too) but NOT yet added to _REGION_COLUMNS/the row dict -- that is
-    # Task 7's job (output schema, schema_version -> "2.2"), kept as a separate
-    # commit so the two tasks' diffs stay cleanly reviewable.
+    # region_threshold_mode_value/region_support_median_descriptive are computed
+    # here (needed by Task 9 too) and wired into _REGION_COLUMNS/the row dict
+    # below (Task 7: output schema, schema_version -> "2.2").
     region_threshold_mode_value = (
         "support_binned" if support_binning in ("auto_on", "forced_on") else "single"
     )
@@ -2067,9 +2066,9 @@ def call_dmrs(
         manifest["status"] = "no_regions"
         return empty_regions, empty_values, manifest
 
-    # Not yet wired into _REGION_COLUMNS/the row dict -- that is Task 7's job
-    # (output schema, schema_version -> "2.2"). Recorded in the manifest here so
-    # the values are computed once, in one place, and available to Task 9
+    # Recorded in the manifest here so the values are computed once, in one
+    # place, and available both to the row-building loop below (Task 7, which
+    # reads this list by position rather than recomputing it) and to Task 9
     # (region-level exposure diagnostic) without recomputation.
     manifest["region_support_median_descriptive"] = [
         float(np.median(observed_support[first:last])) for first, last in regions
@@ -2201,7 +2200,15 @@ def call_dmrs(
                 "statistic_min": float(
                     np.nanmin(statistic[first:last]) if last > first else np.nan
                 ),
-                "statistic_threshold": threshold,
+                "statistic_threshold": (
+                    float(np.mean(per_edge_threshold[first:last]))
+                    if region_threshold_mode_value == "support_binned"
+                    else threshold
+                ),
+                "region_support_median": manifest[
+                    "region_support_median_descriptive"
+                ][position],
+                "region_threshold_mode": region_threshold_mode_value,
                 "region_area": float(observed_areas[position]),
                 "region_qvalue": float(qvalues[position]),
                 "region_tail_fdr": float(fdr_result.tail_fdr[position]),
@@ -2252,7 +2259,7 @@ def call_dmrs(
         (region_frame["region_qvalue"] <= config.target_fdr).sum()
     )
     manifest["n_passing_prevalence"] = int(region_frame["passes_prevalence"].sum())
-    manifest["schema_version"] = "2.1"
+    manifest["schema_version"] = "2.2"
     manifest["fdr_decision"] = config.fdr_decision
     return region_frame, values_frame, manifest
 
@@ -2270,6 +2277,8 @@ _REGION_COLUMNS = [
     "statistic_mean",
     "statistic_min",
     "statistic_threshold",
+    "region_support_median",
+    "region_threshold_mode",
     "region_area",
     "region_qvalue",
     "region_tail_fdr",
