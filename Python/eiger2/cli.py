@@ -905,6 +905,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "unusual given how much coordination the genome "
                             "contains. Use permutation above ~100 samples, or "
                             "whenever q-values saturate at zero.")
+        p.add_argument("--support-binned-threshold", dest="support_binned_threshold",
+                       choices=["auto", "on", "off"], default=None,
+                       help="condition the null-quantile threshold on local "
+                            "measurement support (samples observed at every "
+                            "CpG in the window). 'auto' (default) enables it "
+                            "only when support varies enough to matter.")
+        p.add_argument("--support-bins", dest="support_bins", type=int, default=None)
         p.add_argument("--fdr-decision", dest="fdr_decision",
                        choices=["point", "upper"], default="point",
                        help="'point' (default): significant iff region_qvalue <= "

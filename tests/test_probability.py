@@ -277,8 +277,11 @@ def test_permutation_null_yields_a_richer_null_than_the_lag_null():
     threshold, _ = null_threshold(deflated, config, locations)
 
     def count(tracks):
+        # `tracks` is either `null_tracks`' 3-tuples (track, eligible, lag) or
+        # `permutation_null_tracks`' 2-tuples (track, eligible) -- this helper is
+        # called with both (see below), so the star-unpack tolerates either shape.
         total = 0
-        for track, usable in tracks:
+        for track, usable, *_ in tracks:
             found = segment(
                 track, usable & np.isfinite(track), threshold,
                 min_cpgs=config.min_cpgs, max_gap_edges=config.max_gap_edges,

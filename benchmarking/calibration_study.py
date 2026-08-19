@@ -136,7 +136,7 @@ def score_one(
 
     areas = region_area(statistic, regions, threshold)
     null_areas, null_edges = [], 0
-    for track, null_eligible in null_tracks(deflated, config):
+    for track, null_eligible, _lag in null_tracks(deflated, config):
         finite = null_eligible & np.isfinite(track)
         null_edges += int(finite.sum())
         null_regions = segment(track, finite, threshold,

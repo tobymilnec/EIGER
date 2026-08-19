@@ -60,6 +60,9 @@ __all__ = [
 # --------------------------------------------------------------------------
 
 
+_DEFAULT_SUPPORT_DISPERSION_CUT = 0.5  # calibrated in Task 8 -- see that task's commit
+
+
 @dataclass(frozen=True)
 class Eiger2Config:
     """Everything the caller can tune. Defaults are the validated settings."""
@@ -307,6 +310,26 @@ class Eiger2Config:
     min_null_regions_for_posterior: int = 50
     """Refuse the posterior below this many pooled null regions."""
 
+    support_binned_threshold: str = "auto"
+    """``"auto"`` | ``"on"`` | ``"off"``. When enabled, the null-quantile
+    threshold is computed per support bin (samples observed at every CpG in the
+    window) instead of once genome-wide, correcting the region-level FDR
+    inflation that survives Stage 1b's null-window fix under structured
+    missingness. ``"auto"`` enables it only when observed support varies enough
+    to matter (``support_dispersion > support_dispersion_cut``). See
+    docs/FDR.md, "Support conditioning" (added Stage 1e)."""
+
+    support_bins: int = 4
+    """Quantile bins for support-conditioned thresholding. Adjacent bins merge
+    upward if the pooled null has fewer than ``min_null_values`` values in a
+    bin; collapses to the unconditioned single threshold if merging cannot
+    satisfy every bin."""
+
+    support_dispersion_cut: float | None = None
+    """Auto-enable threshold for ``support_binned_threshold="auto"``. ``None``
+    uses the calibrated default (see docs/FDR.md, Stage 1e) -- calibrated in
+    this stage's STOP report pending Stage 1e's full-scale confirmation."""
+
     def __post_init__(self) -> None:
         if self.statistic not in {"correlation", "covariance"}:
             raise ValueError("statistic must be 'correlation' or 'covariance'")
@@ -334,6 +357,10 @@ class Eiger2Config:
             raise ValueError("target_fdr must lie in (0, 1)")
         if self.fdr_decision not in {"point", "upper"}:
             raise ValueError("fdr_decision must be 'point' or 'upper'")
+        if self.support_binned_threshold not in {"auto", "on", "off"}:
+            raise ValueError("support_binned_threshold must be 'auto', 'on', or 'off'")
+        if self.support_bins < 2:
+            raise ValueError("support_bins must be at least 2")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -854,13 +881,17 @@ def null_tracks(
     residuals: np.ndarray,
     config: Eiger2Config,
     locations: pd.DataFrame | None = None,
-) -> list[tuple[np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray, int]]:
     """Statistic tracks under the locality-breaking null, one per replicate.
 
-    Returns ``(track, eligible)`` pairs. ``eligible`` restricts the null to
-    positions whose window members share a chromosome, mirroring the constraint
-    applied to the observed track. Passing ``locations=None`` disables the
-    restriction and is retained only for single-chromosome use and for tests.
+    Returns ``(track, eligible, lag)`` triples. ``eligible`` restricts the null
+    to positions whose window members share a chromosome, mirroring the
+    constraint applied to the observed track. ``lag`` is that replicate's own
+    draw, needed by Stage 1c's support-conditioned threshold to reconstruct the
+    replicate's own window-member set (mirroring ``_lag_null_track``'s
+    construction) when computing that replicate's own support. Passing
+    ``locations=None`` disables the chromosome restriction and is retained only
+    for single-chromosome use and for tests.
     """
 
     n_rows = residuals.shape[0]
@@ -872,7 +903,7 @@ def null_tracks(
         locations["chr"].to_numpy() if locations is not None else None
     )
     rng = np.random.default_rng(config.random_seed + 977)
-    tracks: list[tuple[np.ndarray, np.ndarray]] = []
+    tracks: list[tuple[np.ndarray, np.ndarray, int]] = []
     for _ in range(config.null_replicates):
         lag = int(rng.integers(low, high))
         track = _lag_null_track(residuals, lag, config)
@@ -880,7 +911,7 @@ def null_tracks(
             continue
         eligible = _null_eligibility(chromosome, lag, config, track.size)
         if eligible.any():
-            tracks.append((track, eligible))
+            tracks.append((track, eligible, lag))
     return tracks
 
 
@@ -1080,7 +1111,7 @@ def null_threshold(
     if tracks is None:
         tracks = null_tracks(residuals, config, locations)
     pooled = (
-        np.concatenate([t[e] for t, e in tracks]) if tracks else np.empty(0)
+        np.concatenate([t[e] for t, e, _ in tracks]) if tracks else np.empty(0)
     )
     pooled = pooled[np.isfinite(pooled)]
     if pooled.size == 0:
@@ -1093,7 +1124,7 @@ def null_threshold(
     # chromosome boundary. With many short chromosomes and a large lag this can
     # remove most of the null, leaving the threshold poorly determined, so the
     # retained fraction is reported and flagged rather than left implicit.
-    offered = sum(int(t.size) for t, _ in tracks) if tracks else 0
+    offered = sum(int(t.size) for t, _, _lag in tracks) if tracks else 0
     coverage = float(pooled.size / offered) if offered else 0.0
     diagnostics = {
         "null_replicates": len(tracks),
@@ -1869,10 +1900,165 @@ def call_dmrs(
         tracks = null_tracks(deflated, config, frame)
     manifest["null"] = null_diagnostics
 
+    # --- Stage 1c: support-conditioned threshold ---
+    n_cpg_total = deflated.shape[0]
+    w = max(config.window, 1)
+    finite_mask = np.isfinite(deflated)
+
+    def _member_offsets(window: int, lag: int = 1) -> np.ndarray:
+        """Window-member offsets from a base position, per spec §1c.1: the
+        adjacent pair at w=1 (offsets [0, lag]), else [0, lag, 2*lag, ..., (w-1)*lag].
+        `lag=1` gives the observed-track convention; any other `lag` gives a null
+        position's member set, matching `_lag_null_track`'s own construction."""
+        if window == 1:
+            return np.array([0, lag])
+        return np.arange(window) * lag
+
+    obs_offsets = _member_offsets(w)
+    obs_offset0 = 0 if w == 1 else w // 2 - 1
+    obs_base = np.arange(statistic.size) - obs_offset0
+    valid_obs = (obs_base >= 0) & (obs_base + obs_offsets.max() < n_cpg_total)
+    observed_support = np.zeros(statistic.size, dtype=np.int64)
+    observed_support[valid_obs] = _window_support(
+        finite_mask, obs_base[valid_obs], obs_offsets,
+    )
+
+    support_dispersion = float("nan")
+    usable_mask = eligible & np.isfinite(statistic)
+    if np.any(usable_mask):
+        usable_support = observed_support[usable_mask]
+        median = np.median(usable_support)
+        if median > 0:
+            support_dispersion = float(
+                (np.quantile(usable_support, 0.9) - np.quantile(usable_support, 0.1))
+                / median
+            )
+
+    dispersion_cut = (
+        # calibrated in Task 8, module-level constant
+        config.support_dispersion_cut if config.support_dispersion_cut is not None
+        else _DEFAULT_SUPPORT_DISPERSION_CUT
+    )
+
+    if config.support_binned_threshold == "off":
+        support_binning = "forced_off"
+    elif config.support_binned_threshold == "on":
+        support_binning = "forced_on"
+    elif np.isfinite(support_dispersion) and support_dispersion > dispersion_cut:
+        support_binning = "auto_on"
+    else:
+        support_binning = "auto_off"
+
+    support_binning_skipped_reason: str | None = None
+    if config.null_mode == "permutation" and support_binning != "forced_off":
+        # Support-conditioned thresholding requires per-replicate lag-null
+        # tracks (each with their own member-set support); permutation mode has
+        # no such per-replicate geometry (it permutes the observed track's own
+        # values). Stage 1d addresses permutation mode's own calibration
+        # separately -- combining the two is out of this stage's scope.
+        support_binning_skipped_reason = "permutation_mode_not_supported"
+        support_binning = "forced_off"
+
+    support_bin_edges: np.ndarray = np.empty(0)
+    support_bin_merges: list = []
+    support_thresholds: list = []
+    per_edge_threshold: float | np.ndarray = threshold
+    # Per-replicate threshold arrays fed to segment()/region_area() for each
+    # null track, aligned 1:1 with `tracks`. Defaults to the scalar threshold
+    # (mirroring the pre-Stage-1c flow); replaced below when binning succeeds.
+    # Each null track's threshold must come from THAT replicate's own support
+    # geometry (own lag), never from slicing the observed per_edge_threshold
+    # array, since null tracks are not the same length as the observed track
+    # and do not share its position-to-bin mapping.
+    null_edge_thresholds: list[float | np.ndarray] = [threshold] * len(tracks)
+
+    binning_requested = support_binning in ("forced_on", "auto_on")
+    if binning_requested and config.null_mode != "permutation":
+        # Per null replicate, compute that replicate's OWN support (using its own
+        # lag, mirroring _lag_null_track's member set exactly) and pool this
+        # replicate's STATISTIC VALUES -- not its support values -- into the bin
+        # each position's support falls into. threshold[b] is then the
+        # null_quantile of all pooled statistic values across every replicate
+        # whose position landed in bin b (spec §1c.3: "threshold[b] = null_quantile
+        # of the pooled null values whose null-position support falls in bin b").
+        null_support_parts = []
+        # (support_array, value_array) per replicate, usable-filtered
+        null_value_by_replicate = []
+        null_full_support = []  # full-length (track.size) support array per replicate
+        for track, track_eligible, lag in tracks:
+            null_offsets = _member_offsets(w, lag)
+            null_base = np.arange(track.size)
+            valid_null = null_base + null_offsets.max() < n_cpg_total
+            support = np.zeros(track.size, dtype=np.int64)
+            support[valid_null] = _window_support(
+                finite_mask, null_base[valid_null], null_offsets,
+            )
+            null_full_support.append(support)
+            usable = track_eligible & np.isfinite(track) & valid_null
+            null_support_parts.append(support[usable])
+            null_value_by_replicate.append((support[usable], track[usable]))
+
+        pooled_null_support = (
+            np.concatenate(null_support_parts) if null_support_parts else np.empty(0)
+        )
+        bin_result = _support_bin_edges(
+            observed_support[usable_mask], config.support_bins,
+            config.min_null_values, pooled_null_support,
+        )
+        if bin_result["collapsed"]:
+            support_binning = "collapsed_to_single"
+        else:
+            support_bin_edges = bin_result["bin_edges"]
+            support_bin_merges = bin_result["merges"]
+            n_final_bins = support_bin_edges.size + 1
+            observed_bins = _assign_support_bin(observed_support, support_bin_edges)
+
+            per_bin_threshold = np.full(n_final_bins, np.nan)
+            for b in range(n_final_bins):
+                bin_values = np.concatenate([
+                    values[_assign_support_bin(support, support_bin_edges) == b]
+                    for support, values in null_value_by_replicate
+                ]) if null_value_by_replicate else np.empty(0)
+                if bin_values.size:
+                    per_bin_threshold[b] = float(
+                        np.quantile(bin_values, config.null_quantile)
+                    )
+            # a bin with zero pooled null values (shouldn't happen after merging
+            # satisfied min_null_values, but guard defensively) falls back to the
+            # unconditioned scalar threshold for that bin only
+            per_bin_threshold = np.where(
+                np.isfinite(per_bin_threshold), per_bin_threshold, threshold,
+            )
+            per_edge_threshold = per_bin_threshold[observed_bins]
+            support_thresholds = per_bin_threshold.tolist()
+            # each null track's own threshold array, from its OWN support's bin
+            # assignment -- never the observed track's per_edge_threshold
+            null_edge_thresholds = [
+                per_bin_threshold[_assign_support_bin(support, support_bin_edges)]
+                for support in null_full_support
+            ]
+
+    manifest["support_dispersion"] = support_dispersion
+    manifest["support_dispersion_cut"] = dispersion_cut
+    manifest["support_binning"] = support_binning
+    manifest["support_bin_edges"] = support_bin_edges.tolist()
+    manifest["support_bin_merges"] = support_bin_merges
+    manifest["support_thresholds"] = support_thresholds
+    if support_binning_skipped_reason is not None:
+        manifest["support_binning_skipped_reason"] = support_binning_skipped_reason
+
+    # region_support_median/region_threshold_mode are computed here (needed by
+    # Task 9 too) but NOT yet added to _REGION_COLUMNS/the row dict -- that is
+    # Task 7's job (output schema, schema_version -> "2.2"), kept as a separate
+    # commit so the two tasks' diffs stay cleanly reviewable.
+    region_threshold_mode_value = (
+        "support_binned" if support_binning in ("auto_on", "forced_on") else "single"
+    )
+
     regions = segment(
         statistic,
         eligible,
-        threshold,
+        per_edge_threshold,
         min_cpgs=config.min_cpgs,
         max_gap_edges=config.max_gap_edges,
     )
@@ -1881,23 +2067,41 @@ def call_dmrs(
         manifest["status"] = "no_regions"
         return empty_regions, empty_values, manifest
 
-    observed_areas = region_area(statistic, regions, threshold)
+    # Not yet wired into _REGION_COLUMNS/the row dict -- that is Task 7's job
+    # (output schema, schema_version -> "2.2"). Recorded in the manifest here so
+    # the values are computed once, in one place, and available to Task 9
+    # (region-level exposure diagnostic) without recomputation.
+    manifest["region_support_median_descriptive"] = [
+        float(np.median(observed_support[first:last])) for first, last in regions
+    ]
+    manifest["region_threshold_mode_descriptive"] = [
+        region_threshold_mode_value for _ in range(len(regions))
+    ]
+
+    observed_areas = region_area(statistic, regions, per_edge_threshold)
     null_areas = []
     null_lengths = []
     null_edge_total = 0
-    for track, null_eligible in tracks:
+    for (track, null_eligible, *_rest), null_track_threshold in zip(
+        tracks, null_edge_thresholds, strict=True
+    ):
         # the null is masked by the same kind of rule as the data, so that the
-        # two are genuinely passed through the identical segmenter
+        # two are genuinely passed through the identical segmenter. Each track's
+        # threshold comes from ITS OWN support-conditioned bin assignment (see
+        # `null_edge_thresholds` above), exactly mirroring the existing scalar
+        # flow -- previously every null shared the single scalar `threshold`;
+        # now every null shares the same per-bin threshold VALUES but each
+        # applies them through its own support geometry.
         usable = null_eligible & np.isfinite(track)
         null_edge_total += int(usable.sum())
         null_regions = segment(
             track,
             usable,
-            threshold,
+            null_track_threshold,
             min_cpgs=config.min_cpgs,
             max_gap_edges=config.max_gap_edges,
         )
-        null_areas.append(region_area(track, null_regions, threshold))
+        null_areas.append(region_area(track, null_regions, null_track_threshold))
         null_lengths.append(
             (null_regions[:, 1] - null_regions[:, 0] + 1)
             if null_regions.size

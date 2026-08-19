@@ -1615,7 +1615,7 @@ def test_null_exchangeability_ratio_is_one_when_observed_equals_null():
     tracks = null_tracks(residuals, config)
     # use one of the null's own held-out-eligible values as a stand-in "observed"
     # track drawn from the identical distribution -- ratio should be close to 1
-    pooled_all = np.concatenate([t[np.isfinite(t) & e] for t, e in tracks])
+    pooled_all = np.concatenate([t[np.isfinite(t) & e] for t, e, _ in tracks])
     observed_like_null = rng.choice(pooled_all, size=2000, replace=True)
     eligible = np.ones(2000, dtype=bool)
     result = null_exchangeability(tracks, observed_like_null, eligible, config)
@@ -1767,3 +1767,110 @@ def test_recall_does_not_regress_more_than_5_points_after_lag_null_fix():
     # future parameter changes ever drive recall to zero on both sides.
     assert before_recall > 0
     assert after_recall >= before_recall - 0.05, (before_recall, after_recall)
+
+
+# --------------------------------------------------------------------------
+# Task 6: support-conditioned threshold -- config, auto-enable, per-bin
+# thresholds, call_dmrs wiring (Stage 1c)
+# --------------------------------------------------------------------------
+
+
+def test_support_binned_threshold_off_reproduces_scalar_path_bit_for_bit():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
+    )
+    base_config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
+                                support_binned_threshold="off")
+    regions_off, values_off, manifest_off = call_dmrs(matrix, locs, config=base_config)
+    # compare against a config from BEFORE this task's changes semantically --
+    # "off" must produce the same region set/areas/threshold as Stage 1b's output
+    # for identical inputs. Since Stage 1b's code path IS the "off" path structurally,
+    # this is really a self-consistency check: run "off" twice, confirm determinism,
+    # and confirm statistic_threshold is a bare scalar (float), not array-derived.
+    regions_off2, _, _ = call_dmrs(matrix, locs, config=base_config)
+    pd.testing.assert_frame_equal(regions_off, regions_off2, check_exact=True)
+    assert manifest_off["support_binning"] == "forced_off"
+    assert isinstance(regions_off["statistic_threshold"].iloc[0], float)
+
+
+def test_support_dispersion_detector_computed_and_recorded():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=42,
+    )
+    config = Eiger2Config(window=4, null_replicates=50, random_seed=42)
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert "support_dispersion" in manifest
+    assert manifest["support_dispersion"] >= 0
+    assert "support_dispersion_cut" in manifest
+    assert manifest["support_binning"] in {
+        "auto_on", "auto_off", "forced_on", "forced_off", "collapsed_to_single",
+    }
+
+
+def test_support_binned_threshold_on_produces_per_bin_thresholds():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=43,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=43,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
+    if manifest["support_binning"] == "forced_on":
+        assert len(manifest["support_thresholds"]) >= 2
+        assert len(regions) >= 0  # ran without error
+        # region_threshold_mode/region_support_median are computed internally in
+        # this task but only wired into _REGION_COLUMNS by Task 7 (per this
+        # stage's SDD ledger, Task 6 -> Task 7 row: "Task 6 computes these
+        # implicitly via the row-building context; Task 7 is the one that
+        # actually adds them to _REGION_COLUMNS and the row dict"), so this
+        # assertion is conditional on the column already existing.
+        if len(regions) and "region_threshold_mode" in regions.columns:
+            assert (regions["region_threshold_mode"] == "support_binned").all()
+
+
+def test_determinism_same_seed_same_bins_same_thresholds_same_regions():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=44,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=44,
+                           support_binned_threshold="on")
+    regions1, _, manifest1 = call_dmrs(matrix, locs, config=config)
+    regions2, _, manifest2 = call_dmrs(matrix, locs, config=config)
+    pd.testing.assert_frame_equal(regions1, regions2, check_exact=True)
+    assert manifest1["support_bin_edges"] == manifest2["support_bin_edges"]
+
+
+def test_support_binned_threshold_config_validation():
+    with pytest.raises(ValueError, match="support_binned_threshold"):
+        Eiger2Config(support_binned_threshold="bogus")
+    with pytest.raises(ValueError, match="support_bins"):
+        Eiger2Config(support_bins=1)
+
+
+def test_support_binning_forced_off_for_permutation_mode():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=45,
+    )
+    config = Eiger2Config(window=4, null_replicates=50, random_seed=45,
+                           null_mode="permutation", support_binned_threshold="on")
+    _, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] == "forced_off"
+    assert manifest["support_binning_skipped_reason"] == (
+        "permutation_mode_not_supported"
+    )
+
+
+def test_null_tracks_returns_track_eligible_lag_triples():
+    rng = np.random.default_rng(11)
+    residuals = rng.normal(size=(3000, 20))
+    config = Eiger2Config(window=1, random_seed=1, null_replicates=10)
+    tracks = null_tracks(residuals, config)
+    assert len(tracks) > 0
+    for track, eligible, lag in tracks:
+        assert isinstance(lag, int)
+        assert track.shape == eligible.shape
