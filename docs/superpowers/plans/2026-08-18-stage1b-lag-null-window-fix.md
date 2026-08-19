@@ -840,11 +840,21 @@ git commit -m "feat: add exchangeability benchmark command (spec §1b.3)"
 **Interfaces:**
 - Consumes: everything from Tasks 2–4.
 
+**Ruling carried from Task 1:** Task 1's reproduction found `SCENARIOS["missingness"]`'s
+default `missing_rate=0.25` does not manifest the diagnosis's reported effect in this
+environment (ratio ~1.6x, indistinguishable from clean/nuisance), while
+`missing_rate=0.5` does (threshold value lands close to the diagnosis's reported
+missingness figures). User-approved decision: use `missing_rate=0.5` for the
+missingness scenario throughout this task's reproduction, and state this deviation
+explicitly in the STOP 1b report rather than silently reporting numbers under a
+different parameter than the diagnosis implies. Use `missing_rate=0.25` for all other
+purposes (it remains `SCENARIOS`'s shared definition, unchanged).
+
 - [ ] **Step 1: Reproduce the per-edge exceedance and tail-shape tables**
 
 Using the same script structure as Task 1 Step 2, now against the FIXED
 `_lag_null_track`, at `window=4, correlation, null_replicates=100, seed 0, 20000 CpG,
-DMR-free`, reproduce:
+DMR-free` (missingness scenario at `missing_rate=0.5` per the ruling above), reproduce:
 - per-edge exceedance ratio (`p_obs/p_null` via `null_exchangeability`, not the
   simpler Task-1 approximation) for all 5 scenarios,
 - null/observed q99.5 and excess kurtosis (via `scipy.stats.kurtosis` on the pooled
@@ -907,8 +917,14 @@ def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
         "clean": dict(n_samples=80, n_latent=0, noise_sd=0.04, missing_rate=0.0),
         "nuisance": dict(n_samples=80, n_latent=2, latent_loading_sd=0.07,
                          noise_sd=0.04, missing_rate=0.0),
+        # missing_rate=0.5, not the SCENARIOS dict's default 0.25 -- ruled by the
+        # user after Task 1's reproduction found 0.25 does not manifest the
+        # defect's dramatic effect in this environment (ratio ~1.6x, indistinguishable
+        # from clean/nuisance) while 0.5 does (threshold value lands close to the
+        # diagnosis's reported missingness figures). Using 0.25 here would make this
+        # gate trivially pass even before the fix, which is not a meaningful test.
         "missingness": dict(n_samples=80, n_latent=2, latent_loading_sd=0.07,
-                            noise_sd=0.04, missing_rate=0.25),
+                            noise_sd=0.04, missing_rate=0.5),
         "small_n": dict(n_samples=12, n_latent=1, latent_loading_sd=0.07,
                         noise_sd=0.04, missing_rate=0.0),
         "high_noise": dict(n_samples=40, n_latent=2, latent_loading_sd=0.10,
