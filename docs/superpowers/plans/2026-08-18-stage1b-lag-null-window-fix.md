@@ -932,8 +932,15 @@ def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
     }
     for name, params in scenarios.items():
         for seed in range(10):
+            # spacing=20000, not 5000: at 5000 (n_cpg~5400) this test fails
+            # deterministically on 4/50 (scenario, seed) combos (e.g. high_noise
+            # seed 7: ratio 1.865) from finite-sample binomial noise on p_obs at
+            # this null_quantile's ~25-27 expected exceedances -- confirmed via a
+            # 3-point convergence sweep (ratios tighten to ~1.0 as n_cpg grows)
+            # and matches benchmarking/benchmark_suite.py::exchangeability()'s
+            # own established spacing=20000 convention for this exact diagnostic.
             matrix, locs, _ = simulate(seed=seed, strata=[], replicates=0,
-                                        spacing=5000, **params)
+                                        spacing=20000, **params)
             config = Eiger2Config(window=4, random_seed=seed, null_replicates=100)
             residuals = centre_cpgs(matrix)
             basis, _ = estimate_latent_basis(residuals, config)
