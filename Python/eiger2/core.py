@@ -611,6 +611,40 @@ def _lag_statistic(
     return out
 
 
+def _window_support(
+    finite: np.ndarray,
+    base_positions: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    chunk: int = 200_000,
+) -> np.ndarray:
+    """Per-position count of samples observed at every window member.
+
+    ``finite``: ``(n_cpg, n_samples)`` boolean, finiteness of the underlying
+    matrix. ``base_positions``: the reference CpG row for each position.
+    ``offsets``: row offsets from each base position making up that position's
+    window members -- ``[0, 1, ..., w-1]`` for the observed convention (window
+    starts at the base position), ``[0, lag, 2*lag, ..., (w-1)*lag]`` for a null
+    position at the given lag. The SAME function computes both, so the two
+    conventions cannot silently drift apart -- callers only choose ``offsets``.
+
+    Never materialises an ``(n_positions, n_samples, w)`` array: accumulates a
+    boolean AND over ``w`` two-dimensional ``(chunk, n_samples)`` slices instead.
+    """
+
+    n_samples = finite.shape[1]
+    n_positions = base_positions.size
+    out = np.empty(n_positions, dtype=np.int64)
+    for start in range(0, n_positions, chunk):
+        stop = min(start + chunk, n_positions)
+        block_base = base_positions[start:stop]
+        acc = np.ones((stop - start, n_samples), dtype=bool)
+        for offset in offsets:
+            acc &= finite[block_base + offset]
+        out[start:stop] = acc.sum(axis=1)
+    return out
+
+
 def _window_from_lags(lag_statistics: list[np.ndarray], window: int) -> np.ndarray:
     """Mean off-diagonal statistic of every ``window``-CpG block.
 

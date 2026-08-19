@@ -40,6 +40,7 @@ from eiger2.core import (  # noqa: E402
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
+    _window_support,
     null_exchangeability,
     null_threshold,
     null_tracks,
@@ -136,6 +137,50 @@ def test_window_reduces_null_variance():
     spread_pair = np.nanstd(edge_statistic(residuals, config_pair))
     spread_window = np.nanstd(edge_statistic(residuals, config_window))
     assert spread_window < 0.6 * spread_pair
+
+
+def test_window_support_counts_samples_finite_at_every_member():
+    finite = np.array([
+        [True,  True,  False],   # row 0
+        [True,  False, True],    # row 1
+        [True,  True,  True],    # row 2
+        [False, True,  True],    # row 3
+    ])
+    # window covering rows {0,1}: sample 0 finite at both (T,T), sample 1 not
+    # (T,F), sample 2 not (F,T) -> support = 1
+    support = _window_support(
+        finite, base_positions=np.array([0]), offsets=np.array([0, 1])
+    )
+    assert support.tolist() == [1]
+    # window covering rows {1,2}: sample0 (T,T)=finite, sample1 (F,T)=not,
+    # sample2 (T,T)=finite -> support = 2
+    support2 = _window_support(
+        finite, base_positions=np.array([1]), offsets=np.array([0, 1])
+    )
+    assert support2.tolist() == [2]
+
+
+def test_window_support_matches_naive_loop_on_random_data():
+    rng = np.random.default_rng(11)
+    n_cpg, n_samples = 200, 30
+    finite = rng.random((n_cpg, n_samples)) > 0.3
+    offsets = np.array([0, 3, 7])
+    base_positions = np.arange(n_cpg - offsets.max())
+    fast = _window_support(finite, base_positions, offsets)
+    naive = np.array([
+        finite[base + offsets].all(axis=0).sum() for base in base_positions
+    ])
+    np.testing.assert_array_equal(fast, naive)
+
+
+def test_window_support_chunking_does_not_change_result():
+    rng = np.random.default_rng(12)
+    finite = rng.random((500, 20)) > 0.4
+    offsets = np.array([0, 1, 2, 3])
+    base_positions = np.arange(496)
+    whole = _window_support(finite, base_positions, offsets, chunk=200_000)
+    chunked = _window_support(finite, base_positions, offsets, chunk=50)
+    np.testing.assert_array_equal(whole, chunked)
 
 
 # --------------------------------------------------------------------------
