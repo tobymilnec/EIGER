@@ -1380,6 +1380,12 @@ def length_stratum(n_cpg: int) -> str:
     return "50+"
 
 
+# Spec §1c.6: minimum pooled null-region count for a joint (length x support-bin)
+# stratum to be estimated on its own. Below this the stratum falls back to
+# length-only pooling. Fixed by the spec, deliberately not user-configurable.
+_MIN_NULL_REGIONS_PER_JOINT_STRATUM = 50
+
+
 def _overdispersion_diagnostic(
     per_replicate_null_areas: list[np.ndarray], cutoffs: np.ndarray
 ) -> tuple[str, float | None]:
@@ -1419,6 +1425,8 @@ def region_fdr_result(
     null_edges: int,
     observed_lengths: np.ndarray | None = None,
     null_length_sets: Sequence[np.ndarray] | None = None,
+    observed_support_bins: np.ndarray | None = None,
+    null_support_bin_sets: Sequence[np.ndarray] | None = None,
     confidence_level: float = 0.95,
 ) -> RegionFdrResult:
     """Region-level empirical FDR: point estimate, resolution, and simultaneous
@@ -1435,6 +1443,18 @@ def region_fdr_result(
     worse than long ones and pushes the caller towards a minimum-length cutoff.
     A 4-CpG DMR is real biology; it should compete against 4-CpG null regions,
     not against 50-CpG ones.
+
+    When ``observed_support_bins`` and ``null_support_bin_sets`` are ALSO
+    supplied (they require the length arrays; support-only stratification is not
+    supported), the null pool is stratified jointly, by
+    ``"<length_stratum>|sbin<b>"`` -- spec §1c.6's escalation. Equalising the
+    per-edge threshold across support bins does not equalise the rate at which
+    regions FORM per bin, so a region from a well-supported bin must compete
+    against null regions from that same bin. A joint stratum whose pooled null
+    count is below ``_MIN_NULL_REGIONS_PER_JOINT_STRATUM`` is too thin to
+    estimate on its own; those regions fall back to the length-only pool (every
+    support bin of that length stratum, unioned) and the joint label is listed in
+    ``diagnostics["support_stratification_fallback_strata"]``.
 
     See ``docs/FDR.md`` for the derivation and the three distinct quantities this
     keeps apart: the point estimate, the empirical resolution, and the Monte Carlo
@@ -1479,18 +1499,77 @@ def region_fdr_result(
     if stratified:
         observed_lengths = np.asarray(observed_lengths, dtype=int)
         null_length_sets = [np.asarray(a, dtype=int) for a in null_length_sets]
-        observed_strata = np.array(
+        observed_length_labels = np.array(
             [length_stratum(int(n)) for n in observed_lengths], dtype=object
         )
-        null_strata_by_replicate = [
+        null_length_labels_by_replicate = [
             np.array([length_stratum(int(n)) for n in lengths], dtype=object)
             for lengths in null_length_sets
         ]
     else:
-        observed_strata = np.full(m, "_pooled", dtype=object)
-        null_strata_by_replicate = [
+        observed_length_labels = np.full(m, "_pooled", dtype=object)
+        null_length_labels_by_replicate = [
             np.full(areas.size, "_pooled", dtype=object) for areas in null_area_sets
         ]
+
+    # Spec §1c.6 escalation: joint (length x support-bin) null pooling, layered on
+    # top of the length strata above. Never activates unless BOTH support arrays
+    # are supplied AND length stratification is already on, so every pre-existing
+    # caller (which passes neither) keeps bit-identical behaviour.
+    support_stratified = (
+        stratified
+        and observed_support_bins is not None
+        and null_support_bin_sets is not None
+    )
+    support_fallback_joint_strata: list[str] = []
+    null_joint_labels_by_replicate = null_length_labels_by_replicate
+    if support_stratified:
+        observed_support_bins = np.asarray(observed_support_bins, dtype=int)
+        null_support_bin_sets = [
+            np.asarray(a, dtype=int) for a in null_support_bin_sets
+        ]
+        observed_joint_labels = np.array(
+            [
+                f"{length_stratum(int(n))}|sbin{int(b)}"
+                for n, b in zip(observed_lengths, observed_support_bins, strict=True)
+            ],
+            dtype=object,
+        )
+        null_joint_labels_by_replicate = [
+            np.array(
+                [
+                    f"{length_stratum(int(n))}|sbin{int(b)}"
+                    for n, b in zip(lengths, bins, strict=True)
+                ],
+                dtype=object,
+            )
+            for lengths, bins in zip(
+                null_length_sets, null_support_bin_sets, strict=True
+            )
+        ]
+        joint_null_counts: dict[str, int] = {}
+        for labels in null_joint_labels_by_replicate:
+            if labels.size == 0:
+                continue
+            values, counts = np.unique(labels, return_counts=True)
+            for value, count in zip(values, counts, strict=True):
+                joint_null_counts[str(value)] = (
+                    joint_null_counts.get(str(value), 0) + int(count)
+                )
+
+        observed_strata = np.empty(m, dtype=object)
+        for i in range(m):
+            joint_label = str(observed_joint_labels[i])
+            if (
+                joint_null_counts.get(joint_label, 0)
+                >= _MIN_NULL_REGIONS_PER_JOINT_STRATUM
+            ):
+                observed_strata[i] = joint_label
+            else:
+                observed_strata[i] = observed_length_labels[i]
+                support_fallback_joint_strata.append(joint_label)
+    else:
+        observed_strata = observed_length_labels
 
     strata = np.unique(observed_strata)
 
@@ -1513,8 +1592,18 @@ def region_fdr_result(
 
     for stratum in strata:
         rows = np.flatnonzero(observed_strata == stratum)
+        # A joint label selects null regions by the joint key; a length-only
+        # label (either because support stratification is off, or because this
+        # stratum fell back) selects by length alone, i.e. the union over every
+        # support bin of that length stratum.
+        is_joint_stratum = support_stratified and "|sbin" in str(stratum)
+        labels_by_replicate = (
+            null_joint_labels_by_replicate
+            if is_joint_stratum
+            else null_length_labels_by_replicate
+        )
         per_replicate = [
-            null_area_sets[b][null_strata_by_replicate[b] == stratum]
+            null_area_sets[b][labels_by_replicate[b] == stratum]
             for b in range(replicates)
         ]
         pooled = np.concatenate(per_replicate) if per_replicate else np.empty(0)
@@ -1554,6 +1643,11 @@ def region_fdr_result(
         "null_count_dispersion_by_stratum": overdispersion_by_stratum,
         "null_count_overdispersion_warning": overdispersion_warning,
         "scale": scale,
+        "support_stratified": support_stratified,
+        "support_stratification_fallback_strata": sorted(
+            set(support_fallback_joint_strata)
+        ),
+        "min_null_regions_per_joint_stratum": _MIN_NULL_REGIONS_PER_JOINT_STRATUM,
     }
     return RegionFdrResult(
         qvalue=qvalue, tail_fdr=tail_fdr, qvalue_lower=qvalue_lower,
@@ -2157,6 +2251,12 @@ def call_dmrs(
     # set up): `pooled_null_support` is precisely the eligible+finite null
     # support values pooled across every replicate, and `usable_mask` is the
     # observed analogue -- no separate occupancy count needed.
+    # Task 10 (spec §1c.6 escalation): the same per-region support-bin
+    # assignments also stratify the region-FDR null pool below. Default None ==
+    # length-only pooling == pre-Task-10 behaviour, which is what every run with
+    # support binning off (and every other caller of region_fdr_result) gets.
+    observed_support_bins_for_fdr = None
+    null_support_bin_sets_for_fdr = None
     if support_binning in ("auto_on", "forced_on"):
         n_final_bins = support_bin_edges.size + 1
         region_bins = _assign_support_bin(
@@ -2229,6 +2329,38 @@ def call_dmrs(
                 entry["ratio"] = observed_rate / null_rate
             region_rate_by_support_bin[int(b)] = entry
         manifest["region_rate_by_support_bin"] = region_rate_by_support_bin
+
+        # Joint (length x support-bin) FDR stratification is defined ON TOP of
+        # the length strata, so it only activates when those are on too. Each
+        # null region's bin comes from its OWN replicate's full-length support
+        # array via the same median-then-_assign_support_bin recipe used for the
+        # observed regions above, so observed and null are binned identically.
+        if config.length_stratified_fdr:
+            observed_support_bins_for_fdr = region_bins
+            null_region_support_medians_by_replicate = [
+                (
+                    np.array(
+                        [
+                            float(np.median(support[first:last]))
+                            for first, last in null_regions
+                        ],
+                        dtype=float,
+                    )
+                    if null_regions.size
+                    else np.empty(0, dtype=float)
+                )
+                for null_regions, support in zip(
+                    null_regions_by_replicate, null_full_support, strict=True
+                )
+            ]
+            null_support_bin_sets_for_fdr = [
+                (
+                    _assign_support_bin(medians, support_bin_edges)
+                    if medians.size
+                    else np.empty(0, dtype=int)
+                )
+                for medians in null_region_support_medians_by_replicate
+            ]
     fdr_result = region_fdr_result(
         observed_areas,
         null_areas,
@@ -2236,6 +2368,8 @@ def call_dmrs(
         null_edges=max(null_edge_total, 1),
         observed_lengths=observed_lengths if config.length_stratified_fdr else None,
         null_length_sets=null_lengths if config.length_stratified_fdr else None,
+        observed_support_bins=observed_support_bins_for_fdr,
+        null_support_bin_sets=null_support_bin_sets_for_fdr,
     )
     if config.fdr_decision == "upper":
         # Spec §1.8 frames this guard as running "before computing regions";

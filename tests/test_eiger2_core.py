@@ -1041,6 +1041,276 @@ def test_region_fdr_result_weak_candidates_do_not_inherit_a_leading_zero():
 
 
 # --------------------------------------------------------------------------
+# Task 10 (Stage 1c escalation, spec §1c.6): region-FDR null pooling
+# additionally stratified by support bin, with a length-only fallback when a
+# joint (length x support) stratum has too few pooled null regions.
+# --------------------------------------------------------------------------
+
+
+def test_region_fdr_result_support_stratification_diagnostics():
+    rng = np.random.default_rng(77)
+    # Two observed regions, same length stratum ("6-9"), different support bins.
+    observed_areas = np.array([12.0, 9.0])
+    observed_lengths = np.array([6, 6])
+    observed_support_bins = np.array([0, 1])
+
+    # 3 null replicates. Support bin 0 gets 20 null regions per replicate (60
+    # pooled, >= _MIN_NULL_REGIONS_PER_JOINT_STRATUM -> joint stratum "6-9|sbin0"
+    # stays joint). Support bin 1 gets 1 null region per replicate (3 pooled,
+    # < 50 -> falls back to length-only pooling for that region).
+    null_area_sets = []
+    null_length_sets = []
+    null_support_bin_sets = []
+    for _ in range(3):
+        bin0_areas = rng.uniform(1.0, 8.0, size=20)
+        bin1_areas = rng.uniform(1.0, 8.0, size=1)
+        null_area_sets.append(np.concatenate([bin0_areas, bin1_areas]))
+        null_length_sets.append(np.full(21, 6))
+        null_support_bin_sets.append(
+            np.concatenate([np.zeros(20, dtype=int), np.ones(1, dtype=int)])
+        )
+
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1000, null_edges=3000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        observed_support_bins=observed_support_bins,
+        null_support_bin_sets=null_support_bin_sets,
+    )
+
+    assert result.diagnostics["support_stratified"] is True
+    assert result.diagnostics["min_null_regions_per_joint_stratum"] == 50
+    assert result.diagnostics["support_stratification_fallback_strata"] == ["6-9|sbin1"]
+    cutoffs = result.diagnostics["fdr_interval_cutoffs_by_stratum"]
+    assert "6-9|sbin0" in cutoffs  # well-populated joint stratum stayed joint
+    assert "6-9" in cutoffs        # region 1 fell back to the length-only label
+    assert "6-9|sbin1" not in cutoffs  # never appears as a final stratum itself
+    assert np.all(np.isfinite(result.qvalue))
+    assert result.qvalue.shape == (2,)
+
+    # None (the default) must reproduce pre-existing behavior exactly: no new
+    # diagnostics keys, same shape.
+    unstratified = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1000, null_edges=3000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert unstratified.diagnostics["support_stratified"] is False
+    assert unstratified.diagnostics["support_stratification_fallback_strata"] == []
+
+
+def test_region_fdr_result_fallback_stratum_pools_every_support_bin_numerically():
+    # Hand-verifiable arithmetic, no RNG. Both observed regions sit in length
+    # stratum "6-9" and each is ALONE in its final stratum, so the
+    # reverse-cumulative-minimum over groups is the identity and
+    # tail_fdr == qvalue == min(1, scale * K / 1) with K exactly the number of
+    # pooled null areas >= that region's own area (see _fdr_from_areas_result).
+    #
+    #   bin 0: 20 null regions per replicate, areas 1.0 .. 20.0  (60 pooled >= 50
+    #          -> "6-9|sbin0" stays joint)
+    #   bin 1:  1 null region  per replicate, area 50.0          (3 pooled < 50
+    #          -> region 1 falls back to the length-only pool "6-9")
+    bin0 = np.arange(1.0, 21.0)
+    null_area_sets = [np.concatenate([bin0, np.array([50.0])]) for _ in range(3)]
+    null_length_sets = [np.full(21, 6) for _ in range(3)]
+    null_support_bin_sets = [
+        np.concatenate([np.zeros(20, dtype=int), np.ones(1, dtype=int)])
+        for _ in range(3)
+    ]
+    observed_areas = np.array([12.0, 9.0])
+    observed_lengths = np.array([6, 6])
+    observed_support_bins = np.array([0, 1])
+
+    # scale = 1/100 keeps every product below the min(1.0, ...) cap so the
+    # arithmetic stays visible instead of saturating.
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1, null_edges=100,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        observed_support_bins=observed_support_bins,
+        null_support_bin_sets=null_support_bin_sets,
+    )
+    assert result.diagnostics["scale"] == pytest.approx(0.01)
+    assert result.diagnostics["support_stratification_fallback_strata"] == ["6-9|sbin1"]
+
+    # Region 0 ("6-9|sbin0"): only bin-0 nulls, 9 per replicate >= 12.0 -> 27.
+    # The length-only pool would have added the three 50.0 bin-1 nulls (30), so
+    # this value also proves the joint stratum EXCLUDED the other bin.
+    bin0_ge_12 = 3 * int(np.sum(bin0 >= 12.0))
+    assert bin0_ge_12 == 27
+    assert int(result.null_exceedances[0]) == 27
+    assert result.tail_fdr[0] == pytest.approx(0.27)
+    assert result.qvalue[0] == pytest.approx(0.27)
+
+    # Region 1 fell back: its pooled null set must literally be the UNION of
+    # both support bins' null areas for length stratum "6-9".
+    pooled_all = np.concatenate(null_area_sets)
+    expected_fallback_k = int(np.sum(pooled_all >= 9.0))
+    assert expected_fallback_k == 3 * int(np.sum(bin0 >= 9.0)) + 3  # 36 + 3
+    assert int(result.null_exceedances[1]) == expected_fallback_k == 39
+    assert result.tail_fdr[1] == pytest.approx(0.39)
+    # Had the thin joint stratum NOT fallen back, K would have been the three
+    # bin-1 nulls only -> 0.03. Had it fallen back to the WRONG (bin-0-only)
+    # pool, K would have been 36 -> 0.36. Both are excluded.
+    assert result.tail_fdr[1] != pytest.approx(0.03)
+    assert result.tail_fdr[1] != pytest.approx(0.36)
+
+    # The length-only-stratified run must reach region 1 through the SAME pooled
+    # null set (K == 39 either way) -- that is what "fell back to length-only
+    # pooling" means. Its tail_fdr differs only through the DENOMINATOR: there
+    # both regions share one stratum, so R = 2 observed areas >= 9.0 and
+    # raw = 0.01 * 39 / 2 = 0.195, whereas under joint stratification region 1
+    # is alone in "6-9" and R = 1. This is exactly the stratum-membership
+    # dependence that makes a naive qvalue-equality assertion wrong; the pooled
+    # NULL SET is the invariant that must hold, and it does.
+    length_only = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1, null_edges=100,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert int(length_only.null_exceedances[1]) == 39
+    assert length_only.tail_fdr[1] == pytest.approx(0.01 * 39 / 2)
+    # ...and region 0's null pool DOES change: length-only pools the three 50.0
+    # bin-1 nulls in with the bin-0 ones, so at region 0's OWN cutoff (which is
+    # what tail_fdr reports) K = 30, not the 27 the joint stratum gave.
+    assert length_only.tail_fdr[0] == pytest.approx(0.30)
+    # null_exceedances reports K at the Q-ACHIEVING cutoff, which for region 0
+    # here is region 1's cutoff (0.195 < 0.30), hence 39 rather than 30.
+    assert int(length_only.null_exceedances[0]) == 39
+    assert length_only.qvalue[0] == pytest.approx(0.01 * 39 / 2)
+
+
+def test_region_fdr_result_joint_strata_use_only_their_own_bin_nulls():
+    # Both support bins are well populated (60 pooled null regions each), so
+    # NOTHING falls back and each observed region is scored against its own
+    # bin's nulls only.
+    bin0 = np.arange(1.0, 21.0)    # 1..20
+    bin1 = np.arange(21.0, 41.0)   # 21..40
+    null_area_sets = [np.concatenate([bin0, bin1]) for _ in range(3)]
+    null_length_sets = [np.full(40, 6) for _ in range(3)]
+    null_support_bin_sets = [
+        np.concatenate([np.zeros(20, dtype=int), np.ones(20, dtype=int)])
+        for _ in range(3)
+    ]
+    observed_areas = np.array([15.0, 15.0])
+    observed_lengths = np.array([6, 6])
+    observed_support_bins = np.array([0, 1])
+
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1, null_edges=100,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        observed_support_bins=observed_support_bins,
+        null_support_bin_sets=null_support_bin_sets,
+    )
+    assert result.diagnostics["support_stratification_fallback_strata"] == []
+    assert set(result.diagnostics["fdr_interval_cutoffs_by_stratum"]) == {
+        "6-9|sbin0", "6-9|sbin1",
+    }
+    # bin 0: 6 values >= 15 per replicate -> 18.  bin 1: all 20 -> 60.
+    assert int(result.null_exceedances[0]) == 18
+    assert int(result.null_exceedances[1]) == 60
+    assert result.tail_fdr[0] == pytest.approx(0.18)
+    assert result.tail_fdr[1] == pytest.approx(0.60)
+    # The length-only pool would have given BOTH regions 78.
+    length_only = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1, null_edges=100,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert int(length_only.null_exceedances[0]) == 78
+    assert int(length_only.null_exceedances[1]) == 78
+
+
+def test_region_fdr_result_single_support_bin_is_numerically_identical():
+    # Degenerate-but-critical invariant: if every observed region AND every null
+    # region falls in the SAME support bin, joint stratification only relabels
+    # the strata -- the membership of every pool is unchanged, so every numeric
+    # field must match the length-only run exactly. This is the check that would
+    # catch double-counting, an off-by-one in the joint-label zip, or a silently
+    # empty joint pool.
+    rng = np.random.default_rng(78)
+    observed_areas = rng.exponential(3.0, size=25)
+    observed_lengths = rng.integers(4, 60, size=25)
+    null_area_sets = [rng.exponential(3.0, size=200) for _ in range(6)]
+    null_length_sets = [rng.integers(4, 60, size=200) for _ in range(6)]
+
+    length_only = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=5000, null_edges=30000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    joint = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=5000, null_edges=30000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        observed_support_bins=np.zeros(25, dtype=int),
+        null_support_bin_sets=[np.zeros(200, dtype=int) for _ in range(6)],
+    )
+    for field in (
+        "qvalue", "tail_fdr", "qvalue_lower", "qvalue_upper",
+        "qvalue_resolution", "null_exceedances", "qvalue_cutoff_rank",
+    ):
+        assert np.array_equal(
+            getattr(joint, field), getattr(length_only, field), equal_nan=True
+        ), field
+    assert (
+        joint.diagnostics["fdr_interval_bonferroni_m"]
+        == length_only.diagnostics["fdr_interval_bonferroni_m"]
+    )
+    # Only the stratum LABELS differ ("20-49" -> "20-49|sbin0").
+    assert sorted(
+        k.split("|")[0] for k in joint.diagnostics["fdr_interval_cutoffs_by_stratum"]
+    ) == sorted(length_only.diagnostics["fdr_interval_cutoffs_by_stratum"])
+    assert all(
+        k.endswith("|sbin0")
+        for k in joint.diagnostics["fdr_interval_cutoffs_by_stratum"]
+    )
+
+
+def test_region_fdr_result_support_args_ignored_without_length_stratification():
+    # Joint stratification is defined ON TOP of length stratification. Passing
+    # support bins without lengths must not silently activate a support-only
+    # scheme (which is not spec'd) -- it must stay the pooled path.
+    rng = np.random.default_rng(79)
+    observed_areas = rng.exponential(2.0, size=10)
+    null_area_sets = [rng.exponential(2.0, size=80) for _ in range(4)]
+    result = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=500, null_edges=1000,
+        observed_support_bins=np.arange(10) % 2,
+        null_support_bin_sets=[np.arange(80) % 2 for _ in range(4)],
+    )
+    assert result.diagnostics["support_stratified"] is False
+    assert list(result.diagnostics["fdr_interval_cutoffs_by_stratum"]) == ["_pooled"]
+    baseline = region_fdr_result(
+        observed_areas, null_area_sets, observed_edges=500, null_edges=1000,
+    )
+    assert np.array_equal(result.qvalue, baseline.qvalue)
+
+
+def test_region_fdr_result_misaligned_support_bins_raise_rather_than_mispool():
+    # The support-bin arrays must be row-aligned with the length/area arrays. A
+    # silent misalignment would pool the wrong nulls into a stratum, so the zips
+    # are strict and this must raise, not quietly truncate.
+    observed_areas = np.array([5.0, 6.0])
+    observed_lengths = np.array([6, 6])
+    null_area_sets = [np.full(21, 1.0) for _ in range(2)]
+    null_length_sets = [np.full(21, 6) for _ in range(2)]
+    with pytest.raises(ValueError):
+        region_fdr_result(
+            observed_areas, null_area_sets, observed_edges=100, null_edges=200,
+            observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+            observed_support_bins=np.array([0, 1]),
+            null_support_bin_sets=[np.zeros(20, dtype=int) for _ in range(2)],
+        )
+    with pytest.raises(ValueError):
+        region_fdr_result(
+            observed_areas, null_area_sets, observed_edges=100, null_edges=200,
+            observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+            observed_support_bins=np.array([0]),
+            null_support_bin_sets=[np.zeros(21, dtype=int) for _ in range(2)],
+        )
+
+
+# --------------------------------------------------------------------------
 # overdispersion diagnostic
 # --------------------------------------------------------------------------
 
@@ -2101,3 +2371,67 @@ def test_region_rate_by_support_bin_ratio_guards_zero_null_rate():
             assert bin_stats["ratio"] == pytest.approx(
                 bin_stats["observed_rate"] / bin_stats["null_rate"]
             )
+
+
+# --------------------------------------------------------------------------
+# Task 10: support-stratified region FDR wired through call_dmrs
+# --------------------------------------------------------------------------
+
+
+def test_call_dmrs_support_stratified_fdr_activates_when_binning_on():
+    # The brief's original simulate() parameters (spacing=19600, strata=[])
+    # returned status="no_regions" for BOTH modes, making every assertion below
+    # vacuous. This uses the same scenario as the Task 9 tests, which does
+    # produce forced_on runs with real regions on both sides.
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] == "forced_on"
+    assert len(regions)  # guard against the assertions below going vacuous
+    assert manifest["fdr"]["support_stratified"] is True
+    assert manifest["fdr"]["min_null_regions_per_joint_stratum"] == 50
+    fallbacks = manifest["fdr"]["support_stratification_fallback_strata"]
+    final_strata = set(manifest["fdr"]["fdr_interval_cutoffs_by_stratum"])
+    # A joint label that fell back must never also survive as a final stratum,
+    # and every fallback label must be a joint label.
+    for label in fallbacks:
+        assert "|sbin" in label
+        assert label not in final_strata
+    # Every final stratum is either a bare length stratum or a joint one.
+    for label in final_strata:
+        assert label.split("|")[0] in {"4-5", "6-9", "10-19", "20-49", "50+"}
+
+    # "off" must be unaffected: no support stratification, same diagnostics shape
+    # as before this task.
+    config_off = Eiger2Config(window=4, null_replicates=100, random_seed=61,
+                               support_binned_threshold="off")
+    regions_off, _, manifest_off = call_dmrs(matrix, locs, config=config_off)
+    assert len(regions_off)
+    assert manifest_off["fdr"]["support_stratified"] is False
+    assert manifest_off["fdr"]["support_stratification_fallback_strata"] == []
+    assert all(
+        "|sbin" not in label
+        for label in manifest_off["fdr"]["fdr_interval_cutoffs_by_stratum"]
+    )
+
+
+def test_call_dmrs_support_stratified_fdr_is_not_used_without_length_strata():
+    # config.length_stratified_fdr=False must keep the FDR path pooled even when
+    # support binning is forced on (joint stratification without length strata is
+    # not spec'd).
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
+                           support_binned_threshold="on",
+                           length_stratified_fdr=False)
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    if manifest["support_binning"] != "forced_on" or not len(regions):
+        pytest.skip("this seed did not produce a forced_on run with regions")
+    assert manifest["fdr"]["support_stratified"] is False
+    assert list(manifest["fdr"]["fdr_interval_cutoffs_by_stratum"]) == ["_pooled"]
