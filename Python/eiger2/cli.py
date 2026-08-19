@@ -654,6 +654,18 @@ def command_call(args: argparse.Namespace) -> int:
             f"uncertainty.",
             file=sys.stderr,
         )
+    exchangeability_ratio = (caller_manifest.get("null") or {}).get(
+        "null_exchangeability_ratio"
+    )
+    if exchangeability_ratio is not None and exchangeability_ratio > 1.25:
+        print(
+            f"[eiger2] WARNING: observed edges exceed the null threshold "
+            f"{exchangeability_ratio:.2f}x more often than the null itself "
+            f"does (nominal 1.0x). The null is not exchangeable with the data; "
+            f"region_qvalue and significant are unreliable. See docs/FDR.md, "
+            f"'Null exchangeability'.",
+            file=sys.stderr,
+        )
     warning = caller_manifest.get("null", {}).get("warning") \
         if isinstance(caller_manifest.get("null"), dict) else None
     if warning:

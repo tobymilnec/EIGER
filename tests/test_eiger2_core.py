@@ -34,6 +34,9 @@ from eiger2.core import (  # noqa: E402
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
+    null_exchangeability,
+    null_threshold,
+    null_tracks,
     permutation_null_tracks,
     qvalue_result_from_track,
     qvalues_from_track,
@@ -1268,3 +1271,68 @@ def test_lag_null_track_slice_bounds_hold_for_large_window_and_lag():
                 assert out.size == 0
             else:
                 assert out.size == expected_usable
+
+
+# --------------------------------------------------------------------------
+# null exchangeability
+# --------------------------------------------------------------------------
+
+
+def test_null_exchangeability_self_consistency_control():
+    # held-out null exceedance must equal 1 - null_quantile to within Monte Carlo
+    # error -- this is the control that proves the gate measures the right thing
+    rng = np.random.default_rng(303)
+    residuals = rng.normal(size=(3000, 40))
+    config = Eiger2Config(window=1, random_seed=7, null_replicates=200)
+    tracks = null_tracks(residuals, config)
+    statistic = rng.normal(size=2999)  # arbitrary observed track, same length class
+    eligible = np.ones(2999, dtype=bool)
+    result = null_exchangeability(tracks, statistic, eligible, config)
+    assert result["p_null"] == pytest.approx(1 - config.null_quantile, abs=0.003)
+
+
+def test_null_exchangeability_ratio_is_one_when_observed_equals_null():
+    rng = np.random.default_rng(404)
+    residuals = rng.normal(size=(3000, 40))
+    config = Eiger2Config(window=1, random_seed=7, null_replicates=200)
+    tracks = null_tracks(residuals, config)
+    # use one of the null's own held-out-eligible values as a stand-in "observed"
+    # track drawn from the identical distribution -- ratio should be close to 1
+    pooled_all = np.concatenate([t[np.isfinite(t) & e] for t, e in tracks])
+    observed_like_null = rng.choice(pooled_all, size=2000, replace=True)
+    eligible = np.ones(2000, dtype=bool)
+    result = null_exchangeability(tracks, observed_like_null, eligible, config)
+    assert result["null_exchangeability_ratio"] == pytest.approx(1.0, abs=0.3)
+
+
+def test_null_exchangeability_deterministic_split():
+    rng = np.random.default_rng(505)
+    residuals = rng.normal(size=(2000, 30))
+    config = Eiger2Config(window=1, random_seed=9, null_replicates=100)
+    tracks = null_tracks(residuals, config)
+    statistic = rng.normal(size=1999)
+    eligible = np.ones(1999, dtype=bool)
+    first = null_exchangeability(tracks, statistic, eligible, config)
+    second = null_exchangeability(tracks, statistic, eligible, config)
+    assert first == second
+
+
+def test_null_threshold_reports_exchangeability_when_statistic_given():
+    rng = np.random.default_rng(606)
+    residuals = rng.normal(size=(2000, 30))
+    config = Eiger2Config(window=1, random_seed=3, null_replicates=100)
+    statistic = rng.normal(size=1999)
+    eligible = np.ones(1999, dtype=bool)
+    threshold, diagnostics = null_threshold(
+        residuals, config, statistic=statistic, eligible=eligible,
+    )
+    assert "null_exchangeability_ratio" in diagnostics
+    assert diagnostics["null_exchangeability_ratio"] > 0
+
+
+def test_null_threshold_omits_exchangeability_when_statistic_not_given():
+    rng = np.random.default_rng(707)
+    residuals = rng.normal(size=(2000, 30))
+    config = Eiger2Config(window=1, random_seed=3, null_replicates=100)
+    threshold, diagnostics = null_threshold(residuals, config)
+    assert "null_exchangeability_ratio" not in diagnostics

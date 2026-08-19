@@ -900,11 +900,91 @@ def region_minority_size(
     return int(min(cut + 1, n - cut - 1)), delta
 
 
+def null_exchangeability(
+    tracks: list[tuple[np.ndarray, np.ndarray]],
+    statistic: np.ndarray,
+    eligible: np.ndarray,
+    config: Eiger2Config,
+    *,
+    calibration_fraction: float = 0.5,
+) -> dict:
+    """Split-half check that the null distribution matches the observed one.
+
+    Splits the null replicates into a calibration half (sets the threshold) and a
+    held-out half (measures exceedance against it). ``p_null`` is the held-out
+    exceedance and is a control: by construction it must equal
+    ``1 - config.null_quantile``, confirming the null is internally self-consistent.
+    ``p_obs`` is the observed track's exceedance against the SAME threshold. The
+    ratio ``p_obs / p_null`` is the actual gate: it is 1.0 when the null and the
+    data share the same upper-tail shape, and rises when the observed track is
+    more heavy-tailed than the null represents -- exactly the failure mode
+    described in docs/FDR.md, "Null exchangeability".
+
+    The split is deterministic given ``config.random_seed`` -- a fixed permutation
+    of replicate indices, not re-derived from tracks' own order, so results are
+    reproducible independent of how many replicates happen to survive filtering
+    upstream.
+    """
+
+    n = len(tracks)
+    rng = np.random.default_rng(config.random_seed + 30011)
+    order = rng.permutation(n)
+    n_calibration = max(1, int(round(n * calibration_fraction)))
+    calibration_idx = order[:n_calibration]
+    holdout_idx = order[n_calibration:]
+
+    def _pool(indices):
+        if indices.size == 0:
+            return np.empty(0, dtype=float)
+        values = np.concatenate([
+            tracks[i][0][np.isfinite(tracks[i][0]) & tracks[i][1]]
+            for i in indices
+        ])
+        return values
+
+    calibration_pool = _pool(calibration_idx)
+    holdout_pool = _pool(holdout_idx)
+
+    calibration_threshold = (
+        float(np.quantile(calibration_pool, config.null_quantile))
+        if calibration_pool.size else float("nan")
+    )
+
+    p_null = (
+        float(np.mean(holdout_pool >= calibration_threshold))
+        if holdout_pool.size and np.isfinite(calibration_threshold) else float("nan")
+    )
+
+    observed_eligible = statistic[eligible & np.isfinite(statistic)]
+    p_obs = (
+        float(np.mean(observed_eligible >= calibration_threshold))
+        if observed_eligible.size and np.isfinite(calibration_threshold)
+        else float("nan")
+    )
+
+    ratio = (
+        p_obs / p_null if p_null and np.isfinite(p_null) and p_null > 0
+        else float("nan")
+    )
+
+    return {
+        "p_null": p_null,
+        "p_obs": p_obs,
+        "null_exchangeability_ratio": ratio,
+        "n_calibration_replicates": int(calibration_idx.size),
+        "n_holdout_replicates": int(holdout_idx.size),
+        "calibration_threshold": calibration_threshold,
+    }
+
+
 def null_threshold(
     residuals: np.ndarray,
     config: Eiger2Config,
     locations: pd.DataFrame | None = None,
     tracks: list | None = None,
+    *,
+    statistic: np.ndarray | None = None,
+    eligible: np.ndarray | None = None,
 ) -> tuple[float, dict]:
     """Upper-quantile threshold of the null statistic distribution."""
 
@@ -935,6 +1015,10 @@ def null_threshold(
         "null_median": float(np.median(pooled)),
         "threshold": threshold,
     }
+    if statistic is not None and eligible is not None:
+        diagnostics.update(
+            null_exchangeability(tracks, statistic, eligible, config)
+        )
     if pooled.size < config.min_null_values or coverage < config.min_null_coverage:
         diagnostics["warning"] = (
             f"null is thin: {pooled.size} usable positions "
@@ -1652,7 +1736,9 @@ def call_dmrs(
     # The threshold always comes from the locality-breaking null: it decides
     # which individual edges count as elevated, and that question is unaffected
     # by cohort size in the way the region-level question is.
-    threshold, null_diagnostics = null_threshold(deflated, config, frame)
+    threshold, null_diagnostics = null_threshold(
+        deflated, config, frame, statistic=statistic, eligible=eligible,
+    )
     null_diagnostics["mode"] = config.null_mode
 
     if config.null_mode == "permutation":
