@@ -60,7 +60,20 @@ __all__ = [
 # --------------------------------------------------------------------------
 
 
-_DEFAULT_SUPPORT_DISPERSION_CUT = 0.5  # calibrated in Task 8 -- see that task's commit
+_DEFAULT_SUPPORT_DISPERSION_CUT = 0.5
+# calibrated (Stage 1c, Task 8): 5 standard scenarios x 10 seeds each
+# (benchmarking/benchmark_suite.py::SCENARIOS, strata=DEFAULT_STRATA,
+# replicates=6, spacing=400), support_binned_threshold="off" so dispersion is
+# recorded but binning cannot activate. clean/nuisance/small_n/high_noise
+# (missing_rate=0.0) measured support_dispersion == 0.0 at every seed --
+# structurally exact, since with no missingness every eligible window has
+# full support and the 90th/10th percentile spread is zero. missingness
+# (missing_rate=0.25) measured support_dispersion in [1.0417, 1.1250],
+# median 1.0833. 0.5 sits near the midpoint of the separating gap (0, 1.0417)
+# -- comfortable margin either side (0.5 above the four-scenario ceiling,
+# 0.5417 below the missingness floor) -- and was verified to reproduce
+# auto_on for missingness and auto_off for the other four at every one of
+# the 50 scenario x seed combinations tested. See STOP 1c report.
 
 
 @dataclass(frozen=True)
@@ -327,8 +340,11 @@ class Eiger2Config:
 
     support_dispersion_cut: float | None = None
     """Auto-enable threshold for ``support_binned_threshold="auto"``. ``None``
-    uses the calibrated default (see docs/FDR.md, Stage 1e) -- calibrated in
-    this stage's STOP report pending Stage 1e's full-scale confirmation."""
+    uses the calibrated default, ``_DEFAULT_SUPPORT_DISPERSION_CUT = 0.5``
+    (Stage 1c, Task 8: separates the 5 standard scenarios' measured
+    ``support_dispersion`` at 10 seeds/scenario -- clean/nuisance/small_n/
+    high_noise at 0.0, missingness in [1.0417, 1.1250] -- see STOP 1c report),
+    pending Stage 1e's full-scale confirmation."""
 
     def __post_init__(self) -> None:
         if self.statistic not in {"correlation", "covariance"}:

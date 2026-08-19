@@ -1998,3 +1998,45 @@ def test_statistic_threshold_stays_scalar_when_single_mode():
         regions["statistic_threshold"].to_numpy(),
         np.full(len(regions), scalar_threshold),
     )
+
+
+# --------------------------------------------------------------------------
+# Task 8: calibrated support_dispersion_cut -- auto-enable fires only on
+# missingness at the calibrated default (Stage 1c, spec §1c.7 test item 6)
+# --------------------------------------------------------------------------
+
+
+def test_auto_enable_fires_only_on_missingness_at_calibrated_cut():
+    # Calibration basis (Task 8, full table in task-8-report.md): the 5
+    # standard scenarios (benchmarking.benchmark_suite.SCENARIOS) at
+    # strata=DEFAULT_STRATA, replicates=6, spacing=400 (matching the
+    # benchmark harness's own standard invocation, e.g. heuristic_sweep()/
+    # calibration()), 10 seeds each. Measured manifest["support_dispersion"]
+    # with support_binned_threshold="off": clean/nuisance/small_n/high_noise
+    # (missing_rate=0.0) == 0.0 at every seed (structurally exact -- with no
+    # missingness every eligible window has full support, so the 90th/10th
+    # percentile spread is zero); missingness (missing_rate=0.25) in
+    # [1.0417, 1.1250], median 1.0833. _DEFAULT_SUPPORT_DISPERSION_CUT = 0.5
+    # sits near the midpoint of the (0, 1.0417) separating gap. This test
+    # re-runs a subset of those seeds (3, not all 10 -- the calibration
+    # script itself, not this suite, is the full 10-seed record) with
+    # support_binned_threshold="auto" (the calibrated default) and asserts
+    # the auto-enable decision lands correctly for every scenario x seed.
+    from benchmarking.benchmark_suite import DEFAULT_STRATA, SCENARIOS
+
+    scenario_names = ["clean", "nuisance", "missingness", "small_n", "high_noise"]
+    for name in scenario_names:
+        params = SCENARIOS[name]
+        for seed in range(3):
+            matrix, locs, _ = simulate(
+                seed=seed, strata=DEFAULT_STRATA, replicates=6, spacing=400,
+                **params,
+            )
+            config = Eiger2Config(window=4, random_seed=seed, null_replicates=100)
+            assert config.support_binned_threshold == "auto"
+            assert config.support_dispersion_cut is None
+            _, _, manifest = call_dmrs(matrix, locs, config=config)
+            expected = "auto_on" if name == "missingness" else "auto_off"
+            assert manifest["support_binning"] == expected, (
+                name, seed, manifest["support_binning"], manifest["support_dispersion"],
+            )
