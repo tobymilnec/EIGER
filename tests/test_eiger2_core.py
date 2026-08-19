@@ -2435,3 +2435,278 @@ def test_call_dmrs_support_stratified_fdr_is_not_used_without_length_strata():
         pytest.skip("this seed did not produce a forced_on run with regions")
     assert manifest["fdr"]["support_stratified"] is False
     assert list(manifest["fdr"]["fdr_interval_cutoffs_by_stratum"]) == ["_pooled"]
+
+
+# --------------------------------------------------------------------------
+# Task 11: the remaining spec §1c.7 items (2, 3, 5, 8, 9) at the call_dmrs
+# integration level. Items 1/4/6/7/10 are already covered by Tasks 4/5/6/8's
+# own tests; the five below are the ones §1c.7 asks for that only a real
+# end-to-end run can establish.
+# --------------------------------------------------------------------------
+
+
+def test_observed_and_null_support_come_from_the_same_function_end_to_end(
+    monkeypatch,
+):
+    # spec §1c.7 item 2, at the integration level. Task 3's unit tests prove
+    # `_window_support` itself is correct; they cannot prove `call_dmrs` routes
+    # BOTH the observed track and every null replicate through it, against the
+    # same finiteness mask, with member-set offsets built by the same rule. That
+    # is what this test establishes, by recording every call the real pipeline
+    # makes.
+    import eiger2.core as core_mod
+
+    original = core_mod._window_support
+    calls: list[dict] = []
+
+    def recording(finite, base_positions, offsets, **kwargs):
+        out = original(finite, base_positions, offsets, **kwargs)
+        calls.append({
+            "finite": finite,
+            "base": np.asarray(base_positions).copy(),
+            "offsets": np.asarray(offsets).copy(),
+            "out": np.asarray(out).copy(),
+        })
+        return out
+
+    monkeypatch.setattr(core_mod, "_window_support", recording)
+
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=8, random_seed=61,
+                           support_binned_threshold="on")
+    _, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
+
+    # one observed call, then exactly one per null replicate -- the null never
+    # takes a different route to its support values.
+    assert len(calls) == 1 + config.null_replicates
+
+    # every call reads the SAME finiteness mask object: observed and null support
+    # are two views of one underlying data matrix, not two separate derivations.
+    first_finite = calls[0]["finite"]
+    assert all(call["finite"] is first_finite for call in calls)
+
+    # every call's offsets follow the one member-set rule (spec §1c.1):
+    # arange(window) * lag. Observed is that rule at lag 1; each null replicate
+    # is the same rule at its own lag. Nothing else is permitted.
+    window = config.window
+    for index, call in enumerate(calls):
+        offsets = call["offsets"]
+        assert offsets.size == window
+        assert offsets[0] == 0
+        lag = int(offsets[1] - offsets[0])
+        assert np.array_equal(offsets, np.arange(window) * lag)
+        if index == 0:
+            assert lag == 1                     # the observed track
+        else:
+            assert lag >= 2                     # a locality-breaking null lag
+
+    # and the values themselves match a naive brute-force loop over the same
+    # mask, for the observed call and for a null call alike -- the "same value
+    # on identical underlying finiteness" half of §1c.7 item 2.
+    for call in (calls[0], calls[-1]):
+        finite, base, offsets = call["finite"], call["base"], call["offsets"]
+        naive = np.array([
+            int(np.sum(np.all(finite[b + offsets, :], axis=0)))
+            for b in base
+        ])
+        assert np.array_equal(naive, call["out"])
+
+    # the decisive cross-check: feed a null replicate's base positions through
+    # the OBSERVED member-set pattern. Observed and null differ only in which
+    # positions and which lag they ask about, never in how support is counted.
+    null_base = calls[-1]["base"]
+    shared = original(first_finite, null_base[: 500], calls[0]["offsets"])
+    expected = np.array([
+        int(np.sum(np.all(first_finite[b + calls[0]["offsets"], :], axis=0)))
+        for b in null_base[:500]
+    ])
+    assert np.array_equal(shared, expected)
+
+
+def test_null_support_bins_use_the_observed_derived_edges_unchanged(monkeypatch):
+    # spec §1c.7 item 3. The edges must be derived ONCE, from the observed
+    # support, and then applied verbatim to every null replicate -- a null that
+    # re-quantiles its own support would equalise the two by construction and
+    # make the whole diagnostic vacuous. Recording both helpers proves the
+    # derivation happens exactly once and that every later bin assignment
+    # (observed, per-replicate null threshold pooling, per-replicate null
+    # threshold arrays, and the region-rate diagnostic) uses that same array.
+    import eiger2.core as core_mod
+
+    original_edges = core_mod._support_bin_edges
+    original_assign = core_mod._assign_support_bin
+    edge_results: list[dict] = []
+    assign_edges: list[np.ndarray] = []
+
+    def recording_edges(observed_support, n_bins, min_null_values, pooled_null):
+        out = original_edges(observed_support, n_bins, min_null_values, pooled_null)
+        edge_results.append(out)
+        return out
+
+    def recording_assign(support, bin_edges):
+        assign_edges.append(np.asarray(bin_edges).copy())
+        return original_assign(support, bin_edges)
+
+    monkeypatch.setattr(core_mod, "_support_bin_edges", recording_edges)
+    monkeypatch.setattr(core_mod, "_assign_support_bin", recording_assign)
+
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=8, random_seed=61,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] == "forced_on"
+    assert len(regions)
+
+    # derived exactly once -- the null has no opportunity to re-derive its own.
+    assert len(edge_results) == 1
+    assert edge_results[0]["collapsed"] is False
+    derived = np.asarray(edge_results[0]["bin_edges"])
+    assert derived.size >= 1
+
+    # the manifest reports the same edges the pipeline actually used.
+    assert manifest["support_bin_edges"] == derived.tolist()
+
+    # every bin assignment anywhere in the run -- observed and null alike --
+    # used that identical array, element for element.
+    assert len(assign_edges) >= 1 + config.null_replicates
+    for edges in assign_edges:
+        assert np.array_equal(edges, derived)
+
+    # and the per-bin thresholds are indexed by that same binning, so a null
+    # replicate's threshold array can only take values from this list.
+    thresholds = np.asarray(manifest["support_thresholds"], dtype=float)
+    assert thresholds.size == derived.size + 1
+
+
+def test_single_bin_collapse_reproduces_the_unconditioned_path_end_to_end():
+    # spec §1c.7 item 5, at the integration level (Task 5 covers the collapse
+    # decision itself in `_support_bin_edges`). `min_null_values` far above any
+    # attainable pooled-null count forces every candidate bin to merge upward
+    # until one bin is left, which is the collapse fallback. The run must then
+    # be indistinguishable from `support_binned_threshold="off"` -- same regions,
+    # same areas, same q-values, same scalar threshold column -- not merely
+    # "close".
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
+    )
+    collapsed_config = Eiger2Config(
+        window=4, null_replicates=50, random_seed=41,
+        support_binned_threshold="on", min_null_values=10**9,
+    )
+    off_config = Eiger2Config(
+        window=4, null_replicates=50, random_seed=41,
+        support_binned_threshold="off",
+    )
+    regions_collapsed, values_collapsed, manifest_collapsed = call_dmrs(
+        matrix, locs, config=collapsed_config
+    )
+    regions_off, values_off, manifest_off = call_dmrs(
+        matrix, locs, config=off_config
+    )
+
+    assert manifest_collapsed["support_binning"] == "collapsed_to_single"
+    assert manifest_off["support_binning"] == "forced_off"
+    assert len(regions_off)  # guard against a vacuous empty-vs-empty comparison
+
+    pd.testing.assert_frame_equal(
+        regions_collapsed, regions_off, check_exact=True
+    )
+    pd.testing.assert_frame_equal(values_collapsed, values_off, check_exact=True)
+    # collapse means no bin structure survived, so no per-bin threshold exists
+    # and the exported threshold stays the single unconditioned scalar.
+    assert manifest_collapsed["support_bin_edges"] == []
+    assert manifest_collapsed["support_thresholds"] == []
+    assert (regions_collapsed["region_threshold_mode"] == "single").all()
+    assert "region_rate_by_support_bin" not in manifest_collapsed
+
+
+def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
+    # spec §1c.7 item 8. Gate methodology is this stage's ruling: per-scenario
+    # MEDIAN across seeds <= 1.25, per-instance outliers reported but not gated
+    # (see the same policy applied in benchmarking/benchmark_suite.py's
+    # command_exchangeability).
+    #
+    # missing_rate=0.5, matching the override
+    # test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios already uses
+    # for the missingness scenario, and spacing=20000 for the same
+    # finite-sample reason documented there.
+    #
+    # The ratio itself is computed inside null_threshold, BEFORE the
+    # support-binning branch runs, so this test's real content is that turning
+    # binning on -- which changes the null tracks' segmentation thresholds and
+    # every downstream region -- leaves the Stage 1b null-exchangeability gate
+    # passing on a genuine end-to-end binning-on run, and that binning does in
+    # fact engage on this data (asserted below). Measured out of suite at
+    # missing_rate=0.25 as well (seeds 0-4, binning forced on): ratios 1.031,
+    # 0.993, 0.887, 1.206, 0.883, median 0.993 -- also passing; that
+    # configuration is ~13x slower per seed, so it is recorded in
+    # task-11-report.md rather than run here.
+    from benchmarking.benchmark_suite import SCENARIOS
+
+    params = {**SCENARIOS["missingness"], "missing_rate": 0.5}
+    ratios = []
+    for seed in range(5):
+        matrix, locs, _ = simulate(
+            seed=seed, strata=[], replicates=0, spacing=20000, **params
+        )
+        config = Eiger2Config(window=4, null_replicates=100, random_seed=seed,
+                               support_binned_threshold="on")
+        _, _, manifest = call_dmrs(matrix, locs, config=config)
+        assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
+        ratio = manifest["null"]["null_exchangeability_ratio"]
+        assert np.isfinite(ratio)
+        ratios.append(ratio)
+    assert np.median(ratios) <= 1.25, ratios
+
+
+def test_support_stratified_fdr_diagnostics_on_a_realistic_missingness_run():
+    # spec §1c.7 item 9's second half: Task 10's own tests exercise
+    # `region_fdr_result` directly plus one small `call_dmrs` case. This runs the
+    # actual §1c.8 validation configuration -- the standard `missingness`
+    # scenario with the standard planted signal, at shipped defaults (so
+    # support_binned_threshold="auto" and fdr_decision="point") -- and confirms
+    # the support-stratified FDR path really does engage there.
+    from benchmarking.benchmark_suite import DEFAULT_STRATA, SCENARIOS
+
+    matrix, locs, _ = simulate(
+        seed=0, strata=DEFAULT_STRATA, replicates=6, spacing=400,
+        **SCENARIOS["missingness"],
+    )
+    config = Eiger2Config(target_fdr=0.05)
+    assert config.support_binned_threshold == "auto"
+    assert config.fdr_decision == "point"
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+
+    assert manifest["support_binning"] == "auto_on"
+    assert len(regions)
+    assert manifest["fdr"]["support_stratified"] is True
+    assert manifest["region_rate_by_support_bin"]
+
+    # Measured characterisation, Stage 1c Task 11 (see task-11-report.md): at
+    # this scale the lag-null tracks form ZERO regions per replicate, so every
+    # joint (length x support-bin) stratum is below
+    # _MIN_NULL_REGIONS_PER_JOINT_STRATUM and falls back to the length-only
+    # pool, which is itself empty. The support-stratification escalation is
+    # therefore inert here, and every observed region gets K=0 -- hence
+    # region_qvalue == 0.0 for all of them under the "point" decision. These
+    # assertions are a witness to that measured state, not an endorsement of it:
+    # if one of them ever fails, the null-region-supply problem documented in
+    # task-11-report.md has changed, and this test should be updated to match
+    # the new measurement rather than relaxed.
+    assert manifest["null_regions_per_replicate"] == 0.0
+    assert manifest["fdr"]["support_stratification_fallback_strata"]
+    assert manifest["fdr"]["pooled_fallback_strata"]
+    assert all(
+        entry["null_regions"] == 0
+        for entry in manifest["region_rate_by_support_bin"].values()
+    )
+    assert (regions["region_qvalue"] == 0.0).all()
+    assert (regions["null_exceedances_at_cutoff"] == 0).all()
