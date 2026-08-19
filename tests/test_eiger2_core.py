@@ -37,9 +37,11 @@ from eiger2 import (  # noqa: E402
 from eiger2.benchmark import evaluate, simulate  # noqa: E402
 from eiger2.core import (  # noqa: E402
     RegionFdrResult,  # noqa: F401
+    _assign_support_bin,
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
+    _support_bin_edges,
     _window_support,
     null_exchangeability,
     null_threshold,
@@ -182,6 +184,52 @@ def test_window_support_chunking_does_not_change_result():
     whole = _window_support(finite, base_positions, offsets, chunk=200_000)
     chunked = _window_support(finite, base_positions, offsets, chunk=50)
     np.testing.assert_array_equal(whole, chunked)
+
+
+def test_support_bin_edges_are_observed_quantiles():
+    rng = np.random.default_rng(31)
+    observed_support = rng.integers(10, 100, size=2000)
+    pooled_null_support = rng.integers(10, 100, size=20000)
+    result = _support_bin_edges(observed_support, n_bins=4,
+                                 min_null_values=1000,
+                                 pooled_null_support=pooled_null_support)
+    expected_edges = np.quantile(observed_support, [0.25, 0.5, 0.75])
+    np.testing.assert_allclose(result["bin_edges"], expected_edges)
+    assert not result["collapsed"]
+
+
+def test_support_bins_merge_upward_when_null_underpopulated():
+    # construct null support so that the top bin has very few values
+    rng = np.random.default_rng(32)
+    observed_support = rng.integers(0, 100, size=2000)
+    pooled_null_support = np.concatenate([
+        rng.integers(0, 75, size=5000),   # plenty in the lower 3 quartiles
+        rng.integers(75, 100, size=10),   # almost nothing in the top quartile
+    ])
+    result = _support_bin_edges(observed_support, n_bins=4,
+                                 min_null_values=1000,
+                                 pooled_null_support=pooled_null_support)
+    assert len(result["merges"]) >= 1
+    # fewer final bins than requested, since the top one merged into its neighbour
+    assert result["bin_edges"].size < 3
+
+
+def test_support_bins_collapse_to_single_when_null_too_thin_everywhere():
+    observed_support = np.arange(2000)
+    pooled_null_support = np.arange(50)  # far too few null values overall
+    result = _support_bin_edges(observed_support, n_bins=4,
+                                 min_null_values=1000,
+                                 pooled_null_support=pooled_null_support)
+    assert result["collapsed"]
+    assert result["bin_edges"].size == 0
+
+
+def test_assign_support_bin_matches_searchsorted_semantics():
+    bin_edges = np.array([10.0, 20.0, 30.0])
+    support = np.array([5, 10, 15, 20, 25, 30, 35])
+    bins = _assign_support_bin(support, bin_edges)
+    # 4 bins: [-inf,10), [10,20), [20,30), [30,inf)
+    assert bins.tolist() == [0, 1, 1, 2, 2, 3, 3]
 
 
 # --------------------------------------------------------------------------

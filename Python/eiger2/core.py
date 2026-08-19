@@ -645,6 +645,61 @@ def _window_support(
     return out
 
 
+def _assign_support_bin(support: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """Bin index for each support value, given interior bin edges.
+
+    ``bin_edges`` are the interior boundaries (``n_bins - 1`` of them); values
+    below the first edge are bin 0, at/above the last edge are bin ``n_bins-1``.
+    Shared by observed and null callers so the two are binned identically.
+    """
+
+    return np.searchsorted(bin_edges, support, side="right")
+
+
+def _support_bin_edges(
+    observed_support: np.ndarray,
+    n_bins: int,
+    min_null_values: int,
+    pooled_null_support: np.ndarray,
+) -> dict:
+    """Quantile bin edges from observed support, merged upward until every bin
+    has at least ``min_null_values`` pooled null values, per spec §1c.2.
+
+    Returns ``{"bin_edges": np.ndarray, "merges": list[dict], "collapsed": bool}``.
+    ``bin_edges`` has one fewer entry than the final bin count (interior edges
+    only, consumed by ``_assign_support_bin``). ``collapsed=True`` means every
+    candidate merge still left an underpopulated bin, so the caller must fall
+    back to the unconditioned single threshold.
+    """
+
+    quantiles = np.linspace(0, 1, n_bins + 1)[1:-1]
+    candidate_edges = np.quantile(observed_support, quantiles)
+    merges: list[dict] = []
+
+    edges = list(candidate_edges)
+    while True:
+        edges_array = np.array(edges) if edges else np.array([])
+        bins = _assign_support_bin(pooled_null_support, edges_array)
+        counts = np.bincount(bins, minlength=len(edges) + 1)
+        underpopulated = np.flatnonzero(counts < min_null_values)
+        if underpopulated.size == 0:
+            break
+        if len(edges) == 0:
+            return {"bin_edges": np.empty(0), "merges": merges, "collapsed": True}
+        # merge the first underpopulated bin into its upward neighbour by
+        # dropping the edge above it (merges bin b into bin b+1)
+        merge_at = int(underpopulated[0])
+        drop_edge_index = min(merge_at, len(edges) - 1)
+        merges.append({
+            "merged_bin": merge_at,
+            "into_bin": merge_at + 1 if merge_at < len(edges) else merge_at - 1,
+            "null_count_before_merge": int(counts[merge_at]),
+        })
+        del edges[drop_edge_index]
+
+    return {"bin_edges": np.array(edges), "merges": merges, "collapsed": False}
+
+
 def _window_from_lags(lag_statistics: list[np.ndarray], window: int) -> np.ndarray:
     """Mean off-diagonal statistic of every ``window``-CpG block.
 
