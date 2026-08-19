@@ -1,6 +1,6 @@
 """Operating-characteristic suite: EIGER 1 versus EIGER 2.
 
-Five experiments, each answering a question the head-to-head accuracy tables in
+Six experiments, each answering a question the head-to-head accuracy tables in
 ``BENCHMARK.md`` do not:
 
 ``negative``   No planted signal anywhere. How many regions does each caller
@@ -33,6 +33,13 @@ Five experiments, each answering a question the head-to-head accuracy tables in
                and rises when the null is thinner-tailed than the data --
                exactly the failure mode described in docs/FDR.md, "Null
                exchangeability".
+
+``region_rate``     Region-level exposure diagnostic and its gate (spec
+               §1c.6). Per-edge support-conditioned thresholding equalises the
+               marginal within a support bin but does not by itself guarantee
+               observed and null REGIONS form at the same rate per bin; this
+               compares the two directly, DMR-free, per bin, and flags any
+               bin whose ratio exceeds 2.0.
 
 Run everything::
 
@@ -497,6 +504,64 @@ def calibration(
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# experiment — region-rate-by-support-bin diagnostic gate (spec §1c.6)
+# --------------------------------------------------------------------------
+
+
+def region_rate_by_bin(
+    seeds: Sequence[int],
+    scenarios: Sequence[str],
+    *,
+    statistic: str = "correlation",
+    null_replicates: int = 200,
+    n_cpg_target: int = 20000,
+) -> pd.DataFrame:
+    """Per-support-bin observed/null region rate, DMR-free (spec §1c.6).
+
+    Runs with no planted signal (``strata=[]``, ``replicates=0``) so every
+    called region is a false call by construction -- the same convention as
+    ``negative_control``, including ``n_cpg_target``: at ``spacing=400`` (the
+    other experiments' default matrix size) both observed and null region
+    counts are so close to zero DMR-free that most bins are structurally
+    undefined (0/0) and the gate cannot be evaluated at all -- the genome
+    needs to be large enough for a small per-bin false-region rate to be
+    visible above zero. ``support_binned_threshold="on"`` forces support
+    binning regardless of the ``auto`` dispersion gate, so the diagnostic
+    populates on every scenario/seed rather than only the ones that would
+    trigger binning on their own; ``call_dmrs`` still reports
+    ``support_binning="collapsed_to_single"`` (and no
+    ``region_rate_by_support_bin``) on a run whose null is too thin to
+    support any bin, which this function skips.
+
+    The gate itself (any bin's ``ratio`` > 2.0) is read off this table, not
+    computed here -- see ``command_region_rate``.
+    """
+
+    rows: list[dict] = []
+    for scenario in scenarios:
+        for seed in seeds:
+            matrix, locations, _ = simulate(
+                seed=seed, strata=[], replicates=0,
+                spacing=max(400, n_cpg_target - 400), **SCENARIOS[scenario],
+            )
+            config = Eiger2Config(
+                statistic=statistic,
+                null_replicates=null_replicates,
+                random_seed=seed,
+                support_binned_threshold="on",
+            )
+            _, _, manifest = call_dmrs(matrix, locations, config=config)
+            per_bin = manifest.get("region_rate_by_support_bin", {})
+            for bin_index, stats in per_bin.items():
+                rows.append({
+                    "scenario": scenario, "seed": seed, "bin": bin_index,
+                    "support_binning": manifest["support_binning"],
+                    **stats,
+                })
+    return pd.DataFrame(rows)
+
+
 def _summarise(frame: pd.DataFrame, by: list[str], metrics: list[str]) -> pd.DataFrame:
     present = [m for m in metrics if m in frame.columns]
     grouped = frame.groupby(by, dropna=False)[present].agg(["mean", "std", "count"])
@@ -626,6 +691,37 @@ def command_exchangeability(args: argparse.Namespace) -> None:
           f"({'PASS' if worst_median <= 1.25 else 'FAIL'} at gate 1.25)")
 
 
+def command_region_rate(args: argparse.Namespace) -> None:
+    out = Path(args.out_dir)
+    seeds = list(range(args.seeds))
+    frame = region_rate_by_bin(
+        seeds, args.scenarios, statistic=args.statistic,
+        null_replicates=args.null_replicates,
+    )
+    _write(frame, out / "region_rate_by_bin.csv")
+    if frame.empty:
+        print("  no bins populated (support binning did not activate, or "
+              "collapsed to single, on every run)")
+        return
+    summary = frame.groupby(["scenario", "bin"])[
+        ["observed_rate", "null_rate", "ratio"]
+    ].mean()
+    print(summary.round(4).to_string())
+    ratios = frame["ratio"].dropna()
+    n_undefined = int(frame["ratio"].isna().sum())
+    if n_undefined:
+        print(f"\n  {n_undefined} bin-instance(s) had an undefined ratio "
+              f"(null had zero eligible edges or zero regions -- see the "
+              f"'note' column in region_rate_by_bin.csv)")
+    if len(ratios):
+        worst = float(ratios.max())
+        print(f"\nworst bin ratio: {worst:.3f} "
+              f"({'PASS' if worst <= 2.0 else 'FAIL'} at gate 2.0)")
+    else:
+        print("\n  every bin-instance had an undefined ratio; gate not "
+              "evaluable from this run")
+
+
 def command_all(args: argparse.Namespace) -> None:
     for name, function in (
         ("negative", command_negative),
@@ -633,6 +729,7 @@ def command_all(args: argparse.Namespace) -> None:
         ("scaling", command_scaling),
         ("calibration", command_calibration),
         ("exchangeability", command_exchangeability),
+        ("region_rate", command_region_rate),
     ):
         print("=" * 78)
         print(name.upper())
@@ -644,7 +741,8 @@ def command_all(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=[
-        "negative", "sweep", "scaling", "calibration", "exchangeability", "all"
+        "negative", "sweep", "scaling", "calibration", "exchangeability",
+        "region_rate", "all",
     ])
     parser.add_argument("--out-dir", default="benchmark_v2")
     parser.add_argument("--seeds", type=int, default=10,
@@ -671,6 +769,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "scaling": command_scaling,
         "calibration": command_calibration,
         "exchangeability": command_exchangeability,
+        "region_rate": command_region_rate,
         "all": command_all,
     }
     started = time.perf_counter()

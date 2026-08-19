@@ -2097,6 +2097,15 @@ def call_dmrs(
     null_areas = []
     null_lengths = []
     null_edge_total = 0
+    # Task 9 reuses these per-replicate null regions (rather than re-segmenting)
+    # for `region_rate_by_support_bin`: each entry is the `segment()` output for
+    # that replicate, already computed against that replicate's OWN per-bin
+    # threshold array (`null_track_threshold` below), exactly mirroring the
+    # observed-region convention. Populated for every replicate regardless of
+    # whether support binning is active, since it's cheap to keep and the
+    # gating on `support_binning in ("auto_on", "forced_on")` happens once,
+    # below, before it's used.
+    null_regions_by_replicate: list[np.ndarray] = []
     for (track, null_eligible, *_rest), null_track_threshold in zip(
         tracks, null_edge_thresholds, strict=True
     ):
@@ -2122,7 +2131,104 @@ def call_dmrs(
             if null_regions.size
             else np.empty(0, dtype=int)
         )
+        null_regions_by_replicate.append(null_regions)
     observed_lengths = regions[:, 1] - regions[:, 0] + 1
+
+    # --- Task 9: region-level exposure diagnostic (spec §1c.6) ---
+    # Compares the observed rate of CALLED REGIONS per support bin against the
+    # null's rate of REGIONS per support bin (both per 10,000 eligible edges),
+    # keyed by bin index. This is distinct from the per-EDGE threshold
+    # equalisation already performed above: equalising the marginal per edge
+    # does not guarantee observed and null regions FORM at the same rate per
+    # bin (spec §1c.6's own framing) -- clustering could still be
+    # support-driven even though individual edges are fairly thresholded.
+    #
+    # Null regions are the SAME `null_regions_by_replicate` segmented just
+    # above, against each replicate's own per-bin threshold array -- reusing
+    # the existing null-segmentation mechanism rather than inventing a
+    # parallel one, so this diagnostic cannot lie about whether the null was
+    # segmented consistently with the observed convention. Each null region's
+    # support-median is read from that SAME replicate's own full-length
+    # support array (`null_full_support[i]`, Task 6), mirroring exactly how
+    # `region_support_median_descriptive` reads `observed_support` above.
+    #
+    # Eligible-edge counts per bin reuse `observed_support[usable_mask]` and
+    # `pooled_null_support` (both already computed above, when binning was
+    # set up): `pooled_null_support` is precisely the eligible+finite null
+    # support values pooled across every replicate, and `usable_mask` is the
+    # observed analogue -- no separate occupancy count needed.
+    if support_binning in ("auto_on", "forced_on"):
+        n_final_bins = support_bin_edges.size + 1
+        region_bins = _assign_support_bin(
+            np.asarray(manifest["region_support_median_descriptive"], dtype=float),
+            support_bin_edges,
+        )
+        observed_regions_by_bin = np.bincount(region_bins, minlength=n_final_bins)
+
+        null_bin_hits = []
+        for null_regions, support in zip(
+            null_regions_by_replicate, null_full_support, strict=True
+        ):
+            for first, last in null_regions:
+                support_median = float(np.median(support[first:last]))
+                null_bin_hits.append(support_median)
+        if null_bin_hits:
+            null_region_bins = _assign_support_bin(
+                np.asarray(null_bin_hits, dtype=float), support_bin_edges
+            )
+            null_regions_by_bin = np.bincount(
+                null_region_bins, minlength=n_final_bins
+            )
+        else:
+            null_regions_by_bin = np.zeros(n_final_bins, dtype=int)
+
+        observed_edges_by_bin = np.bincount(
+            _assign_support_bin(observed_support[usable_mask], support_bin_edges),
+            minlength=n_final_bins,
+        )
+        null_edges_by_bin = np.bincount(
+            _assign_support_bin(pooled_null_support, support_bin_edges),
+            minlength=n_final_bins,
+        )
+
+        region_rate_by_support_bin: dict = {}
+        for b in range(n_final_bins):
+            obs_edges = int(observed_edges_by_bin[b])
+            n_null_edges = int(null_edges_by_bin[b])
+            obs_regions = int(observed_regions_by_bin[b])
+            n_null_regions = int(null_regions_by_bin[b])
+            observed_rate = (
+                10_000 * obs_regions / obs_edges if obs_edges > 0 else float("nan")
+            )
+            null_rate = (
+                10_000 * n_null_regions / n_null_edges
+                if n_null_edges > 0
+                else float("nan")
+            )
+            entry = {
+                "observed_regions": obs_regions,
+                "observed_eligible_edges": obs_edges,
+                "observed_rate": observed_rate,
+                "null_regions": n_null_regions,
+                "null_eligible_edges": n_null_edges,
+                "null_rate": null_rate,
+            }
+            if n_null_edges == 0:
+                entry["ratio"] = None
+                entry["note"] = (
+                    "null had zero eligible edges in this bin; ratio undefined"
+                )
+            elif null_rate == 0.0:
+                entry["ratio"] = None
+                entry["note"] = (
+                    "null had zero regions in this bin; ratio undefined"
+                    if observed_rate > 0
+                    else "both observed and null had zero regions in this bin"
+                )
+            else:
+                entry["ratio"] = observed_rate / null_rate
+            region_rate_by_support_bin[int(b)] = entry
+        manifest["region_rate_by_support_bin"] = region_rate_by_support_bin
     fdr_result = region_fdr_result(
         observed_areas,
         null_areas,

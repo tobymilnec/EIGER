@@ -2040,3 +2040,64 @@ def test_auto_enable_fires_only_on_missingness_at_calibrated_cut():
             assert manifest["support_binning"] == expected, (
                 name, seed, manifest["support_binning"], manifest["support_dispersion"],
             )
+
+
+# --------------------------------------------------------------------------
+# Task 9: region-level exposure diagnostic and its 2.0 gate (Stage 1c,
+# spec §1c.6)
+# --------------------------------------------------------------------------
+
+
+def test_region_rate_by_support_bin_populated_when_binning_active():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    if manifest["support_binning"] == "forced_on":
+        assert "region_rate_by_support_bin" in manifest
+        for bin_stats in manifest["region_rate_by_support_bin"].values():
+            assert "observed_rate" in bin_stats
+            assert "null_rate" in bin_stats
+            assert "ratio" in bin_stats
+
+
+def test_region_rate_by_support_bin_absent_when_binning_off():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=4,
+        spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
+    )
+    config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
+                           support_binned_threshold="off")
+    _, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["support_binning"] == "forced_off"
+    assert "region_rate_by_support_bin" not in manifest
+
+
+def test_region_rate_by_support_bin_ratio_guards_zero_null_rate():
+    # Every bin dict must report a numeric rate for both sides and either a
+    # numeric ratio or an explicit None with a "note" -- never a raised
+    # ZeroDivisionError/RuntimeWarning and never a bare 0.0 standing in for
+    # "undefined" (the "no exact zero presented as certainty" spirit carried
+    # from the rest of this stage).
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[(0.2, 0.35)], replicates=6,
+        spacing=400, dmr_length=15, missing_rate=0.4, seed=62,
+    )
+    config = Eiger2Config(window=4, null_replicates=100, random_seed=62,
+                           support_binned_threshold="on")
+    _, _, manifest = call_dmrs(matrix, locs, config=config)
+    if manifest["support_binning"] != "forced_on":
+        pytest.skip("this seed did not produce a forced_on run")
+    for bin_stats in manifest["region_rate_by_support_bin"].values():
+        assert np.isfinite(bin_stats["observed_rate"]) or bin_stats[
+            "observed_eligible_edges"
+        ] == 0
+        if bin_stats["ratio"] is None:
+            assert "note" in bin_stats
+        else:
+            assert bin_stats["ratio"] == pytest.approx(
+                bin_stats["observed_rate"] / bin_stats["null_rate"]
+            )
