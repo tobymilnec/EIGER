@@ -61,7 +61,12 @@ and §1 revised invariant contract from the same document.
 - Do not implement the §1c.6 region-FDR-by-support-bin escalation speculatively —
   implement the diagnostic and its gate check first, run it for real, and only build
   the escalation path if the gate actually fires in this stage's own validation.
-  Report clearly either way.
+  Report clearly either way. **Update (post-Task 9): the gate fired** (283x–811x
+  observed/null region-rate ratio across every evaluable support bin on DMR-free
+  `missingness`/`small_n` data, one bin infinite, confirmed not a small-count
+  artifact). Task 10 was inserted, following spec §1c.6's exact escalation
+  instructions, per the user's explicit ruling to proceed with the spec-prescribed
+  escalation rather than any alternative.
 - Docs/tests ship in the same commit as the code they cover, except the full
   `docs/FDR.md`/`docs/PROBABILITY.md`/`docs/BENCHMARK.md` rewrite, which is
   explicitly Stage 1e's job (mirror Stage 1b's precedent here).
@@ -1137,7 +1142,371 @@ git commit -m "feat: add region_rate_by_support_bin diagnostic and its 2.0 gate 
 
 ---
 
-### Task 10: Remaining §1c.7 tests, and the §1c.8 target validation
+### Task 10: Escalation — stratify region-FDR exposure counts by support bin (spec §1c.6, triggered)
+
+**Context — why this task exists:** Task 9's real-data gate check fired. On DMR-free
+`missingness`/`small_n` data (20 seeds, `null_replicates=500`, `support_binned_threshold
+="on"`), every evaluable support bin's observed/null region-formation ratio was
+283x–811x, one bin infinite — confirmed not a small-count artifact (pooled null
+exposure was 11–51 million eligible edges per bin). Per this plan's own Global
+Constraints ("only build the escalation path if the gate actually fires in this stage's
+own validation... report clearly either way") and spec §1c.6's exact instructions, the
+escalation is now required. This is not a redesign of the per-edge threshold mechanism
+(Tasks 3–8 stand as-is) — it is a second, independent correction at the FDR-estimation
+layer: `region_fdr_result` currently pools null regions within a stratum keyed only by
+length (`length_stratum()`); it must additionally key by support bin, with spec's exact
+fallback when a joint stratum is too thin.
+
+**Files:**
+- Modify: `Python/eiger2/core.py` — `region_fdr_result` (core.py:1414) and its call
+  site inside `call_dmrs` (core.py:2232, immediately after Task 9's `region_rate_by_
+  support_bin` block)
+- Test: `tests/test_eiger2_core.py`
+
+**Interfaces:**
+- `region_fdr_result` gains two new optional parameters, parallel in shape/ordering to
+  the existing `observed_lengths`/`null_length_sets`: `observed_support_bins: np.ndarray
+  | None = None`, `null_support_bin_sets: Sequence[np.ndarray] | None = None`. Leaving
+  both at `None` (the default) must reproduce the exact pre-existing behavior bit for
+  bit — this is what preserves bit-identity when support binning is off, and what every
+  EXISTING caller of `region_fdr_result` (there are several — `qvalue_result_from_track`
+  at core.py:1619, `region_fdr` at core.py:1600, and any test not touched by this task)
+  continues to get automatically, unmodified.
+- New module constant, placed near `length_stratum()` (core.py:1369):
+  `_MIN_NULL_REGIONS_PER_JOINT_STRATUM = 50` (spec's own number, not user-configurable —
+  spec does not ask for this to be a config field).
+- `RegionFdrResult.diagnostics` (the dict already returned) gains three new keys:
+  `"support_stratified"` (bool — whether support-bin stratification was attempted at
+  all, i.e. whether `observed_support_bins` was not `None`), `"support_stratification_
+  fallback_strata"` (`list[str]`, the joint `"<length_stratum>|sbin<b>"` labels that
+  fell back to length-only pooling because their pooled null-region count was below
+  `_MIN_NULL_REGIONS_PER_JOINT_STRATUM`), `"min_null_regions_per_joint_stratum"` (int,
+  echoes the constant, for traceability in the STOP report).
+- **Explicitly out of scope:** `local_fdr` (core.py, called separately inside `call_dmrs`
+  a few lines after `region_fdr_result`, for `config.compute_posterior`) is NOT touched.
+  Spec §1c.6 names `region_fdr_result` specifically ("stratify the region-FDR exposure
+  counts by bin... run `region_fdr_result` per support bin"), not the posterior/local-FDR
+  path. Do not extend `local_fdr` under this task even though its signature looks similar
+  — if you think it should also be extended, note that as an observation in your report,
+  do not do it speculatively.
+- **Consumes from Task 9** (already committed, core.py inside `call_dmrs`, ~2085–2231):
+  `null_regions_by_replicate: list[np.ndarray]` (one `segment()` output array per null
+  replicate, each row `[first, last]` edge indices), `null_full_support: list[np.ndarray]`
+  (Task 6 — one full-length support array per replicate), `region_bins` (Task 9's local
+  variable inside its `if support_binning in ("auto_on", "forced_on"):` block — each
+  OBSERVED region's support-bin index, computed via `_assign_support_bin(manifest[
+  "region_support_median_descriptive"], support_bin_edges)`), `support_bin_edges`
+  (Task 5/6), `support_binning` (Task 6, one of `"auto_on"|"auto_off"|"forced_on"|
+  "forced_off"|"collapsed_to_single"`).
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `tests/test_eiger2_core.py`, near the other `region_fdr_result` tests (~line
+900–1090):
+
+```python
+def test_region_fdr_result_support_stratification_diagnostics():
+    rng = np.random.default_rng(77)
+    # Two observed regions, same length stratum ("6-9"), different support bins.
+    observed_areas = np.array([12.0, 9.0])
+    observed_lengths = np.array([6, 6])
+    observed_support_bins = np.array([0, 1])
+
+    # 3 null replicates. Support bin 0 gets 20 null regions per replicate (60
+    # pooled, >= _MIN_NULL_REGIONS_PER_JOINT_STRATUM -> joint stratum "6-9|sbin0"
+    # stays joint). Support bin 1 gets 1 null region per replicate (3 pooled,
+    # < 50 -> falls back to length-only pooling for that region).
+    null_area_sets = []
+    null_length_sets = []
+    null_support_bin_sets = []
+    for _ in range(3):
+        bin0_areas = rng.uniform(1.0, 8.0, size=20)
+        bin1_areas = rng.uniform(1.0, 8.0, size=1)
+        null_area_sets.append(np.concatenate([bin0_areas, bin1_areas]))
+        null_length_sets.append(np.full(21, 6))
+        null_support_bin_sets.append(
+            np.concatenate([np.zeros(20, dtype=int), np.ones(1, dtype=int)])
+        )
+
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1000, null_edges=3000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        observed_support_bins=observed_support_bins,
+        null_support_bin_sets=null_support_bin_sets,
+    )
+
+    assert result.diagnostics["support_stratified"] is True
+    assert result.diagnostics["min_null_regions_per_joint_stratum"] == 50
+    assert result.diagnostics["support_stratification_fallback_strata"] == ["6-9|sbin1"]
+    cutoffs = result.diagnostics["fdr_interval_cutoffs_by_stratum"]
+    assert "6-9|sbin0" in cutoffs  # well-populated joint stratum stayed joint
+    assert "6-9" in cutoffs        # region 1 fell back to the length-only label
+    assert "6-9|sbin1" not in cutoffs  # never appears as a final stratum itself
+    assert np.all(np.isfinite(result.qvalue))
+    assert result.qvalue.shape == (2,)
+
+    # None (the default) must reproduce pre-existing behavior exactly: no new
+    # diagnostics keys, same shape.
+    unstratified = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=1000, null_edges=3000,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert unstratified.diagnostics["support_stratified"] is False
+    assert unstratified.diagnostics["support_stratification_fallback_strata"] == []
+```
+
+Note: this test deliberately does NOT assert exact numeric equality of `qvalue`/
+`tail_fdr` between the support-stratified and length-only-only calls — the q-value
+construction is a reverse-cumulative-minimum monotonized within each stratum's full
+observed set (see `region_fdr_result`'s docstring and `docs/FDR.md`), so removing
+region 0 from region 1's grouping (which is exactly what putting region 0 into its own
+`"6-9|sbin0"` stratum does) can legitimately change region 1's monotonized qvalue even
+though its underlying pooled null set is unchanged. Do not add such an equality
+assertion without actually running the code and confirming it holds — the diagnostics/
+structural assertions above are what this step commits to.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+conda activate eiger && pytest tests/test_eiger2_core.py::test_region_fdr_result_support_stratification_diagnostics -v
+```
+
+Expected: FAIL — `region_fdr_result() got an unexpected keyword argument 'observed_support_bins'`.
+
+- [ ] **Step 3: Implement the stratification change in `region_fdr_result`**
+
+Replace the existing stratification block (core.py, from `stratified = observed_lengths
+is not None and null_length_sets is not None` through `strata = np.unique
+(observed_strata)`, i.e. lines ~1478–1495) with:
+
+```python
+    stratified = observed_lengths is not None and null_length_sets is not None
+    if stratified:
+        observed_lengths = np.asarray(observed_lengths, dtype=int)
+        null_length_sets = [np.asarray(a, dtype=int) for a in null_length_sets]
+        observed_length_labels = np.array(
+            [length_stratum(int(n)) for n in observed_lengths], dtype=object
+        )
+        null_length_labels_by_replicate = [
+            np.array([length_stratum(int(n)) for n in lengths], dtype=object)
+            for lengths in null_length_sets
+        ]
+    else:
+        observed_length_labels = np.full(m, "_pooled", dtype=object)
+        null_length_labels_by_replicate = [
+            np.full(areas.size, "_pooled", dtype=object) for areas in null_area_sets
+        ]
+
+    support_stratified = (
+        stratified
+        and observed_support_bins is not None
+        and null_support_bin_sets is not None
+    )
+    support_fallback_joint_strata: list[str] = []
+    null_joint_labels_by_replicate = null_length_labels_by_replicate
+    if support_stratified:
+        observed_support_bins = np.asarray(observed_support_bins, dtype=int)
+        null_support_bin_sets = [
+            np.asarray(a, dtype=int) for a in null_support_bin_sets
+        ]
+        observed_joint_labels = np.array(
+            [
+                f"{length_stratum(int(n))}|sbin{int(b)}"
+                for n, b in zip(observed_lengths, observed_support_bins)
+            ],
+            dtype=object,
+        )
+        null_joint_labels_by_replicate = [
+            np.array(
+                [
+                    f"{length_stratum(int(n))}|sbin{int(b)}"
+                    for n, b in zip(lengths, bins)
+                ],
+                dtype=object,
+            )
+            for lengths, bins in zip(
+                null_length_sets, null_support_bin_sets, strict=True
+            )
+        ]
+        joint_null_counts: dict[str, int] = {}
+        for labels in null_joint_labels_by_replicate:
+            if labels.size == 0:
+                continue
+            values, counts = np.unique(labels, return_counts=True)
+            for value, count in zip(values, counts):
+                joint_null_counts[str(value)] = (
+                    joint_null_counts.get(str(value), 0) + int(count)
+                )
+
+        observed_strata = np.empty(m, dtype=object)
+        for i in range(m):
+            joint_label = str(observed_joint_labels[i])
+            if joint_null_counts.get(joint_label, 0) >= _MIN_NULL_REGIONS_PER_JOINT_STRATUM:
+                observed_strata[i] = joint_label
+            else:
+                observed_strata[i] = observed_length_labels[i]
+                support_fallback_joint_strata.append(joint_label)
+    else:
+        observed_strata = observed_length_labels
+
+    strata = np.unique(observed_strata)
+```
+
+Then, in Pass B's loop (the `for stratum in strata:` block, ~line 1514), replace the
+line `per_replicate = [null_area_sets[b][null_strata_by_replicate[b] == stratum] for b
+in range(replicates)]` with:
+
+```python
+    for stratum in strata:
+        rows = np.flatnonzero(observed_strata == stratum)
+        is_joint_stratum = support_stratified and "|sbin" in str(stratum)
+        labels_by_replicate = (
+            null_joint_labels_by_replicate
+            if is_joint_stratum
+            else null_length_labels_by_replicate
+        )
+        per_replicate = [
+            null_area_sets[b][labels_by_replicate[b] == stratum]
+            for b in range(replicates)
+        ]
+```
+
+(the rest of the loop body — `pooled = np.concatenate(...)`, the `pooled_fallback_
+strata` empty-pool safety net, `_fdr_from_areas_result(...)`, the five `[rows] = ...`
+assignments — is unchanged; only the `per_replicate` line and its immediate
+`labels_by_replicate` selection change).
+
+Update the function signature to add the two new parameters (after `null_length_sets`,
+before `confidence_level`) and update the `diagnostics` dict literal near the end of
+the function (~line 1549) to add the three new keys:
+
+```python
+    diagnostics = {
+        "fdr_interval_bonferroni_m": m_bonferroni,
+        "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
+        "fdr_interval_family": "per_stratum",
+        "pooled_fallback_strata": pooled_fallback_strata,
+        "null_count_dispersion_by_stratum": overdispersion_by_stratum,
+        "null_count_overdispersion_warning": overdispersion_warning,
+        "scale": scale,
+        "support_stratified": support_stratified,
+        "support_stratification_fallback_strata": sorted(set(support_fallback_joint_strata)),
+        "min_null_regions_per_joint_stratum": _MIN_NULL_REGIONS_PER_JOINT_STRATUM,
+    }
+```
+
+Also update the function's docstring to describe the new optional joint stratification
+(one or two sentences — state the fallback rule in words, matching spec §1c.6).
+
+- [ ] **Step 4: Run the new test, confirm pass**
+
+```bash
+conda activate eiger && pytest tests/test_eiger2_core.py::test_region_fdr_result_support_stratification_diagnostics -v
+```
+
+- [ ] **Step 5: Wire the new parameters into `call_dmrs`**
+
+Immediately before the existing `fdr_result = region_fdr_result(...)` call (core.py:2232,
+right after Task 9's `if support_binning in ("auto_on", "forced_on"):` block closes),
+add:
+
+```python
+    observed_support_bins_for_fdr = None
+    null_support_bin_sets_for_fdr = None
+```
+
+Then, inside Task 9's existing `if support_binning in ("auto_on", "forced_on"):` block
+(the one that already computes `region_bins`), add — after `region_bins` is computed,
+before that block ends — and gated additionally on `config.length_stratified_fdr` (joint
+stratification without length stratification is not spec'd and should not activate):
+
+```python
+        if config.length_stratified_fdr:
+            observed_support_bins_for_fdr = region_bins
+            null_region_support_medians_by_replicate = [
+                (
+                    np.array(
+                        [
+                            float(np.median(support[first:last]))
+                            for first, last in null_regions
+                        ],
+                        dtype=float,
+                    )
+                    if null_regions.size
+                    else np.empty(0, dtype=float)
+                )
+                for null_regions, support in zip(
+                    null_regions_by_replicate, null_full_support, strict=True
+                )
+            ]
+            null_support_bin_sets_for_fdr = [
+                (
+                    _assign_support_bin(medians, support_bin_edges)
+                    if medians.size
+                    else np.empty(0, dtype=int)
+                )
+                for medians in null_region_support_medians_by_replicate
+            ]
+```
+
+Then change the `region_fdr_result(...)` call to add the two new arguments:
+
+```python
+    fdr_result = region_fdr_result(
+        observed_areas,
+        null_areas,
+        observed_edges=int(np.sum(eligible & np.isfinite(statistic))),
+        null_edges=max(null_edge_total, 1),
+        observed_lengths=observed_lengths if config.length_stratified_fdr else None,
+        null_length_sets=null_lengths if config.length_stratified_fdr else None,
+        observed_support_bins=observed_support_bins_for_fdr,
+        null_support_bin_sets=null_support_bin_sets_for_fdr,
+    )
+```
+
+- [ ] **Step 6: Integration test — support stratification activates through `call_dmrs`, and `off` stays bit-identical**
+
+```python
+def test_call_dmrs_support_stratified_fdr_activates_when_binning_on():
+    matrix, locs, _ = simulate(
+        n_samples=80, strata=[], replicates=0,
+        spacing=19600, missing_rate=0.25, seed=71,
+    )
+    config = Eiger2Config(window=4, null_replicates=200, random_seed=71,
+                           support_binned_threshold="on")
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    if manifest["support_binning"] == "forced_on" and len(regions):
+        assert manifest["fdr"]["support_stratified"] is True
+    # "off" must be unaffected: no support stratification, same diagnostics shape
+    # as before this task.
+    config_off = Eiger2Config(window=4, null_replicates=200, random_seed=71,
+                               support_binned_threshold="off")
+    regions_off, _, manifest_off = call_dmrs(matrix, locs, config=config_off)
+    if len(regions_off):
+        assert manifest_off["fdr"]["support_stratified"] is False
+        assert manifest_off["fdr"]["support_stratification_fallback_strata"] == []
+```
+
+- [ ] **Step 7: Run full regression, lint, commit**
+
+```bash
+conda activate eiger && pytest tests -q
+conda activate eiger && ruff check Python/eiger2 && ruff check tests
+git add Python/eiger2/core.py tests/test_eiger2_core.py
+git commit -m "feat: stratify region-FDR exposure counts by support bin (Stage 1c escalation, spec §1c.6)"
+```
+
+Report, for the STOP 1c report: confirm the gate that triggered this task (Task 9's
+numbers), confirm this escalation is now live, and confirm — this is the one thing
+that must not regress — that `support_binned_threshold="off"` still reproduces Stage
+1b output bit-for-bit end to end (re-run Task 6/7's existing bit-identity test as part
+of your full-suite run and confirm it's still passing, don't just assume it).
+
+---
+
+### Task 11: Remaining §1c.7 tests, and the §1c.8 target validation
 
 **Files:**
 - Modify: `tests/test_eiger2_core.py`
@@ -1146,7 +1515,7 @@ git commit -m "feat: add region_rate_by_support_bin diagnostic and its 2.0 gate 
 
 - [ ] **Step 1: Fill any remaining §1c.7 gaps**
 
-Cross-check spec §1c.7's 10 items against what Tasks 3–9 already cover:
+Cross-check spec §1c.7's 10 items against what Tasks 3–10 already cover:
 1. constant-array-threshold-matches-scalar (Task 4) ✓
 2. support computed identically for observed/null (Task 3, via the shared function
    — add an explicit end-to-end test if Task 3's unit tests don't already prove this
@@ -1172,7 +1541,11 @@ Cross-check spec §1c.7's 10 items against what Tasks 3–9 already cover:
    binning-on missingness run, confirm the ratio; apply the Global Constraints'
    median-across-seeds policy if run across multiple seeds)
 9. `region_rate_by_support_bin` populated and gate raises/escalates as specified
-   (Task 9) ✓
+   (Task 9 populated it, Task 10 implemented the escalation the gate triggered) ✓ —
+   also confirm `manifest["fdr"]["support_stratified"]` is `True` and `"support_
+   stratification_fallback_strata"` is populated on a real missingness run with
+   binning on, since Task 10's own tests only exercise `region_fdr_result` directly
+   and one small `call_dmrs` integration case, not a full realistic-scale run
 10. determinism (Task 6) ✓
 
 Write any test identified as missing/weak above, for real, with real assertions.
@@ -1200,7 +1573,7 @@ git commit -m "test: complete spec §1c.7 test coverage and validate the §1c.8 
 
 ---
 
-### Task 11: STOP 1c report
+### Task 12: STOP 1c report
 
 **Files:** none (report only).
 
@@ -1215,15 +1588,22 @@ comparison against Stage 1b." Include:
 3. The calibration table (Task 8): scenarios, seeds, measured dispersion ranges,
    chosen cut, margin.
 4. Every test command and output tail.
-5. The per-bin region-rate table (Task 9) and whether the 2.0 gate fired.
+5. The per-bin region-rate table (Task 9) and whether the 2.0 gate fired — it did
+   (283x–811x, one bin infinite) — and the escalation this triggered (Task 10):
+   support-bin stratification of `region_fdr_result`'s exposure counts, with the
+   spec's <50-pooled-null-regions fallback to length-only stratification.
 6. Runtime/memory if materially different from Stage 1b.
 7. Backward-compatibility: `schema_version` now `"2.2"`, `statistic_threshold`'s
-   meaning change documented, three new columns named.
-8. Remaining limitations: whether §1c.8's target was met, and if the escalation
-   path (Task 9's conditional) was or wasn't triggered/implemented; explicitly flag
-   that this stage's calibration and benchmark validation ran at bounded scale
-   (not the full spec-mandated 100-seed grid, which is Stage 1e's job), mirroring
-   Stage 1b's precedent.
+   meaning change documented, three new columns named, `region_fdr_result`'s two new
+   optional parameters (default `None`, fully backward compatible with every other
+   caller).
+8. Remaining limitations: whether §1c.8's target was met; explicitly flag that this
+   stage's calibration and benchmark validation ran at bounded scale (not the full
+   spec-mandated 100-seed grid, which is Stage 1e's job), mirroring Stage 1b's
+   precedent; note the open question Task 9's implementer flagged and Task 10
+   resolved empirically — whether length-stratification alone was already absorbing
+   some of the support-driven region-formation imbalance — state what Task 10's own
+   validation run(s) actually showed about this, not just what was hypothesized.
 9. `git diff --check` and final `git status --short`.
 10. No claim stronger than the measured evidence.
 
