@@ -688,6 +688,15 @@ def _lag_null_track(
 ) -> np.ndarray:
     """One null track: window members are ``lag`` CpGs apart, not adjacent.
 
+    The window at null position ``i`` comprises CpGs ``i, i+lag, ..., i+(w-1)*lag``
+    and the statistic is the mean over the complete pairwise set among *those*
+    members: pair ``(a, b)`` is ``S_{b-a}[i + a*lag]`` where
+    ``S_d[j] = stat(CpG j, CpG j + d*lag)``.
+
+    Reusing ``_window_from_lags`` here would be wrong: it assumes members sit at
+    consecutive indices, which is true of the observed track and false of this
+    one. See docs/FDR.md, "Null window assembly".
+
     The window at null position ``i`` is made of rows ``i, i+lag, i+2*lag, ...``
     instead of ``i, i+1, i+2, ...``. Every sample moves together, so batch,
     purity, cell composition and every other cross-sample dependency survives
@@ -699,17 +708,31 @@ def _lag_null_track(
     coordination, is broken.
     """
 
-    span = max(config.window, 2)
+    w = config.window
+    span = max(w, 2)
     usable = residuals.shape[0] - lag * (span - 1)
     if usable < 2:
         return np.empty(0, dtype=float)
-    lag_statistics = []
-    for separation in range(1, span):
-        values = _lag_statistic(residuals, separation * lag, config)
-        lag_statistics.append(values[:usable])
-    if config.window == 1:
-        return lag_statistics[0]
-    return _window_from_lags(lag_statistics, config.window)
+
+    S = {d: _lag_statistic(residuals, d * lag, config) for d in range(1, span)}
+    if w == 1:
+        return S[1][:usable]
+
+    assert (w - 2) * lag + usable <= S[1].size if w >= 3 else True, (
+        "slice bounds violated -- see docs/FDR.md, 'Null window assembly'"
+    )
+
+    total = np.zeros(usable, dtype=float)
+    count = np.zeros(usable, dtype=float)
+    for a in range(w):
+        for b in range(a + 1, w):
+            values = S[b - a][a * lag : a * lag + usable]
+            total += np.nan_to_num(values, nan=0.0)
+            count += np.isfinite(values)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(count > 0, total / np.maximum(count, 1.0), np.nan)
+    expected = w * (w - 1) / 2.0
+    return np.where(count >= 0.5 * expected, out, np.nan)
 
 
 def _null_eligibility(

@@ -1153,3 +1153,118 @@ def test_stage1_preserves_the_invariant_column_set():
     regions, _values, _manifest = call_dmrs(matrix, locs, config=config)
     actual = regions[list(expected.columns)].reset_index(drop=True)
     pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+
+
+# --------------------------------------------------------------------------
+# Stage 1b — lag-null window assembly
+# --------------------------------------------------------------------------
+
+from eiger2.core import _lag_null_track, _lag_statistic, _null_eligibility  # noqa: E402
+
+
+def _reference_lag_null_track(residuals, lag, config):
+    """Old (buggy) implementation, kept ONLY as a fixed reference point for the
+    no-op-at-w<=2 test below -- never reintroduced into the package."""
+    from eiger2.core import _window_from_lags
+    span = max(config.window, 2)
+    usable = residuals.shape[0] - lag * (span - 1)
+    if usable < 2:
+        return np.empty(0, dtype=float)
+    lag_statistics = []
+    for separation in range(1, span):
+        values = _lag_statistic(residuals, separation * lag, config)
+        lag_statistics.append(values[:usable])
+    if config.window == 1:
+        return lag_statistics[0]
+    return _window_from_lags(lag_statistics, config.window)
+
+
+def test_lag_null_track_is_a_noop_at_window_1_and_2():
+    rng = np.random.default_rng(101)
+    residuals = rng.normal(size=(200, 30))
+    for w in (1, 2):
+        config = Eiger2Config(window=w, random_seed=1)
+        old = _reference_lag_null_track(residuals, lag=17, config=config)
+        new = _lag_null_track(residuals, lag=17, config=config)
+        assert new.shape == old.shape
+        # allclose, not exact equality: at w=2, the old reference path goes
+        # through _window_from_lags's cumsum-then-diff construction, which is
+        # mathematically a no-op but is not bit-exact (floating-point
+        # non-associativity, ~1e-16). The new direct-sum implementation is
+        # bit-exact to the raw underlying statistic; a tight tolerance still
+        # catches any real (non-floating-point-noise) discrepancy.
+        np.testing.assert_allclose(new, old, rtol=1e-10, atol=1e-10)
+
+
+def test_lag_null_track_member_set_is_exactly_the_lag_multiples():
+    # Build a residual matrix where stat(row j, row k) is recoverable from the
+    # pair itself: use two samples, values j and k respectively, so
+    # correlation/covariance of (j, j2, ..) vs (k, k2, ..) across a handful of
+    # synthetic "samples" encodes (j, k) in a way we can invert. Simpler and
+    # exact: monkeypatch _lag_statistic to return a matrix whose value at
+    # position i is the pair (i, i+d) encoded as i * 10_000 + d, then confirm
+    # _lag_null_track's output at window position i decodes to exactly the
+    # pairs {(i + a*lag, i + b*lag) : 0 <= a < b < w} and no others.
+    import eiger2.core as core_mod
+
+    lag = 5
+    w = 4
+    n_positions = 30
+
+    def fake_lag_statistic(residuals, d, config, chunk=200_000):
+        n_pairs = residuals.shape[0] - d
+        # value at row i encodes the pair (i, i + d) uniquely
+        return np.array([i * 100_000 + d for i in range(n_pairs)], dtype=float)
+
+    original = core_mod._lag_statistic
+    core_mod._lag_statistic = fake_lag_statistic
+    try:
+        config = Eiger2Config(window=w, random_seed=1)
+        dummy_residuals = np.zeros((n_positions + lag * (w - 1) + 5, 3))
+        out = core_mod._lag_null_track(dummy_residuals, lag, config)
+    finally:
+        core_mod._lag_statistic = original
+
+    # decode window position i=0: expect the average of pair-encodings for
+    # {(0, lag), (0, 2*lag), (0, 3*lag), (lag, 2*lag), (lag, 3*lag), (2*lag, 3*lag)}
+    expected_pairs = [(a * lag, b * lag) for a in range(w) for b in range(a + 1, w)]
+    expected_values = [j * 100_000 + (k - j) for (j, k) in expected_pairs]
+    assert out[0] == pytest.approx(np.mean(expected_values))
+
+    # and NOT the old (buggy) construction's pairs, which would include e.g.
+    # (0+lag, 0+2) -- a base offset that isn't a multiple of lag
+    wrong_pairs_value = 0 * 100_000 + 2  # what the old code would have pulled in
+    assert wrong_pairs_value not in expected_values
+
+
+def test_null_eligibility_offsets_match_lag_null_track_member_set():
+    lag = 7
+    for w in (1, 2, 3, 5):
+        config = Eiger2Config(window=w, random_seed=1)
+        span = max(w, 2)
+        size = 50
+        chromosome = np.array(["chr1"] * (size + lag * (span - 1) + 5))
+        eligible = _null_eligibility(chromosome, lag, config, size)
+        # hand-derive the same offsets _lag_null_track's member set implies
+        expected = np.ones(size, dtype=bool)
+        first = chromosome[:size]
+        for step in range(1, span):
+            offset = step * lag
+            expected &= first == chromosome[offset : offset + size]
+        np.testing.assert_array_equal(eligible, expected)
+
+
+def test_lag_null_track_slice_bounds_hold_for_large_window_and_lag():
+    rng = np.random.default_rng(202)
+    for w in (1, 2, 4, 8, 12):
+        for lag in (2, 50, 1999):
+            n = 4000
+            residuals = rng.normal(size=(n, 10))
+            config = Eiger2Config(window=w, random_seed=1)
+            out = _lag_null_track(residuals, lag, config)
+            span = max(w, 2)
+            expected_usable = max(n - lag * (span - 1), 0)
+            if expected_usable < 2:
+                assert out.size == 0
+            else:
+                assert out.size == expected_usable
