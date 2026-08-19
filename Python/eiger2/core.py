@@ -1071,12 +1071,16 @@ def null_threshold(
 def segment(
     statistic: np.ndarray,
     eligible: np.ndarray,
-    threshold: float,
+    threshold: float | np.ndarray,
     *,
     min_cpgs: int,
     max_gap_edges: int = 0,
 ) -> np.ndarray:
     """Contiguous runs of passing edges, tolerating short internal gaps.
+
+    ``threshold`` may be a scalar or a per-edge array matching ``statistic``'s
+    shape (support-conditioned mode, Stage 1c). The scalar path is unchanged and
+    stays bit-identical.
 
     Returns an ``(n_regions, 2)`` array of inclusive CpG index bounds. A run of
     ``E`` passing edges spans ``E + 1`` CpGs; ``min_cpgs`` counts CpGs.
@@ -1086,7 +1090,10 @@ def segment(
     eligible = np.asarray(eligible, dtype=bool)
     if statistic.shape != eligible.shape:
         raise ValueError("statistic and eligible must have the same shape")
-    passing = np.isfinite(statistic) & (statistic >= threshold) & eligible
+    threshold_arr = np.asarray(threshold, dtype=float)
+    if threshold_arr.shape not in ((), statistic.shape):
+        raise ValueError("threshold must be a scalar or match statistic's shape")
+    passing = np.isfinite(statistic) & (statistic >= threshold_arr) & eligible
 
     regions: list[tuple[int, int]] = []
     index = 0
@@ -1117,9 +1124,12 @@ def segment(
 
 
 def region_area(
-    statistic: np.ndarray, regions: np.ndarray, threshold: float
+    statistic: np.ndarray, regions: np.ndarray, threshold: float | np.ndarray
 ) -> np.ndarray:
     """Summed excess of the statistic over the threshold, per region.
+
+    ``threshold`` may be a scalar or a per-edge array matching ``statistic``'s
+    shape (Stage 1c support-conditioned mode); the scalar path is unchanged.
 
     Area rewards both strength and length, which is the behaviour wanted for a
     region-level statistic and matches the ``bumphunter`` convention.
@@ -1128,11 +1138,23 @@ def region_area(
     if regions.size == 0:
         return np.empty(0, dtype=float)
     values = np.asarray(statistic, dtype=float)
+    threshold_arr = np.asarray(threshold, dtype=float)
+    if threshold_arr.shape not in ((), values.shape):
+        raise ValueError("threshold must be a scalar or match statistic's shape")
+    is_array_threshold = threshold_arr.shape == values.shape
     areas = np.empty(len(regions), dtype=float)
     for position, (first, last) in enumerate(regions):
-        block = values[int(first) : int(last)]
-        block = block[np.isfinite(block)]
-        areas[position] = float(np.sum(block - threshold)) if block.size else 0.0
+        first, last = int(first), int(last)
+        block = values[first:last]
+        block_threshold = (
+            threshold_arr[first:last] if is_array_threshold else threshold_arr
+        )
+        finite_mask = np.isfinite(block)
+        block = block[finite_mask]
+        block_threshold = (
+            block_threshold[finite_mask] if is_array_threshold else block_threshold
+        )
+        areas[position] = float(np.sum(block - block_threshold)) if block.size else 0.0
     return areas
 
 

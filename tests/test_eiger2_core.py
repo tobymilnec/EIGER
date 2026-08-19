@@ -47,6 +47,7 @@ from eiger2.core import (  # noqa: E402
     permutation_null_tracks,
     qvalue_result_from_track,
     qvalues_from_track,
+    region_area,
     region_fdr_result,
 )
 
@@ -327,6 +328,43 @@ def test_segment_never_crosses_ineligible_edges():
         statistic, eligible, 0.5, min_cpgs=3, max_gap_edges=3
     ):
         assert not (first <= 5 < last)
+
+
+def test_segment_constant_array_threshold_matches_scalar():
+    rng = np.random.default_rng(21)
+    statistic = rng.normal(size=300)
+    eligible = np.ones(300, dtype=bool)
+    scalar_regions = segment(statistic, eligible, 0.5, min_cpgs=4, max_gap_edges=1)
+    array_regions = segment(
+        statistic, eligible, np.full(300, 0.5), min_cpgs=4, max_gap_edges=1,
+    )
+    np.testing.assert_array_equal(scalar_regions, array_regions)
+
+
+def test_region_area_constant_array_threshold_matches_scalar():
+    rng = np.random.default_rng(22)
+    statistic = rng.normal(size=300)
+    regions = np.array([[10, 25], [100, 130]])
+    scalar_areas = region_area(statistic, regions, 0.3)
+    array_areas = region_area(statistic, regions, np.full(300, 0.3))
+    np.testing.assert_array_equal(scalar_areas, array_areas)
+
+
+def test_segment_and_region_area_reject_mismatched_array_threshold_shape():
+    statistic = np.zeros(10)
+    with pytest.raises(ValueError):
+        segment(statistic, np.ones(10, dtype=bool), np.zeros(5), min_cpgs=2)
+    with pytest.raises(ValueError):
+        region_area(statistic, np.array([[0, 2]]), np.zeros(5))
+
+
+def test_region_area_array_threshold_uses_per_edge_values():
+    statistic = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    threshold = np.array([0.5, 1.5, 1.0, 3.5, 0.0])
+    regions = np.array([[0, 4]])
+    areas = region_area(statistic, regions, threshold)
+    expected = (1.0 - 0.5) + (2.0 - 1.5) + (3.0 - 1.0) + (4.0 - 3.5)
+    assert areas[0] == pytest.approx(expected)
 
 
 def test_regions_do_not_cross_chromosomes():
