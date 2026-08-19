@@ -15,7 +15,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "Python"))
+# benchmarking/ is not an installed package (see pyproject.toml's setuptools
+# packages.find scope); add the repo root so `from benchmarking.benchmark_suite
+# import SCENARIOS` resolves under pytest, matching how it already resolves when
+# run as a plain script from the repo root.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from eiger2 import (  # noqa: E402
     Eiger2Config,
@@ -34,7 +40,6 @@ from eiger2.core import (  # noqa: E402
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
-    eligible_edges,
     null_exchangeability,
     null_threshold,
     null_tracks,
@@ -327,21 +332,33 @@ def test_region_evidence_score_exercises_corrected_tail_area_fdr():
     # null regions for this simulated genome, so `local_fdr` always returns
     # "insufficient_null_regions" and evidence_score_extrapolated is never
     # set -- that failure is unrelated to the _tail_area_fdr direction/tie
-    # bug this task fixes. null_replicates is raised (with a matching, lower
-    # min_null_regions_for_posterior) so the posterior estimate actually
-    # reaches "ok" status and the extrapolated tail-area fallback -- which is
-    # exactly the code path _tail_area_fdr governs -- is genuinely exercised.
+    # bug this task fixes.
+    #
+    # Post-Stage-1b-fix, null_replicates=500 (the brief's original raised value)
+    # is no longer enough either: the corrected null is properly calibrated, so
+    # min_cpgs=4 consecutive exceedances (the default, matching window=4) never
+    # occur in this null -- measured n_pooled_null=0 at null_replicates up to
+    # 20,000 (about 21s), so this is not a replicate-count problem at all; the
+    # corrected null simply produces far fewer spurious null regions than the
+    # pre-fix defective one did, which happened to leak enough locality back in
+    # to occasionally clear a 4-in-a-row bar. min_cpgs is lowered to 3 (still
+    # >= the framework's own floor of 2) instead: a lower run-length bar that
+    # the corrected, better-calibrated null can still clear, restoring
+    # n_pooled_null=7 at null_replicates=500 and genuinely exercising the
+    # extrapolated tail-area fallback -- exactly the code path _tail_area_fdr
+    # governs -- rather than raising null_replicates without bound.
     matrix, locs, _planted = simulate(
         n_samples=50, strata=[(0.2, 0.4)], replicates=3,
         spacing=250, dmr_length=10, seed=99,
     )
     config = Eiger2Config(
         window=4, null_replicates=500, random_seed=99, compute_posterior=True,
-        min_null_regions_for_posterior=5,
+        min_null_regions_for_posterior=5, min_cpgs=3,
     )
     regions, _values, manifest = call_dmrs(matrix, locs, config=config)
     assert "posterior" in manifest
-    assert regions["evidence_score_extrapolated"].any() or len(regions) == 0
+    assert manifest["posterior"]["status"] == "ok"
+    assert regions["evidence_score_extrapolated"].any()
 
 
 def test_estimate_pi0_output_is_unchanged_by_the_tail_area_fdr_fix():
@@ -1008,21 +1025,27 @@ def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
 
 
 def test_upper_decision_uses_upper_bound_not_point_estimate():
-    # These parameters produce a real divergence between "point" and "upper"
-    # decision modes (13 vs 12 significant regions, measured on this branch) --
-    # unlike weaker parameter choices where both modes happen to call the same
-    # set of regions, which would let this test pass even if --fdr-decision
-    # were silently ignored.
+    # The brief's original parameters (13 vs 12 significant regions) collapse
+    # to 13 vs 13 post-Stage-1b-fix: the corrected, better-calibrated null
+    # narrows the Garwood interval enough that "point" and "upper" now call the
+    # identical region set here. Re-searched empirically (varying strata,
+    # replicates, null_replicates and target_fdr) for a config that still
+    # diverges on the corrected code -- found at 31 vs 30 significant regions
+    # with a two-strata signal (a weaker (0.10, 0.15) stratum alongside the
+    # original (0.15, 0.25)) and more simulated replicates (15, not 12), which
+    # produces enough borderline-area regions for the upper Garwood bound to
+    # push at least one of them across target_fdr=0.05 while the point
+    # estimate does not.
     matrix, locs, _ = simulate(
-        n_samples=80, strata=[(0.15, 0.25)], replicates=12,
+        n_samples=80, strata=[(0.10, 0.15), (0.15, 0.25)], replicates=15,
         spacing=300, dmr_length=10, seed=7,
     )
     point_config = Eiger2Config(
-        window=4, null_replicates=400, random_seed=7, target_fdr=0.05,
+        window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
         fdr_decision="point",
     )
     upper_config = Eiger2Config(
-        window=4, null_replicates=400, random_seed=7, target_fdr=0.05,
+        window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
         fdr_decision="upper",
     )
     point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
@@ -1340,25 +1363,82 @@ def test_lag_null_track_member_set_is_exactly_the_lag_multiples():
     expected_values = [j * 100_000 + (k - j) for (j, k) in expected_pairs]
     assert out[0] == pytest.approx(np.mean(expected_values))
 
-    # and NOT the old (buggy) construction's pairs, which would include e.g.
-    # (0+lag, 0+2) -- a base offset that isn't a multiple of lag
-    wrong_pairs_value = 0 * 100_000 + 2  # what the old code would have pulled in
-    assert wrong_pairs_value not in expected_values
+    # And decode a NON-ZERO window position (i=10) the same way, pinning that
+    # the base offset i is carried correctly through the whole window, not just
+    # at the i=0 edge case: expect the pairs {(10 + a*lag, 10 + b*lag)}, i.e.
+    # every member shifted by the base position, and nothing else.
+    i = 10
+    expected_pairs_i = [
+        (i + a * lag, i + b * lag) for a in range(w) for b in range(a + 1, w)
+    ]
+    expected_values_i = [j * 100_000 + (k - j) for (j, k) in expected_pairs_i]
+    assert out[i] == pytest.approx(np.mean(expected_values_i))
 
 
 def test_null_eligibility_offsets_match_lag_null_track_member_set():
+    # Extract _lag_null_track's actual member-set offsets programmatically, via
+    # the same fake-_lag_statistic monkeypatch/decode technique as
+    # test_lag_null_track_member_set_is_exactly_the_lag_multiples above, instead
+    # of hand-rederiving _null_eligibility's own offset formula. Copying
+    # _null_eligibility's "step * lag" loop into the test only proves
+    # _null_eligibility is self-consistent with itself -- it can't fail even if
+    # _lag_null_track's member set diverges from it. Deriving the expected
+    # offsets from _lag_null_track's real output (and validating that
+    # derivation against the real output first) makes the two genuinely
+    # coupled: this test now fails if either function's member set moves
+    # without the other following.
+    import eiger2.core as core_mod
+
     lag = 7
     for w in (1, 2, 3, 5):
         config = Eiger2Config(window=w, random_seed=1)
         span = max(w, 2)
+
+        def fake_lag_statistic(residuals, d, config, chunk=200_000):
+            n_pairs = residuals.shape[0] - d
+            return np.array([i * 100_000 + d for i in range(n_pairs)], dtype=float)
+
+        n_positions = 10
+        original = core_mod._lag_statistic
+        core_mod._lag_statistic = fake_lag_statistic
+        try:
+            dummy_residuals = np.zeros((n_positions + lag * (span - 1) + 5, 3))
+            out = core_mod._lag_null_track(dummy_residuals, lag, config)
+        finally:
+            core_mod._lag_statistic = original
+
+        if w == 1:
+            # No window combination at w=1 (see _lag_null_track's `if w == 1`
+            # branch): the raw single-lag statistic is returned directly, so
+            # the member set at position 0 is {0, lag}. Confirm against the
+            # real output before relying on it below.
+            assert out[0] == pytest.approx(0 * 100_000 + lag)
+            member_offsets = {0, lag}
+        else:
+            # Confirm the {0, lag, 2*lag, ..., (w-1)*lag} member set against
+            # the real output -- same decode formula validated by
+            # test_lag_null_track_member_set_is_exactly_the_lag_multiples --
+            # before trusting it as ground truth for _null_eligibility below.
+            candidate = sorted(a * lag for a in range(w))
+            pairs = [
+                (candidate[a], candidate[b])
+                for a in range(w)
+                for b in range(a + 1, w)
+            ]
+            predicted = np.mean([j * 100_000 + (k - j) for j, k in pairs])
+            assert out[0] == pytest.approx(predicted)
+            member_offsets = set(candidate)
+
         size = 50
         chromosome = np.array(["chr1"] * (size + lag * (span - 1) + 5))
         eligible = _null_eligibility(chromosome, lag, config, size)
-        # hand-derive the same offsets _lag_null_track's member set implies
+        # A null position i is admissible iff every extracted member offset
+        # (relative to i) sits on the same chromosome as i itself -- built from
+        # member_offsets extracted above, not from copying _null_eligibility's
+        # own loop.
         expected = np.ones(size, dtype=bool)
         first = chromosome[:size]
-        for step in range(1, span):
-            offset = step * lag
+        for offset in sorted(member_offsets - {0}):
             expected &= first == chromosome[offset : offset + size]
         np.testing.assert_array_equal(eligible, expected)
 
@@ -1452,27 +1532,29 @@ def test_null_threshold_omits_exchangeability_when_statistic_not_given():
 def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
     # spec §1b.5 item 4: all five scenarios, 10 seeds. This is a correctness gate,
     # not an exploratory check -- do not reduce scenario/seed coverage for speed.
+    from benchmarking.benchmark_suite import SCENARIOS
+
     from eiger2.benchmark import simulate
     from eiger2.core import (
-        centre_cpgs, deflate, edge_statistic, eligible_edges,
-        estimate_latent_basis, null_exchangeability, null_tracks,
+        centre_cpgs,
+        deflate,
+        edge_statistic,
+        eligible_edges,
+        estimate_latent_basis,
+        null_exchangeability,
+        null_tracks,
     )
+    # Sourced from benchmarking.benchmark_suite.SCENARIOS rather than a hand-copied
+    # dict, so the two definitions cannot silently drift apart. Only "missingness"
+    # is overridden: missing_rate=0.5, not SCENARIOS' default 0.25. Ruled by the
+    # user after Task 1's reproduction found 0.25 leaves the pre-fix defect
+    # marginal and seed-dependent (measured ratios 1.631 and 1.262 -- both over
+    # the 1.25 threshold -- vs 1.226 which passes, across 3 tested seeds), while
+    # 0.5 makes it unambiguous (measured ~3.8x pre-fix) -- the real reason 0.5 was
+    # chosen for this demonstration.
     scenarios = {
-        "clean": dict(n_samples=80, n_latent=0, noise_sd=0.04, missing_rate=0.0),
-        "nuisance": dict(n_samples=80, n_latent=2, latent_loading_sd=0.07,
-                         noise_sd=0.04, missing_rate=0.0),
-        # missing_rate=0.5, not the SCENARIOS dict's default 0.25 -- ruled by the
-        # user after Task 1's reproduction found 0.25 does not manifest the
-        # defect's dramatic effect in this environment (ratio ~1.6x, indistinguishable
-        # from clean/nuisance) while 0.5 does (threshold value lands close to the
-        # diagnosis's reported missingness figures). Using 0.25 here would make this
-        # gate trivially pass even before the fix, which is not a meaningful test.
-        "missingness": dict(n_samples=80, n_latent=2, latent_loading_sd=0.07,
-                            noise_sd=0.04, missing_rate=0.5),
-        "small_n": dict(n_samples=12, n_latent=1, latent_loading_sd=0.07,
-                        noise_sd=0.04, missing_rate=0.0),
-        "high_noise": dict(n_samples=40, n_latent=2, latent_loading_sd=0.10,
-                           noise_sd=0.08, missing_rate=0.0),
+        **SCENARIOS,
+        "missingness": {**SCENARIOS["missingness"], "missing_rate": 0.5},
     }
     for name, params in scenarios.items():
         for seed in range(10):
@@ -1493,7 +1575,9 @@ def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
             # exchangeability(), added in this same stage) and Task 5's
             # verified reproduction (spacing=19600), and passes all 50
             # combos with comfortable margin (max ratio 1.169 across a full
-            # sweep). See task-6-report.md for the full investigation.
+            # sweep). See
+            # docs/superpowers/plans/2026-08-18-stage1b-lag-null-window-fix.md
+            # for the full investigation.
             matrix, locs, _ = simulate(seed=seed, strata=[], replicates=0,
                                         spacing=20000, **params)
             config = Eiger2Config(window=4, random_seed=seed, null_replicates=100)
@@ -1513,15 +1597,24 @@ def test_recall_does_not_regress_more_than_5_points_after_lag_null_fix():
     #
     # evaluate()'s actual signature/return type (confirmed by reading
     # Python/eiger2/benchmark.py directly, not guessed):
-    #   evaluate(regions, truth, *, min_overlap=20) -> (recovered: set[int], false_regions: int)
+    #   evaluate(regions, truth, *, min_overlap=20)
+    #       -> (recovered: set[int], false_regions: int)
     # It is a tuple, not a dict -- there is no "recall" key to index. Recall is
     # derived as len(recovered) / len(truth), matching Task 5's report's usage.
     import eiger2.core as core_mod
-    from eiger2.benchmark import simulate, evaluate
+    from eiger2.benchmark import evaluate, simulate
 
+    # dmr_length=25, NOT the brief's literal 15: evaluate()'s default
+    # min_overlap=20 means a truth region can only ever be "recovered" if its
+    # own span is >= 20 CpGs (a called region can overlap a dmr_length=15
+    # truth region by at most 15 CpGs, which never reaches min_overlap=20).
+    # At dmr_length=15 this test was vacuous in both directions -- measured
+    # before_recall == after_recall == 0/6 -- which the "assert before_recall
+    # > 0" guard below now genuinely catches instead of silently passing.
+    # dmr_length=25 restores real recall (measured 6/6 before and after).
     matrix, locs, planted = simulate(
         n_samples=80, strata=[(0.2, 0.35)], replicates=6,
-        spacing=400, dmr_length=15, seed=11,
+        spacing=400, dmr_length=25, seed=11,
     )
     config = Eiger2Config(window=4, null_replicates=50, random_seed=11)
 
@@ -1539,4 +1632,7 @@ def test_recall_does_not_regress_more_than_5_points_after_lag_null_fix():
     after_recovered, _after_false = evaluate(after_regions, planted)
     before_recall = len(before_recovered) / len(planted)
     after_recall = len(after_recovered) / len(planted)
+    # Guard against the comparison becoming vacuously true (0 >= 0 - 0.05) if
+    # future parameter changes ever drive recall to zero on both sides.
+    assert before_recall > 0
     assert after_recall >= before_recall - 0.05, (before_recall, after_recall)
