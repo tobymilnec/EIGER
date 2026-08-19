@@ -1,6 +1,6 @@
 """Operating-characteristic suite: EIGER 1 versus EIGER 2.
 
-Four experiments, each answering a question the head-to-head accuracy tables in
+Five experiments, each answering a question the head-to-head accuracy tables in
 ``BENCHMARK.md`` do not:
 
 ``negative``   No planted signal anywhere. How many regions does each caller
@@ -22,6 +22,17 @@ Four experiments, each answering a question the head-to-head accuracy tables in
 ``calibration`` Reliability of the two-groups posterior: bin regions by
                predicted probability, report the observed fraction that are
                genuinely planted.
+
+``exchangeability`` Split-half self-consistency check of the null itself (spec
+               §1b.3). The null is split into a calibration half, which sets
+               a threshold, and a held-out half, whose exceedance against that
+               threshold is a control that must equal ``1 - null_quantile`` by
+               construction. The actual gate is the observed track's
+               exceedance against the same threshold: the ratio of the two is
+               1.0 when the null and the data share the same upper-tail shape,
+               and rises when the null is thinner-tailed than the data --
+               exactly the failure mode described in docs/FDR.md, "Null
+               exchangeability".
 
 Run everything::
 
@@ -196,6 +207,59 @@ def negative_control(
                         "latent_structure", {}
                     ).get("n_components", np.nan),
                 ))
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
+# experiment 1b — null exchangeability (spec §1b.3)
+# --------------------------------------------------------------------------
+
+
+def exchangeability(
+    seeds: Sequence[int],
+    scenarios: Sequence[str],
+    *,
+    statistic: str = "correlation",
+) -> pd.DataFrame:
+    """Split-half null self-consistency check, per spec §1b.3.
+
+    For each DMR-free scenario/seed: generate null replicates, split into
+    calibration/held-out halves, threshold on the calibration half, measure
+    exceedance on the held-out half (the control -- must equal
+    ``1 - null_quantile``) and on the observed track (the actual gate).
+    """
+
+    from eiger2.core import (
+        Eiger2Config,
+        centre_cpgs,
+        deflate,
+        edge_statistic,
+        eligible_edges,
+        estimate_latent_basis,
+        null_exchangeability,
+        null_tracks,
+    )
+
+    rows: list[dict] = []
+    for scenario_name in scenarios:
+        for seed in seeds:
+            matrix, locations, _ = simulate(
+                seed=seed, strata=[], replicates=0,
+                spacing=20000, **SCENARIOS[scenario_name],
+            )
+            config = Eiger2Config(statistic=statistic, random_seed=seed)
+            residuals = centre_cpgs(matrix)
+            basis, _ = estimate_latent_basis(residuals, config)
+            deflated = deflate(residuals, basis, missing=config.deflation_missing)
+            statistic_track = edge_statistic(deflated, config)
+            eligible = eligible_edges(locations, config)
+            tracks = null_tracks(deflated, config, locations)
+            result = null_exchangeability(tracks, statistic_track, eligible, config)
+            rows.append({
+                "scenario": scenario_name, "seed": seed,
+                "n_cpg": int(matrix.shape[0]), "n_samples": int(matrix.shape[1]),
+                **result,
+            })
     return pd.DataFrame(rows)
 
 
@@ -539,12 +603,27 @@ def command_calibration(args: argparse.Namespace) -> None:
     print(f"  maximum calibration error  {error['max_calibration_error']:.4f}")
 
 
+def command_exchangeability(args: argparse.Namespace) -> None:
+    out = Path(args.out_dir)
+    seeds = list(range(args.seeds))
+    frame = exchangeability(seeds, args.scenarios, statistic=args.statistic)
+    _write(frame, out / "exchangeability.csv")
+    summary = frame.groupby("scenario")[
+        ["p_null", "p_obs", "null_exchangeability_ratio"]
+    ].mean()
+    print(summary.round(4).to_string())
+    worst = frame["null_exchangeability_ratio"].max()
+    print(f"  worst null_exchangeability_ratio: {worst:.3f} "
+          f"({'PASS' if worst <= 1.25 else 'FAIL'} at gate 1.25)")
+
+
 def command_all(args: argparse.Namespace) -> None:
     for name, function in (
         ("negative", command_negative),
         ("sweep", command_sweep),
         ("scaling", command_scaling),
         ("calibration", command_calibration),
+        ("exchangeability", command_exchangeability),
     ):
         print("=" * 78)
         print(name.upper())
@@ -556,7 +635,7 @@ def command_all(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=[
-        "negative", "sweep", "scaling", "calibration", "all"
+        "negative", "sweep", "scaling", "calibration", "exchangeability", "all"
     ])
     parser.add_argument("--out-dir", default="benchmark_v2")
     parser.add_argument("--seeds", type=int, default=10,
@@ -582,6 +661,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "sweep": command_sweep,
         "scaling": command_scaling,
         "calibration": command_calibration,
+        "exchangeability": command_exchangeability,
         "all": command_all,
     }
     started = time.perf_counter()
@@ -610,7 +690,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         peak_memory_mb=_peak_memory_mb(),
         warnings=[],
         # Every Eiger2Config built by this suite leaves fdr_decision at its
-        # 'point' default; none of the four experiments override it.
+        # 'point' default; none of the five experiments override it.
         fdr_decision="point",
     )
     (out / f"{args.command}_manifest.json").write_text(
