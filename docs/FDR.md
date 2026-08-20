@@ -344,8 +344,8 @@ optimistic rather than trust it as-is.
 implicit v2.0.0 output format — it was never written to any manifest at the time, so a
 v2.0.0-era `regions.csv`/`run_manifest.json` is identified by the **absence** of a
 `schema_version` key, not by that key being present with value `"2.0"`. From this
-release onward, `manifest["schema_version"] = "2.1"` is written explicitly by every
-run.
+release onward, `manifest["schema_version"]` is written explicitly by every run
+(currently `"2.2"`, bumped from `"2.1"` in Stage 1c).
 
 `regions.csv` gains six columns, inserted immediately after `region_qvalue`:
 
@@ -372,10 +372,17 @@ reason: they are derived from the corrected `significant` / `region_qvalue` valu
 The following are bit-for-bit invariant between v2.0.0 and v2.0.1 for a default
 fixed-window run and are **not** in the table above because they do not change:
 `region_id`, `chr`, `start`, `end`, `n_cpgs`, `cpg_index_start`, `cpg_index_end`,
-`statistic`, `statistic_mean`, `statistic_min`, `statistic_threshold`, `region_area`,
+`statistic`, `statistic_mean`, `statistic_min`, `region_area`,
 and every `*_descriptive` column. This is pinned by
 `tests/test_eiger2_core.py::test_stage1_preserves_the_invariant_column_set` against a
 committed v2.0.0 fixture.
+
+As of schema 2.2, `statistic_threshold` is **not** in this invariant set: under
+`region_threshold_mode == "support_binned"` (reachable via the shipped default
+`support_binned_threshold="auto"` when there is sufficient support dispersion),
+`statistic_threshold` becomes the region's mean per-edge threshold rather than a
+single fixed scalar, and its value is not comparable across runs with different
+`support_binning`.
 
 `confidence_level` (default `0.95`) remains available in the Python API for research
 use. If a caller requests a value other than `0.95`, `eiger2 call`'s CSV export refuses

@@ -2072,6 +2072,14 @@ def call_dmrs(
     support_bin_edges: np.ndarray = np.empty(0)
     support_bin_merges: list = []
     support_thresholds: list = []
+    # `null_full_support`/`pooled_null_support` are only ever assigned inside the
+    # `if binning_requested and ...:` block below, but the Task 9/10 diagnostic
+    # code later references `null_full_support` unconditionally under a
+    # `support_binning in ("auto_on", "forced_on")` gate that is today always
+    # equivalent to "that block ran". There's no structural guarantee of that
+    # equivalence holding forever, so initialize defensively here to turn a
+    # future NameError into an empty (inert) list instead.
+    null_full_support: list[np.ndarray] = []
     per_edge_threshold: float | np.ndarray = threshold
     # Per-replicate threshold arrays fed to segment()/region_area() for each
     # null track, aligned 1:1 with `tracks`. Defaults to the scalar threshold
@@ -2176,15 +2184,12 @@ def call_dmrs(
         manifest["status"] = "no_regions"
         return empty_regions, empty_values, manifest
 
-    # Recorded in the manifest here so the values are computed once, in one
-    # place, and available both to the row-building loop below (Task 7, which
-    # reads this list by position rather than recomputing it) and to Task 9
-    # (region-level exposure diagnostic) without recomputation.
+    # Recorded in the manifest here so `region_support_median_descriptive` is
+    # computed once, in one place, and available both to the row-building loop
+    # below (Task 7, which reads this list by position rather than recomputing
+    # it) and to Task 9 (region-level exposure diagnostic) without recomputation.
     manifest["region_support_median_descriptive"] = [
         float(np.median(observed_support[first:last])) for first, last in regions
-    ]
-    manifest["region_threshold_mode_descriptive"] = [
-        region_threshold_mode_value for _ in range(len(regions))
     ]
 
     observed_areas = region_area(statistic, regions, per_edge_threshold)
@@ -2416,6 +2421,13 @@ def call_dmrs(
             "pi0": estimate.pi0,
             **estimate.diagnostics,
         }
+        # `local_fdr` above is only ever given `observed_lengths`/`null_length_sets`
+        # (never support-bin arguments), so this posterior path is length-stratified
+        # at most, never support-stratified -- unlike `region_fdr_result` above, which
+        # spec §1c.6 names explicitly for support-bin stratification. Recorded here so
+        # a consumer of `manifest["posterior"]` doesn't assume parity with the
+        # region-level q-values.
+        manifest["posterior"]["support_stratified"] = False
 
     decision_qvalue = (
         fdr_result.qvalue_upper if config.fdr_decision == "upper" else fdr_result.qvalue

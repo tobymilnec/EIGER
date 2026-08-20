@@ -2667,7 +2667,10 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
     assert np.median(ratios) <= 1.25, ratios
 
 
-def test_support_stratified_fdr_diagnostics_on_a_realistic_missingness_run():
+def test_support_stratified_fdr_pins_the_known_zero_qvalue_state_under_missingness():
+    # KNOWN-BAD STATE PIN -- see task-11-report.md. This test SHOULD go red the
+    # day someone fixes the underlying null-region-formation problem; update it
+    # then, don't relax it now.
     # spec §1c.7 item 9's second half: Task 10's own tests exercise
     # `region_fdr_result` directly plus one small `call_dmrs` case. This runs the
     # actual §1c.8 validation configuration -- the standard `missingness`

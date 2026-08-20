@@ -227,6 +227,13 @@ defines no false discovery rate. That is the point of the comparison.
 See [docs/FDR.md](docs/FDR.md) for the full derivation, the Garwood interval's Poisson
 assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneous).
 
+### New in v2.2: two columns alongside `statistic_threshold`
+
+| Column | Meaning |
+|---|---|
+| `region_support_median` | median per-edge measurement support (samples observed at every CpG) across the region's edges |
+| `region_threshold_mode` | `"single"` or `"support_binned"`, depending on whether `--support-binned-threshold` was active for this region |
+
 ---
 
 ## 6. Options worth knowing
@@ -242,6 +249,13 @@ assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneo
                                       # for --compute-posterior (100-300)
 --fdr-decision point|upper           # default point; upper decides on
                                       # region_qvalue_upper_95 instead (conservative)
+--support-binned-threshold auto|on|off  # condition the null-quantile threshold on
+                                      # local measurement support; default auto
+                                      # enables it only when support varies enough
+                                      # to matter
+--support-bins N                     # number of support quantile bins when
+                                      # support-binned thresholding is active
+                                      # (default 4, minimum 2)
 --target-fdr 0.05
 --compute-posterior                  # per-region evidence SCORE, not a probability
 ```

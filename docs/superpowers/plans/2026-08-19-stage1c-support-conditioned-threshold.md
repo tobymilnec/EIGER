@@ -1128,7 +1128,7 @@ Using a missingness-scenario run at reasonable scale (several seeds,
 escalation (stratifying region-FDR exposure counts by support bin) — record clearly
 in the STOP 1c report that the gate was checked and did not fire, per this plan's
 Global Constraints. **If a bin does exceed 2.0:** stop this task, do not proceed to
-Task 10, and report the finding — the escalation implementation becomes a new task,
+Task 11, and report the finding — the escalation implementation becomes a new task,
 inserted here, following spec §1c.6's exact instructions (stratify `region_fdr_result`
 by support bin in addition to length, with the ≥50-null-regions-per-joint-stratum
 fallback to length-only stratification, recorded when triggered).
