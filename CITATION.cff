@@ -10,12 +10,20 @@ abstract: >-
   is retained and runnable via --legacy. Version 2.0.1 corrects the direction
   and tied-cutoff handling of the region-level false discovery rate estimator
   and adds finite-null uncertainty quantification via simultaneous Garwood
-  Monte Carlo bounds on each region's q-value.
+  Monte Carlo bounds on each region's q-value. Version 2.1.0 replaces the
+  region-level null with a member-step construction that reproduces the
+  observed statistic's autocorrelation by construction, corrects the
+  null-adequacy floor from a per-stratum to an aggregate check, exposes the
+  region-level null as a command-line option with an automatic small-input
+  fallback, and removes the broken permutation null mode. Pooled realised
+  false discovery rate across measured planted-signal data is conservative
+  relative to the 5% nominal target (95% upper bound 1.6%), not evidence of
+  exact calibration.
 type: software
 authors:
   - family-names: Milne-Clark
     given-names: Toby
-version: "2.0.1"
+version: "2.1.0"
 license: MIT
 repository-code: "https://github.com/tobymilnec/EIGER"
 keywords:

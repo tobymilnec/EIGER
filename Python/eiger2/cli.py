@@ -65,6 +65,7 @@ from .core import (
     Eiger2Config,
     call_dmrs,
     check_fdr_decision_vacuity,
+    member_step_min_n_cpg,
     qvalue_result_from_track,
 )
 from .manifest_utils import build_manifest_envelope
@@ -568,6 +569,16 @@ def command_call(args: argparse.Namespace) -> int:
         values = pd.DataFrame()
     else:
         config = _config_from_args(args)
+        # Stage 1f Task 1c (pre-release, master spec pre-release): report the
+        # region_null_mode="member_step" minimum-size floor before the
+        # pipeline runs, not only after a fallback/raise -- so the constraint
+        # is visible before a long run, not buried in output at the end.
+        min_n_cpg = member_step_min_n_cpg(config)
+        print(
+            f"[eiger2] region null: region_null_mode={config.region_null_mode!r}, "
+            f"input has {matrix.shape[0]:,} CpGs, member_step needs >= "
+            f"{min_n_cpg:,}"
+        )
         regions, values, caller_manifest = call_dmrs(
             matrix, locations, sample_names=samples, config=config
         )
@@ -587,12 +598,95 @@ def command_call(args: argparse.Namespace) -> int:
         values.to_csv(out / "region_sample_means.csv", index=False)
 
     warnings_list: list[str] = []
+    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
+    # left at its default "auto" fell back to "lag" because the input was
+    # below member_step's minimum size. Loud and immediate (printed to stderr
+    # below, not only recorded in the manifest), naming the input size, the
+    # required size, and that "lag" fails both region gates and is not
+    # calibrated -- the whole point of the fallback is that this is visible in
+    # the output, not merely non-fatal.
+    fallback = caller_manifest.get("gates", {}).get("region_null_mode_fallback")
+    if fallback:
+        warnings_list.append(
+            f"region_null_mode='auto' fell back to 'lag': input has "
+            f"{fallback['n_cpg']:,} CpGs, below member_step's minimum of "
+            f"{fallback['n_cpg_required']:,}. 'lag' fails both region-level "
+            f"exchangeability gates on real layouts and its region_qvalue is "
+            f"not calibrated -- treat it as candidates-only. Pass "
+            f"--region-null-mode member_step to raise instead of falling "
+            f"back, or --region-null-mode off to skip region_qvalue entirely."
+        )
     if caller_manifest.get("fdr", {}).get("null_count_overdispersion_warning"):
         ratio = caller_manifest["fdr"]["null_count_overdispersion_warning"]
         warnings_list.append(
             f"pooled null region counts are overdispersed (variance/mean="
             f"{ratio:.2f})"
         )
+    # Stage 1e Task 1 (master spec §8): the null-adequacy floor is now a single
+    # AGGREGATE check on the run as a whole (see region_fdr_result's
+    # docstring); a per-stratum empty pool is reported in
+    # zero_exceedance_strata, not refused, so it is an informational note here,
+    # not a "refused" warning.
+    fdr_status = caller_manifest.get("fdr", {}).get("status")
+    if fdr_status == "aggregate null inadequate":
+        fdr_diag = caller_manifest["fdr"]
+        required = fdr_diag.get("replicates_required")
+        required_note = (
+            f"; ~{required} replicates needed to reach the floor at the "
+            f"observed rate"
+            if required is not None
+            else "; observed rate is zero, so no replicate count reaches "
+                 "the floor"
+        )
+        warnings_list.append(
+            f"region_qvalue refused for the whole run: "
+            f"{fdr_diag.get('pooled_null_regions')} pooled null regions across "
+            f"{fdr_diag.get('replicates')} replicates, below "
+            f"min_null_regions_for_fdr{required_note}"
+        )
+    zero_exceedance_strata = caller_manifest.get("fdr", {}).get(
+        "zero_exceedance_strata"
+    )
+    if zero_exceedance_strata:
+        for entry in zero_exceedance_strata:
+            warnings_list.append(
+                f"stratum {entry['stratum']!r}: null pool is empty (0 pooled "
+                f"regions across {entry['replicates']} replicates) -- "
+                f"region_qvalue is reported at the finite K=0 Garwood bound, "
+                f"not refused"
+            )
+    collapsed_strata = caller_manifest.get("layout", {}).get(
+        "collapsed_length_strata"
+    )
+    if collapsed_strata:
+        ceiling = caller_manifest["layout"]["layout_max_detectable_region_cpgs"]
+        warnings_list.append(
+            f"layout_max_detectable_region_cpgs={ceiling} cannot populate length "
+            f"stratum/strata {collapsed_strata} -- no eligible run in this input is "
+            f"long enough, regardless of what was called"
+        )
+    acf_gate_result = caller_manifest.get("gates", {}).get("acf")
+    if acf_gate_result is not None and not acf_gate_result["passed"]:
+        bad_lags = [
+            lag for lag, d in acf_gate_result["diff"].items()
+            if not (np.isfinite(d) and abs(d) <= acf_gate_result["tolerance"])
+        ]
+        warnings_list.append(
+            f"Gate 1 (ACF match, master spec §6.2) failed at lag(s) {bad_lags} "
+            f"of {acf_gate_result['lags']}: null autocorrelation does not match "
+            f"observed within {acf_gate_result['tolerance']}"
+        )
+    region_exch = caller_manifest.get("gates", {}).get("region_exchangeability")
+    if region_exch is not None:
+        ratio = region_exch["region_exchangeability_ratio"]
+        if not math.isfinite(ratio):
+            warnings_list.append(
+                f"Gate 2 (region-level exchangeability, master spec §6.2): "
+                f"null_rate=0 (region_exchangeability_ratio is inf or undefined) "
+                f"-- {region_exch['null_regions_total']} pooled null regions "
+                f"across this call, null_count_adequate="
+                f"{region_exch['null_count_adequate']}"
+            )
 
     # Spec §0.3.4: record every derived seed. core.py derives its null-track
     # RNGs from `random_seed` via fixed, documented additive offsets rather
@@ -664,6 +758,24 @@ def command_call(args: argparse.Namespace) -> int:
         print(f"[eiger2] significant: {significant} at q <= {args.target_fdr}")
     else:
         print("[eiger2] significant: n/a (legacy defines no error rate)")
+    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
+    # "auto" fell back to "lag" -- loud and immediate, not buried only in the
+    # manifest (STOP 1e §5 flagged the previous behaviour, a hard uncatchable
+    # error with no CLI way out, as broken for a public tool).
+    fallback = (caller_manifest.get("gates") or {}).get("region_null_mode_fallback")
+    if fallback:
+        print(
+            f"[eiger2] WARNING: region_null_mode='auto' fell back to 'lag'\n"
+            f"         (input has {fallback['n_cpg']:,} CpGs, below "
+            f"member_step's minimum of {fallback['n_cpg_required']:,}).\n"
+            f"         'lag' fails both region-level exchangeability gates on "
+            f"real layouts and its region_qvalue is not calibrated -- treat "
+            f"it as candidates-only.\n"
+            f"         Pass --region-null-mode member_step to raise instead "
+            f"of falling back, or --region-null-mode off to skip "
+            f"region_qvalue entirely.",
+            file=sys.stderr,
+        )
     overdispersion_ratio = (caller_manifest.get("fdr") or {}).get(
         "null_count_overdispersion_warning"
     )
@@ -674,6 +786,86 @@ def command_call(args: argparse.Namespace) -> int:
             f"1.0).\n"
             f"         region_qvalue_upper_95 is a LOWER BOUND on the true "
             f"uncertainty.",
+            file=sys.stderr,
+        )
+    # Stage 1e Task 1 (master spec §8): a single AGGREGATE null-adequacy
+    # refusal for the whole run, not a per-stratum one -- see
+    # region_fdr_result's docstring.
+    fdr_diag = caller_manifest.get("fdr") or {}
+    if fdr_diag.get("status") == "aggregate null inadequate":
+        required = fdr_diag.get("replicates_required")
+        required_note = (
+            f"raise --null-replicates to at least {required} to clear the "
+            f"floor at the observed rate."
+            if required is not None
+            else "the observed rate is zero, so no replicate count reaches "
+                 "the floor at these parameters."
+        )
+        print(
+            f"[eiger2] WARNING: too few pooled null regions to report "
+            f"region_qvalue\n"
+            f"         ({fdr_diag.get('pooled_null_regions')} across "
+            f"{fdr_diag.get('replicates')} replicates, below "
+            f"min_null_regions_for_fdr).\n"
+            f"         region_qvalue, its bounds, and significant are refused "
+            f"(NaN / False) for the whole run, not a fabricated zero.\n"
+            f"         {required_note}",
+            file=sys.stderr,
+        )
+    for entry in fdr_diag.get("zero_exceedance_strata") or []:
+        print(
+            f"[eiger2] NOTE: stratum {entry['stratum']!r} has an empty pooled "
+            f"null (0 across {entry['replicates']} replicates)\n"
+            f"         -- region_qvalue is reported at the finite K=0 Garwood "
+            f"bound for this stratum, not refused: the null had real "
+            f"opportunity and never produced a region this long.",
+            file=sys.stderr,
+        )
+    collapsed_strata = (caller_manifest.get("layout") or {}).get(
+        "collapsed_length_strata"
+    )
+    if collapsed_strata:
+        ceiling = caller_manifest["layout"]["layout_max_detectable_region_cpgs"]
+        print(
+            f"[eiger2] WARNING: this layout's longest possible region is "
+            f"{ceiling} CpGs\n"
+            f"         (layout_max_detectable_region_cpgs) -- length stratum/strata "
+            f"{collapsed_strata} can\n"
+            f"         never be populated here, however this input is called; "
+            f"see manifest['layout'].",
+            file=sys.stderr,
+        )
+    acf_gate_result = (caller_manifest.get("gates") or {}).get("acf")
+    if acf_gate_result is not None and not acf_gate_result["passed"]:
+        tolerance = acf_gate_result["tolerance"]
+        bad_lags = [
+            lag for lag in acf_gate_result["lags"]
+            if not (
+                np.isfinite(acf_gate_result["diff"][lag])
+                and abs(acf_gate_result["diff"][lag]) <= tolerance
+            )
+        ]
+        print(
+            f"[eiger2] WARNING: Gate 1 (ACF match, master spec §6.2) failed\n"
+            f"         null autocorrelation does not match the observed track's "
+            f"within {tolerance} at lag(s) {bad_lags} of {acf_gate_result['lags']}.\n"
+            f"         Expected on current code at every layout (master spec §6.3 "
+            f"baseline); see manifest['gates']['acf'].",
+            file=sys.stderr,
+        )
+    region_exch = (caller_manifest.get("gates") or {}).get("region_exchangeability")
+    if region_exch is not None and not math.isfinite(
+        region_exch["region_exchangeability_ratio"]
+    ):
+        print(
+            f"[eiger2] WARNING: Gate 2 (region-level exchangeability, master spec "
+            f"§6.2): null_rate is zero\n"
+            f"         ({region_exch['null_regions_total']} pooled null regions; "
+            f"null_count_adequate={region_exch['null_count_adequate']}) -- "
+            f"region_exchangeability_ratio is inf/undefined, reported explicitly "
+            f"rather than hidden.\n"
+            f"         Expected on current code at every layout (master spec §6.3 "
+            f"baseline); see manifest['gates']['region_exchangeability'].",
             file=sys.stderr,
         )
     exchangeability_ratio = (caller_manifest.get("null") or {}).get(
@@ -900,11 +1092,27 @@ def build_parser() -> argparse.ArgumentParser:
                        default=0.05)
         p.add_argument("--null-mode", dest="null_mode",
                        choices=["lag", "permutation"], default=None,
-                       help="'lag' (default) tests for any regional "
-                            "coordination; 'permutation' tests whether a run is "
-                            "unusual given how much coordination the genome "
-                            "contains. Use permutation above ~100 samples, or "
-                            "whenever q-values saturate at zero.")
+                       help="edge-level null; 'lag' is the only supported "
+                            "value. 'permutation' is accepted here (so the "
+                            "informative error names its replacement) but "
+                            "raises immediately: it was removed in v2.1.0, "
+                            "measured at zero usable null regions -- see "
+                            "--region-null-mode for large-cohort saturation, "
+                            "which no longer needs a workaround.")
+        p.add_argument("--region-null-mode", dest="region_null_mode",
+                       choices=["member_step", "lag", "off"], default=None,
+                       help="region-level null behind region_qvalue (distinct "
+                            "from --null-mode above). Default (unset here) is "
+                            "'auto': use 'member_step' when the input clears "
+                            "its genome-scale minimum size (about 103,000 "
+                            "CpGs at defaults), else fall back to 'lag' "
+                            "automatically with a warning. Pass 'member_step' "
+                            "explicitly to raise instead of falling back; "
+                            "'lag' for small inputs or reproducing historical "
+                            "comparisons (fails both region gates, not "
+                            "recommended for inference); 'off' to skip the "
+                            "region-level null entirely (candidates only, no "
+                            "region_qvalue).")
         p.add_argument("--support-binned-threshold", dest="support_binned_threshold",
                        choices=["auto", "on", "off"], default=None,
                        help="condition the null-quantile threshold on local "

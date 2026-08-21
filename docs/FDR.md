@@ -391,5 +391,233 @@ columns whose confidence level the fixed schema doesn't record.
 
 ---
 
+## 11. The region null: the member-step construction (`region_null_mode`)
+
+### 11.1 Why the observed track has autocorrelation, and why that is geometry, not biology
+
+The observed track's lag-1 autocorrelation is close to +0.5 on every real layout
+measured (`STAGE1D_B_STOP_REPORT.md` §4.2: dense/wgbs_real/epic_fitted all ≈ −0.50 in
+the *diff from a flat null*, i.e. the observed value itself is ≈ +0.50). This is not a
+biological claim about regional coordination — it follows mechanically from how
+`edge_statistic()` builds a window: the statistic at edge `e` is the mean over pairs
+among CpGs `{e - offset0, ..., e - offset0 + window - 1}`, and the statistic at edge
+`e+1` shares `window - 1` of those `window` members. Two overlapping sample means are
+correlated because they are built from mostly the same underlying values, regardless of
+whether the biology is coordinated at all. **A null construction that does not
+reproduce this member overlap is not testing "is there real coordination here" — it is
+comparing the data to a null that lacks a structural property the data has for reasons
+having nothing to do with the hypothesis being tested.**
+
+### 11.2 Why the shipped (Stage 1b) null lacks it
+
+`null_tracks()`'s per-position value at null "position" `p` averages pairs among
+members `{p, p+L, ..., p+(w-1)L}` (`L` the drawn lag, deliberately far larger than the
+methylation correlation length). Stepping `p -> p+1` shifts *every* member by one CpG
+simultaneously, so position `p`'s member set and position `p+1`'s are disjoint — no
+overlap, hence (correctly, by construction) no autocorrelation. This is exactly right
+for Stage 1b's purpose (an edge-level marginal that does not inherit the far-apart
+pairing's own irrelevant structure) and exactly wrong for a REGION-level null, which
+needs the SAME member-overlap property the observed track has in order to be compared
+against fairly. Measured: Gate 1 fails on 0/75 instances at every layout
+(`STAGE1D_B_STOP_REPORT.md` §4.2); Gate 2 correspondingly finds an inadequate,
+near-empty null pool on 75/75 (§4.3) — a null with no autocorrelation forms almost no
+runs, so there is almost nothing to compare the observed region-formation rate against.
+
+### 11.3 The member-step construction (C.3)
+
+Fix a lag `L` and a starting offset `i in [0, L)`. Walk a second index `j`: null
+"position" `j`'s members are `{i + jL, i + (j+1)L, ..., i + (j+w-1)L}`. Stepping
+`j -> j+1` shifts the member set by ONE LAG, not by one CpG, so positions `j` and `j+1`
+share `w - 1` of `w` members — the same overlap fraction consecutive OBSERVED windows
+share, reproducing the autocorrelation **by construction, not by tuning**. The pair
+formula itself is unchanged from `_lag_null_track` (`member_step_lag_null_tracks`
+re-slices its existing per-position output at stride `L`; no new pair-assembly code).
+Running every offset `i in [0, L)` as an independent sub-track recovers exposure (a
+single offset alone gives a short sub-track); the null pool is one array per DRAWN
+LAG, sub-tracks concatenated with the eligible mask broken at each boundary so
+`segment()` cannot merge two unrelated offsets (`member_step_lag_null_ensemble`).
+
+Measured on the real fixture at genome scale (600,000 CpGs, `STAGE1D_C_STOP_REPORT.md`
+§5, `STAGE1D_D_STOP_REPORT.md` §1): Gate 1 passes 45/45; Gate 2 median ratio
+1.10–1.12 with an adequate pooled null count on 15/15 instances on both real layouts.
+
+### 11.4 The two gates
+
+**Gate 1 (ACF match).** Null autocorrelation must be within ±0.05 of the observed
+track's at lags `1..window`, on DMR-free data (`acf_gate`, `track_autocorrelation`).
+This is the gate Stage 1b lacked — it validated the null's marginal and variance but
+never re-validated the dependence structure its own fix had just changed
+(`EIGER_NULL_CALIBRATION_DIAGNOSIS.md`, corrected banner; master spec §2.2, §10).
+
+**Gate 2 (region-level exchangeability).** `observed_rate` / `null_rate`, both regions
+per 10,000 eligible edges; the ratio's median across seeds must be ≤ 3.0, **and** the
+pooled null-region count must clear `min_null_regions_for_fdr` (Stage 1c-bis, corrected
+to an aggregate check in §12) so the ratio is estimated from something
+(`region_exchangeability_gate`). `inf` is
+reported explicitly — never coerced to `NaN` or hidden — when the null rate is zero and
+the observed rate is not; that was the state on every layout before this stage
+(`STAGE1D_B_STOP_REPORT.md` §4.3) and had to stay visible while it was.
+
+Both run alongside the pre-existing edge-level gate (`null_exchangeability`, Stage 1b,
+median ≤ 1.25, unchanged) and are recorded, together with `region_null_mode`,
+`n_lag_draws`, the drawn lags, and the implied sub-track length range, in
+`manifest["gates"]` on every `eiger2 call` run.
+
+### 11.5 `s` and resolution — stated the right way round
+
+`region_fdr_result`'s finite-null resolution is `Delta = s / R`, where
+`s = observed_eligible_edges / null_eligible_edges` and `R` is a region's rank among
+distinct cutoffs. **Smaller `s` is better** — it means more null volume relative to the
+observed track, which is a finer-grained empirical null and therefore a smaller
+quantisation step in the reported q-value. Raising the null's volume (more replicates
+for `"lag"`; more lag draws, `n_lag_draws`, for `"member_step"`) *improves* resolution;
+its cost is runtime, not resolution.
+
+The shipped `"lag"` construction at its `null_replicates=100` default gives
+`s ≈ 0.01`. `member_step`'s `n_lag_draws` was originally set to `150` by measuring `s`
+at genome scale on both real layouts and raising the draw count until `s ≤ 0.01` held
+on the tighter of the two (EPIC-seq): `s = 0.0090` (WGBS chr1), `s = 0.0097` (EPIC-seq)
+at `n_lag_draws = 150`. That target predates the realised-FDR measurement described
+below (§13): once realised FDR was shown to be substantially conservative relative to
+the 5% nominal target, a resolution finer than what a 5% decision needs stopped being
+load-bearing. A sensitivity sweep (`n_lag_draws` in {40, 60, 75, 100, 150}, both real
+layouts, 3 seeds, genome scale) found `n_lag_draws = 75` gives `s ≈ 0.019` with both
+region-level gates still passing and recall/realised FDR unchanged from `150` on every
+cell measured, at ~27% lower wall-clock per cell (closer to a 2x cut in the null
+construction's own share of that time) — the current default. `Eiger2Config.n_lag_draws`'s
+docstring records the full sweep; pass `n_lag_draws=150` explicitly to restore the
+finer resolution.
+
+`manifest["gates"]["s"]` and `manifest["gates"]["implied_region_qvalue_resolution_at_R1"]`
+(identical values; the latter names what `s` actually means for the top-ranked region)
+are recorded on every run so a user can see what their q-values are quantised at
+without re-deriving it from the region-exchangeability edge counts.
+
+### 11.6 `region_null_mode="lag"` — retained, not recommended for inference
+
+Kept so the Stage 1d-B/1d-C measurements stay reproducible and the historical
+comparison can be regenerated. **Fails both region-level gates on every layout
+measured** (§11.2 above) — do not use it for region-level inference. It remains the
+only construction Stage 1c's support-conditioned threshold extends to
+(`region_null_mode="member_step"`/`"off"` force support binning off — the
+per-replicate support reconstruction assumes a per-position member-set formula that
+does not describe `"member_step"`'s concatenated sub-tracks near a boundary; a
+documented limitation, not a silent miscalibration, per `Eiger2Config.region_null_mode`'s
+docstring).
+
+## 12. The adequacy-floor correction: `K=0` under adequate exposure is evidence, not
+absence (Stage 1e Task 1, master spec §8)
+
+STOP 1d-D §9 measured recall = 0.000 on both real layouts at genome scale, with the
+guard (`min_null_regions_for_fdr`) at its shipped default. The cause was diagnosed
+precisely: the member-step null pooled 1,963 regions and was aggregate-adequate
+(`region_exchangeability_ratio = 1.625`, `null_count_adequate = True`), but **zero** of
+them fell in the `10-19` CpG length stratum — exactly where every planted true region
+sat. Stage 1c-bis's per-stratum floor (§8 above discusses the related but distinct
+`m_bonferroni` scoping; this is the null-adequacy guard, `min_null_regions_for_fdr`)
+refused every one of them.
+
+**Read that plainly: the null, given millions of opportunities, essentially never
+produces a region that long. Observing ten of them is about as strong as evidence
+gets. The guard responded by refusing to answer.**
+
+Stage 1c-bis's original reasoning conflated two different situations:
+
+- **Thin but populated** — a handful of null regions in a stratum, so a count-based
+  ratio estimated from it would be noisy.
+- **Empty because the null cannot produce them** — not missing information. Decisive
+  information, given the run as a whole is adequately backed by null volume.
+
+The finite-null uncertainty layer this document builds in §1–§7 already handles the
+second case correctly and was never the problem: `K=0` at a cutoff gives a point
+estimate `q = s·0/R = 0` and a **finite** Garwood upper bound `s·U(K=0)/R` (§6). Neither
+depends on how many null regions happened to land in that particular stratum — the
+Garwood interval is a function of `K`, `m_bonferroni`, and `scale` (itself a function of
+`observed_edges`/`null_edges`, run-level quantities), not of a per-stratum pool size. A
+stratum backed by an empty pool and a stratum backed by a huge pool that also happens to
+have zero exceedances at the same cutoff get *identical* `qvalue_upper_95` — as they
+should, since both report the same `K=0`. The Stage 1c-bis floor short-circuited this
+machinery before it could run, discarding a correct, already-implemented answer in favor
+of `NaN`.
+
+**The fix moves the adequacy floor off per-stratum realised region counts and onto
+aggregate adequacy.** `min_null_regions_for_fdr` (`Eiger2Config`, `region_fdr_result`) is
+now checked **once, globally**: pooled null regions summed across every stratum and
+every replicate. If the run as a whole fails this, everything is refused exactly as
+before — that Stage 1c-bis behaviour is unchanged. If the run passes, **every** stratum
+is let through the tail-area estimator, including ones whose own pool is exactly empty.
+`diagnostics["insufficient_null_strata"]` is retained for schema (`"2.2"`) compatibility
+and is now always `[]`; a stratum whose own pool is empty is instead named, with its
+exposure (pooled count, replicate count), in
+`diagnostics["zero_exceedance_strata"]` — reported, not refused, so a reader can see the
+evidence was real rather than absent.
+
+Two alternatives were considered and rejected:
+
+- **Length-neighbour pooling for an empty stratum.** This reintroduces exactly the
+  length bias stratification exists to remove (§1c.6 above), and a cruder version of it
+  was removed in the Stage 1c-bis review for causing a non-monotonic refusal ladder
+  (§1c-bis's own review, cited in `core.py`). Not needed: `K=0` under adequate aggregate
+  exposure is already informative on its own.
+- **Relabelling the refusal as "indeterminate" rather than `NaN`.** Better wording for
+  the wrong answer. The region should get a q-value, not a more politely-worded refusal.
+
+**This is the third correction recorded in this file** (after the direction/tie-aware
+denominator fix in §3–§4 and the region-null autocorrelation fix in §11), and the
+pattern is worth naming plainly: **every defect in this sequence came from validating a
+null on one moment and not the one the estimator actually depends on.** §3–§4's fix
+validated the q-value's monotonicity assumption, not just its point value. §11's fix
+validated the region-level null's autocorrelation, not just its marginal distribution.
+This fix validated the adequacy guard's unit of analysis — the run as a whole, which is
+what `scale` and the Garwood interval are actually computed against — not a per-stratum
+count that the estimator never needed subdivided that finely to begin with.
+
+## 13. Calibrated, or conservative? Quantifying the realised-FDR claim (Stage 1f Task 2,
+master spec pre-release)
+
+STOP 1e reported realised FDR of exactly `0.0000` in 25 of 26 measured planted-signal
+cells (`benchmarking/results_v210/gap_sweep.csv`, 20 cells, plus the dedicated
+`missingness`-scenario measurement, 6 cells; `STAGE1D_D_STOP_REPORT.md` §6.4 and
+`STAGE1E_STOP_REPORT.md` §2). **That is not, on its own, evidence of calibration at
+5%.** With 6–16 significant calls per cell, both "controls FDR at 0.05" and
+"substantially conservative" predict roughly zero observed false positives — the two
+hypotheses are not distinguishable cell by cell. The question has to be asked of the
+**pooled** count, not read off individual cells.
+
+**Pooled across all 26 cells: 293 significant calls, 1 false positive.** (One extra
+candidate at `wgbs_real`, seed 1, `max_cpg_gap_bp=100` — §11.4's small-`n` caveat,
+not smoothed over.) The realised-FDR point estimate is `1/293 = 0.0034` (0.34%). The
+one-sided 95% Clopper–Pearson upper bound on the true FDR given this count is:
+
+```
+upper_95 = Beta.ppf(0.95, false_positives + 1, significant_calls - false_positives)
+         = Beta.ppf(0.95, 2, 292)
+         = 0.0161
+```
+
+**The 95% upper bound is 1.6%, comfortably below the 5% nominal target.** For scale:
+if the true FDR were exactly 5%, the expected false-positive count at 293 calls would
+be `14.65`, and the probability of observing 1 or fewer is `4.9 x 10^-6`
+(`scipy.stats.binom.cdf(1, 293, 0.05)`) — essentially impossible. The pooled data
+reject "calibrated at exactly 5%" and are consistent with "substantially
+conservative", the same direction STOP 1e's own DMR-free calibration numbers already
+pointed (`benchmarking/results_v210/calibration_member_step.csv`: Gate 2 ratios
+0.6–1.6, comfortably under the 3.0 gate, on every completed cell).
+
+**Say "conservative", not "calibrated".** This is the honest reading of the evidence,
+it is the safe direction for a discovery tool (a conservative FDR estimator
+under-calls before it over-calls), and it names where power is being left on the
+table — a reader comparing this method to one that reports realised FDR nearer 5%
+should not conclude EIGER is "better calibrated"; the fair comparison is at matched
+realised FDR, which is not what 293-vs-1 data can establish on its own.
+Overclaiming calibration on evidence that cannot distinguish "controls FDR" from
+"substantially conservative" would be the one thing to undermine an otherwise
+careful record — this section exists so the claim actually matches the evidence
+behind it. Quantifying exactly how conservative (a power curve against a
+"realised FDR near nominal" boundary, not the comfortably-detectable signal grid
+`DEFAULT_STRATA` provides) is Stage 1f Task 3's paper-grid work, not resolved here.
+
+---
+
 See also: [`docs/PROBABILITY.md`](PROBABILITY.md) for the identical direction/tie fix
 applied to `probability._tail_area_fdr` and its effect on `region_evidence_score`.

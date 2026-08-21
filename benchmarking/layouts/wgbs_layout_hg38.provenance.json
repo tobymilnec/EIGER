@@ -1,0 +1,16 @@
+{
+  "source_accession": "GSM5652215",
+  "beta_file": "GSM5652215_Heart-Cardiomyocyte-Z0000044P.hg38.beta",
+  "beta_sha256_head16": "7f30d21824314be6",
+  "cpg_index_file": "CpG.bed.gz",
+  "cpg_index_sha256_head16": "829d3a9e904809f4",
+  "cpg_index_rows": 29401795,
+  "chromosomes": [
+    "chr1",
+    "chr7",
+    "chr19"
+  ],
+  "n_cpg": 5103604,
+  "contains": "CpG position and total read depth only; the methylated channel is discarded and never written",
+  "fixture_bytes": 9767738
+}

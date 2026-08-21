@@ -136,7 +136,7 @@ def _classify(
     recovered: set[int] = set()
     for start, end in called:
         matched = False
-        for index, (t_start, t_end, _, _) in enumerate(truth):
+        for index, (t_start, t_end, _, _, *_run) in enumerate(truth):
             overlap = min(end, t_end) - max(start, t_start) + 1
             if overlap >= min_overlap:
                 recovered.add(index)
@@ -227,45 +227,103 @@ def exchangeability(
     scenarios: Sequence[str],
     *,
     statistic: str = "correlation",
+    layout: str = "dense",
+    max_cpg_gap_bp: int | None = 300,
 ) -> pd.DataFrame:
-    """Split-half null self-consistency check, per spec §1b.3.
+    """The three permanent null-construction gates, per DMR-free scenario/seed/layout.
 
-    For each DMR-free scenario/seed: generate null replicates, split into
-    calibration/held-out halves, threshold on the calibration half, measure
-    exceedance on the held-out half (the control -- must equal
-    ``1 - null_quantile``) and on the observed track (the actual gate).
+    Edge-level (spec §1b.3, unchanged): split null replicates into calibration/
+    held-out halves, threshold on the calibration half, measure exceedance on the
+    held-out half (the control -- must equal ``1 - null_quantile``) and on the
+    observed track (the actual gate; median across seeds must be <= 1.25).
+
+    Gate 1 -- ACF match, Gate 2 -- region-level exchangeability (both master spec
+    §6.2, new in Stage 1d-B): computed from the SAME tracks/statistic already built
+    for the edge-level gate, not a second simulation. Both gates are expected to
+    FAIL on current code at every layout (master spec §6.3's baseline) -- this
+    function reports the numbers; it does not gate on them.
     """
 
     from eiger2.core import (
         Eiger2Config,
+        acf_gate,
         centre_cpgs,
         deflate,
         edge_statistic,
         eligible_edges,
         estimate_latent_basis,
         null_exchangeability,
+        null_threshold,
         null_tracks,
+        region_exchangeability_gate,
+        segment,
     )
 
     rows: list[dict] = []
     for scenario_name in scenarios:
         for seed in seeds:
             matrix, locations, _ = simulate(
-                seed=seed, strata=[], replicates=0,
-                spacing=20000, **SCENARIOS[scenario_name],
+                seed=seed, strata=[], replicates=0, spacing=20000,
+                layout=layout, max_cpg_gap_bp=max_cpg_gap_bp,
+                **SCENARIOS[scenario_name],
             )
-            config = Eiger2Config(statistic=statistic, random_seed=seed)
+            config = Eiger2Config(
+                statistic=statistic, random_seed=seed, max_cpg_gap_bp=max_cpg_gap_bp,
+            )
             residuals = centre_cpgs(matrix)
             basis, _ = estimate_latent_basis(residuals, config)
             deflated = deflate(residuals, basis, missing=config.deflation_missing)
             statistic_track = edge_statistic(deflated, config)
             eligible = eligible_edges(locations, config)
             tracks = null_tracks(deflated, config, locations)
-            result = null_exchangeability(tracks, statistic_track, eligible, config)
+            edge_gate = null_exchangeability(tracks, statistic_track, eligible, config)
+            acf_result = acf_gate(statistic_track, eligible, tracks, config.window)
+
+            threshold, _ = null_threshold(
+                deflated, config, locations, tracks=tracks,
+                statistic=statistic_track, eligible=eligible,
+            )
+            observed_regions = segment(
+                statistic_track, eligible, threshold,
+                min_cpgs=config.min_cpgs, max_gap_edges=config.max_gap_edges,
+            )
+            null_regions_total = 0
+            null_edge_total = 0
+            for track, null_eligible, _lag in tracks:
+                usable = null_eligible & np.isfinite(track)
+                null_edge_total += int(usable.sum())
+                found = segment(
+                    track, usable, threshold,
+                    min_cpgs=config.min_cpgs, max_gap_edges=config.max_gap_edges,
+                )
+                null_regions_total += len(found)
+            region_gate = region_exchangeability_gate(
+                observed_regions=len(observed_regions),
+                observed_eligible_edges=int(
+                    np.sum(eligible & np.isfinite(statistic_track))
+                ),
+                null_regions_total=null_regions_total,
+                null_eligible_edges=null_edge_total,
+                min_null_regions_for_fdr=config.min_null_regions_for_fdr,
+            )
             rows.append({
-                "scenario": scenario_name, "seed": seed,
+                "layout": layout, "scenario": scenario_name, "seed": seed,
                 "n_cpg": int(matrix.shape[0]), "n_samples": int(matrix.shape[1]),
-                **result,
+                **edge_gate,
+                "acf_gate_passed": acf_result["passed"],
+                "acf_diff_by_lag": dict(acf_result["diff"]),
+                "region_exchangeability_ratio": region_gate[
+                    "region_exchangeability_ratio"
+                ],
+                "region_exchangeability_null_count_adequate": region_gate[
+                    "null_count_adequate"
+                ],
+                "region_exchangeability_null_regions_total": region_gate[
+                    "null_regions_total"
+                ],
+                "region_exchangeability_observed_regions": region_gate[
+                    "observed_regions"
+                ],
             })
     return pd.DataFrame(rows)
 
@@ -343,6 +401,101 @@ def heuristic_sweep(
                         "target_fdr": target_fdr,
                         "runtime_seconds": elapsed,
                     })
+    return pd.DataFrame(rows)
+
+
+#: max_cpg_gap_bp values swept (master spec §6.1). q90 of chr1's all-CpG
+#: inter-gap distribution is ~256bp, so the 300bp default sits on the shoulder
+#: of the gap distribution; this has never been examined despite getting the
+#: same scrutiny window/min_cpgs get.
+GAP_SWEEP_VALUES: tuple[int, ...] = (100, 200, 300, 500, 1000)
+
+
+def gap_sweep(
+    seeds: Sequence[int],
+    *,
+    layouts: Sequence[str] = ("wgbs_real", "epic_fitted"),
+    strata: list | None = None,
+    replicates: int = 4,
+    spacing: int = 7000,
+    dmr_length: int = 8,
+    n_samples: int = 60,
+    min_overlap: int = 8,
+    target_fdr: float = 0.05,
+    region_null_mode: str = "member_step",
+) -> pd.DataFrame:
+    """Sweep ``max_cpg_gap_bp`` on real layouts (master spec §6.1).
+
+    Reports, per layout x seed x gap value: the run-length distribution and
+    ``layout_max_detectable_region_cpgs`` (via ``manifest["layout"]``, i.e.
+    ``describe_layout``), the candidate region count, and the realised FDR
+    (matching ``heuristic_sweep``'s convention -- a single planted-signal run's
+    empirical false-positive rate, not a DMR-free calibration estimate).
+    Requires a full repo checkout (the vendored fixture); see
+    ``eiger2.benchmark._fixture_dir``.
+
+    ``spacing=7000`` (default): with ``replicates=4`` and the 4-tuple
+    ``DEFAULT_STRATA``, this gives ``n_cpg = spacing * 16 + 400 ~= 112,400`` --
+    comfortably above ``region_null_mode="member_step"``'s genome-scale
+    minimum-input floor (``null_min_lag * (min_subtrack_length + window - 1)``
+    = 103,000 at defaults). Below Stage 1e Task 1 (master spec §8), which
+    fixed the null-adequacy floor from a per-stratum to an aggregate check,
+    ``realised_fdr`` was structurally ``NaN`` at every gap value on both real
+    layouts even at genome scale (`results_gap_sweep/PROVISIONAL.md`) -- the
+    fix, not a scale change, is what makes this column populate now; the
+    scale change (400 -> 7000) is what makes ``region_null_mode="member_step"``
+    (the shipped default, used here rather than overridden to ``"lag"``)
+    reachable at all on this sweep's matrix size.
+    """
+
+    strata = strata if strata is not None else DEFAULT_STRATA
+    rows: list[dict] = []
+    for layout in layouts:
+        for seed in seeds:
+            for gap in GAP_SWEEP_VALUES:
+                matrix, locations, truth = simulate(
+                    n_samples=n_samples, strata=strata, replicates=replicates,
+                    spacing=spacing, dmr_length=dmr_length, layout=layout,
+                    max_cpg_gap_bp=gap, seed=seed,
+                )
+                config = Eiger2Config(
+                    max_cpg_gap_bp=gap, target_fdr=target_fdr,
+                    region_null_mode=region_null_mode,
+                )
+                regions, _, manifest = call_dmrs(matrix, locations, config=config)
+                run_lengths = manifest["layout"]["layout_eligible_run_lengths_edges"]
+                candidates = int(manifest.get("n_regions", 0))
+                called = _v2_called(regions)
+                true_positive, false_positive, recovered = _classify(
+                    called, truth, min_overlap=min_overlap
+                )
+                n_called = true_positive + false_positive
+                rows.append({
+                    "layout": layout, "seed": seed, "max_cpg_gap_bp": gap,
+                    "layout_eligible_fraction": manifest["layout"][
+                        "layout_eligible_fraction"
+                    ],
+                    "layout_run_q50_edges": run_lengths["q50"],
+                    "layout_run_q90_edges": run_lengths["q90"],
+                    "layout_run_max_edges": run_lengths["max"],
+                    "layout_max_detectable_region_cpgs": manifest["layout"][
+                        "layout_max_detectable_region_cpgs"
+                    ],
+                    "n_dmrs_requested": locations.attrs.get("n_dmrs_requested"),
+                    "n_dmrs_not_plantable": locations.attrs.get(
+                        "n_dmrs_not_plantable"
+                    ),
+                    "candidate_regions": candidates,
+                    "significant_regions": n_called,
+                    "true_positive": true_positive,
+                    "false_positive": false_positive,
+                    "realised_fdr": (
+                        false_positive / n_called if n_called else np.nan
+                    ),
+                    "recall": len(recovered) / len(truth) if truth else np.nan,
+                    "n_truth": len(truth),
+                    "target_fdr": target_fdr,
+                })
     return pd.DataFrame(rows)
 
 
@@ -472,7 +625,7 @@ def calibration(
                 end = int(row["cpg_index_end"])
                 is_true = any(
                     min(end, t_end) - max(start, t_start) + 1 >= min_overlap
-                    for t_start, t_end, _, _ in truth
+                    for t_start, t_end, _, _, *_run in truth
                 )
                 region_rows.append({
                     "scenario": scenario, "seed": seed,
@@ -635,6 +788,25 @@ def command_sweep(args: argparse.Namespace) -> None:
     print(summary.to_string(index=False))
 
 
+def command_gap_sweep(args: argparse.Namespace) -> None:
+    out = Path(args.out_dir)
+    seeds = list(range(args.seeds))
+    # "dense" has one giant eligible run regardless of max_cpg_gap_bp -- nothing
+    # for this sweep to show -- so it is dropped even if present in --layouts.
+    real_layouts = [layout for layout in args.layouts if layout != "dense"]
+    frame = gap_sweep(seeds, layouts=real_layouts or ["wgbs_real", "epic_fitted"])
+    _write(frame, out / "gap_sweep.csv")
+    summary = _summarise(
+        frame, ["layout", "max_cpg_gap_bp"],
+        ["layout_eligible_fraction", "layout_run_q50_edges",
+         "layout_run_q90_edges", "layout_max_detectable_region_cpgs",
+         "candidate_regions", "significant_regions", "realised_fdr", "recall",
+         "n_dmrs_not_plantable"],
+    )
+    _write(summary, out / "gap_sweep_summary.csv")
+    print(summary.to_string(index=False))
+
+
 def command_scaling(args: argparse.Namespace) -> None:
     out = Path(args.out_dir)
     seeds = list(range(args.scaling_seeds))
@@ -669,26 +841,58 @@ def command_calibration(args: argparse.Namespace) -> None:
 
 
 def command_exchangeability(args: argparse.Namespace) -> None:
+    """Master spec §6.2 (Stage 1d-B): all three permanent null-construction gates,
+    across every layout x scenario. Both new gates are expected to FAIL on current
+    code, at every layout -- this reports the numbers and fixes nothing."""
+
     out = Path(args.out_dir)
     seeds = list(range(args.seeds))
-    frame = exchangeability(seeds, args.scenarios, statistic=args.statistic)
+    frame = pd.concat(
+        [
+            exchangeability(seeds, args.scenarios, statistic=args.statistic, layout=layout)
+            for layout in args.layouts
+        ],
+        ignore_index=True,
+    )
     _write(frame, out / "exchangeability.csv")
-    summary = frame.groupby("scenario")[
-        ["p_null", "p_obs", "null_exchangeability_ratio"]
-    ].mean()
-    print(summary.round(4).to_string())
-    per_scenario = frame.groupby("scenario")["null_exchangeability_ratio"].median()
-    print("\nper-scenario median (the gate):")
-    print(per_scenario.round(4).to_string())
+
+    print("--- Edge-level gate (spec §1b.3, retained unchanged; median <= 1.25) ---")
+    per_cell = frame.groupby(["layout", "scenario"])["null_exchangeability_ratio"]
+    print(per_cell.mean().round(4).to_string())
+    medians = per_cell.median()
+    print("\nper layout x scenario median (the gate):")
+    print(medians.round(4).to_string())
     outliers = frame[frame["null_exchangeability_ratio"] > 1.25]
     if len(outliers):
-        print(f"\n{len(outliers)} per-instance outlier(s) above 1.25 (reported, "
-              f"not gated):")
-        print(outliers[["scenario", "seed", "null_exchangeability_ratio"]]
-              .to_string(index=False))
-    worst_median = float(per_scenario.max())
-    print(f"\nworst per-scenario median: {worst_median:.3f} "
-          f"({'PASS' if worst_median <= 1.25 else 'FAIL'} at gate 1.25)")
+        print(f"\n{len(outliers)} of {len(frame)} per-instance outlier(s) above "
+              f"1.25 (reported, not gated)")
+    worst = float(medians.max())
+    print(f"worst layout x scenario median: {worst:.3f} "
+          f"({'PASS' if worst <= 1.25 else 'FAIL'} at gate 1.25)")
+
+    print("\n--- Gate 1: ACF match (master spec §6.2; every lag within +-0.05) ---")
+    pass_rate = frame.groupby(["layout", "scenario"])["acf_gate_passed"].mean()
+    print(pass_rate.round(4).to_string())
+    overall = bool(frame["acf_gate_passed"].all())
+    print(f"every instance must pass: {'PASS' if overall else 'FAIL'} "
+          f"({int(frame['acf_gate_passed'].sum())} of {len(frame)} instances passed)")
+
+    print("\n--- Gate 2: region-level exchangeability (master spec §6.2; "
+          "median <= 3.0) ---")
+    n_inf = int(np.isinf(frame["region_exchangeability_ratio"]).sum())
+    print(f"{n_inf} of {len(frame)} instances: ratio = inf (null_rate is zero, "
+          f"reported explicitly, not hidden)")
+    n_inadequate = int((~frame["region_exchangeability_null_count_adequate"]).sum())
+    print(f"{n_inadequate} of {len(frame)} instances: pooled null-region count "
+          f"below min_null_regions_for_fdr (ratio not estimated from an adequate "
+          f"null)")
+    region_medians = frame.groupby(["layout", "scenario"])[
+        "region_exchangeability_ratio"
+    ].median()
+    print(region_medians.round(4).to_string())
+    worst_region = float(region_medians.max())
+    print(f"worst layout x scenario median: {worst_region:.3f} "
+          f"({'PASS' if worst_region <= 3.0 else 'FAIL'} at gate 3.0)")
 
 
 def command_region_rate(args: argparse.Namespace) -> None:
@@ -742,8 +946,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=[
         "negative", "sweep", "scaling", "calibration", "exchangeability",
-        "region_rate", "all",
+        "region_rate", "gap_sweep", "all",
     ])
+    parser.add_argument(
+        "--layouts", nargs="+", default=["dense", "wgbs_real", "epic_fitted"],
+        choices=["dense", "wgbs_real", "epic_fitted"],
+        help="gap_sweep/exchangeability: layouts to sweep ('dense' is fixture-free; "
+             "wgbs_real/epic_fitted need a repo checkout). gap_sweep silently drops "
+             "'dense' -- it has no gap sensitivity to show.",
+    )
     parser.add_argument("--out-dir", default="benchmark_v2")
     parser.add_argument("--seeds", type=int, default=10,
                         help="number of simulation seeds (0..seeds-1)")
@@ -770,6 +981,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "calibration": command_calibration,
         "exchangeability": command_exchangeability,
         "region_rate": command_region_rate,
+        "gap_sweep": command_gap_sweep,
         "all": command_all,
     }
     started = time.perf_counter()

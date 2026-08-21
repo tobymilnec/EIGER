@@ -1,5 +1,18 @@
 # Reproducing the published and thesis results
 
+> **Historical record — commands below reflect the code as it existed when these
+> results were produced (pre-v2.1.0).** Runs 2 and 4 (`--fdr-replicates`,
+> `--null-mode permutation`) no longer execute on the current codebase: both used an
+> edge-wise permutation null, measured to produce zero usable null regions, and both
+> now raise immediately naming `region_null_mode="member_step"` as the replacement.
+> Run 4's original motivation — large-cohort q-value saturation — is resolved by that
+> replacement instead; see [docs/FDR.md](../docs/FDR.md) §11-§12 and `README.md`'s
+> "Large cohorts" section. The numbers below are kept unchanged as the historical
+> citation record for the published/thesis results; they are not reproducible
+> verbatim on the current release, and re-running this cohort under v2.1.0 to obtain
+> current numbers has not been done as part of this release (the cohort is
+> controlled-access and was not available in this environment).
+
 Every number quoted in the README, the thesis benchmarking chapter and the
 reviewer response was produced by one of the four commands below. Each was run
 against a single input file whose SHA-256 prefix is recorded, so a reviewer can

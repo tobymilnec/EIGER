@@ -30,6 +30,7 @@ post-selection and no q-value is attached to it.
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -61,19 +62,11 @@ __all__ = [
 
 
 _DEFAULT_SUPPORT_DISPERSION_CUT = 0.5
-# calibrated (Stage 1c, Task 8): 5 standard scenarios x 10 seeds each
-# (benchmarking/benchmark_suite.py::SCENARIOS, strata=DEFAULT_STRATA,
-# replicates=6, spacing=400), support_binned_threshold="off" so dispersion is
-# recorded but binning cannot activate. clean/nuisance/small_n/high_noise
-# (missing_rate=0.0) measured support_dispersion == 0.0 at every seed --
-# structurally exact, since with no missingness every eligible window has
-# full support and the 90th/10th percentile spread is zero. missingness
-# (missing_rate=0.25) measured support_dispersion in [1.0417, 1.1250],
-# median 1.0833. 0.5 sits near the midpoint of the separating gap (0, 1.0417)
-# -- comfortable margin either side (0.5 above the four-scenario ceiling,
-# 0.5417 below the missingness floor) -- and was verified to reproduce
-# auto_on for missingness and auto_off for the other four at every one of
-# the 50 scenario x seed combinations tested. See STOP 1c report.
+# Measured across standard benchmark scenarios: with no missingness, support
+# dispersion is structurally 0 (every eligible window has full support, so the
+# 90th/10th percentile spread is zero); under 25% structured missingness it
+# measured 1.04-1.13. 0.5 sits with comfortable margin on both sides of that
+# gap and reliably separates the two regimes.
 
 
 @dataclass(frozen=True)
@@ -82,15 +75,12 @@ class Eiger2Config:
 
     # --- discovery statistic
     statistic: str = "correlation"
-    """``"correlation"`` (scale-free, recommended) or ``"covariance"``.
-
-    Covariance is retained because it is what EIGER 1 published, and because it
-    carries effect-size information that correlation deliberately discards. Be
-    aware that for a two-group structure with minor fraction ``f`` and effect
-    ``delta`` the adjacent covariance is ``f(1-f)delta**2`` — it is intrinsically
-    prevalence-limited and cannot see rare subgroups. Correlation for the same
-    structure is ``f(1-f)delta**2 / (f(1-f)delta**2 + sigma**2)``, which
-    saturates towards 1 for any ``f`` once ``delta`` exceeds the noise.
+    """``"correlation"`` (scale-free, recommended) or ``"covariance"`` (carries
+    effect-size information but is intrinsically prevalence-limited: for a
+    two-group structure with minor fraction ``f`` and effect ``delta``, the
+    adjacent covariance is ``f(1-f)delta**2`` and cannot see rare subgroups,
+    whereas correlation, ``f(1-f)delta**2 / (f(1-f)delta**2 + sigma**2)``,
+    saturates towards 1 for any ``f`` once ``delta`` exceeds the noise).
     """
 
     window: int = 4
@@ -118,16 +108,15 @@ class Eiger2Config:
     deflation_max_concentration: float = 0.10
     """Only project out components whose genomic loading is DIFFUSE.
 
-    A nuisance factor (purity, composition, batch) loads on the whole genome; a
-    biological subgroup — cell type, tumour status, a rare clone — loads on
-    marker regions. Measuring what fraction of a component's loading energy sits
-    in the top 1% of CpGs separates them cleanly: nuisance components score
-    0.08-0.09, biological components 0.15-0.40.
-
-    Without this filter, blind deflation deletes exactly the signal EIGER exists
-    to find. On a cohort of 4 cell types plus tumour status plus a rare subgroup,
-    parallel analysis selects K=5 and recovery collapses from 70/70 regions to
-    0/70. Set to 1.0 to disable the filter and deflate every component.
+    A nuisance factor (purity, composition, batch) loads on the whole genome;
+    a biological subgroup (cell type, tumour status, a rare clone) loads on
+    marker regions. The fraction of a component's loading energy in the top
+    1% of CpGs separates them cleanly: nuisance components score 0.08-0.09,
+    biological components 0.15-0.40. Without this filter, blind deflation
+    deletes exactly the signal EIGER exists to find -- on a cohort of 4 cell
+    types plus tumour status plus a rare subgroup, parallel analysis selects
+    K=5 and recovery collapses from 70/70 regions to 0/70. Set to 1.0 to
+    disable the filter and deflate every component.
     """
 
     deflation_concentration_quantile: float = 0.01
@@ -174,31 +163,103 @@ class Eiger2Config:
     null_stride: int = 1
 
     null_mode: str = "lag"
-    """``"lag"`` or ``"permutation"``.
+    """``"lag"`` is the only supported value for the edge-level null: it builds
+    the null by pairing CpGs far apart on the same chromosome, testing *is
+    there any regional coordination here?*
 
-    ``lag`` builds the null by pairing CpGs far apart on the same chromosome.
-    It tests *is there any regional coordination here?* That hypothesis is
-    informative at modest cohort sizes but becomes trivially false as the
-    cohort grows: with several hundred samples the edge statistic is estimated
-    precisely, genuine regional coordination exists across most of the genome,
-    and every called region clears a threshold set from a near-zero null. On a
-    519-sample cohort every one of 73,784 regions received q = 0, which is
-    arithmetically correct and completely uninformative.
+    ``"permutation"`` (edge-wise permutation of the observed statistic within
+    each chromosome) is no longer available: it destroys the same run-length
+    autocorrelation the region-level null depends on, measured at zero usable
+    null regions. Requesting it raises immediately, naming the replacement.
+    The large-cohort saturation problem it was written to fix (a null that
+    becomes trivially uninformative once genuine coordination is estimated
+    precisely across most of the genome) is addressed by ``region_null_mode``
+    below instead.
 
-    ``permutation`` instead permutes the observed edge statistic within each
-    chromosome. The marginal distribution of local coordination is preserved
-    exactly -- it is the same multiset of values -- while its genomic
-    arrangement is destroyed. The hypothesis becomes *is this run of
-    coordination longer or stronger than chance, given how much coordination
-    the genome contains?* That question stays answerable at any cohort size,
-    because the null can never be shifted away from the data's own marginal.
+    Sign-agnostic: a hypomethylated region produces the same positive adjacent
+    correlation as a hypermethylated one. Direction is recovered afterwards
+    from delta beta.
+    """
 
-    Both are sign-agnostic: a hypomethylated region produces the same positive
-    adjacent correlation as a hypermethylated one, since both endpoints move
-    together. Direction is recovered afterwards from delta beta.
+    region_null_mode: str = "auto"
+    """``"auto"`` | ``"member_step"`` | ``"lag"`` | ``"off"``. The REGION-level
+    null construction, distinct from ``null_mode`` above (which is edge-level:
+    which edges count as elevated). This axis decides which *runs* of elevated
+    edges are significant.
 
-    Use ``permutation`` above roughly 100 samples, or whenever the lag-null
-    q-values saturate at zero.
+    ``"auto"`` (default): use ``"member_step"`` (below) when the input clears
+    its genome-scale minimum-size floor (``member_step_min_n_cpg(config)``);
+    otherwise fall back to ``"lag"`` automatically, with a warning naming the
+    input size, the required size, and that ``"lag"``'s q-values are not
+    calibrated (``call_dmrs`` records ``manifest["gates"]
+    ["region_null_mode_fallback"]``). An **explicitly** requested
+    ``"member_step"`` (below) does NOT fall back: a caller who asked for it by
+    name is told it cannot be done on this input, not silently given
+    something else.
+
+    ``"member_step"``: consecutive null "positions" step by one LAG (not one
+    CpG), so they share ``window - 1`` of ``window`` members exactly as
+    consecutive OBSERVED windows do -- reproducing the observed track's
+    autocorrelation by construction, which ``"lag"`` (below) does not (see
+    ``member_step_lag_null_ensemble``). Passes both region-level gates on real
+    layouts at genome scale with recall identical to ``"lag"``; see
+    ``docs/FDR.md``. Raises below its minimum-size floor rather than
+    degrading silently -- use ``"auto"`` (default) unless you specifically
+    want that raise.
+
+    ``"lag"``: the region-level null built the same way as the edge-level one
+    -- consecutive positions slide by one CpG rather than sharing members the
+    way the observed track does. **Fails region-level exchangeability on real
+    layouts** -- do not request it directly for region-level inference; kept
+    for small inputs (``"auto"``'s fallback) and reproducibility. Still the
+    edge-level null every ``null_mode`` uses; only the REGION-level use of it
+    is not recommended.
+
+    ``"off"``: no region null is built at all. ``region_qvalue`` and every
+    inferential column are refused (``NaN`` / ``-1`` / ``significant=False``)
+    via the same degenerate path ``region_fdr_result`` already takes for
+    ``replicates == 0`` -- an explicit, cheap "candidates only, no region FDR"
+    mode, not a new refusal mechanism.
+    """
+
+    n_lag_draws: int = 75
+    """``region_null_mode="member_step"`` only: number of independent lag draws
+    pooled into the null, each treated as one "replicate" -- directly
+    comparable to ``null_replicates`` for the ``"lag"`` construction.
+
+    Derived from a resolution target, not convenience: finite-null resolution
+    is ``Delta = s / R`` where ``s = observed_eligible_edges /
+    null_eligible_edges`` -- SMALLER ``s`` is better, since it means MORE null
+    volume. Each lag draw contributes about one observed track's worth of null
+    positions, so ``s ~ 1.3-1.45 / n_lag_draws``.
+
+    A sensitivity sweep (``n_lag_draws`` in {40, 60, 75, 100, 150}, both real
+    layouts, 3 seeds each, genome scale) measured `s = 0.0187-0.0195` at
+    `n_lag_draws=75` -- comfortably resolving decisions at a 0.05 target -- with
+    both region-level gates passing, an adequate pooled null, and recall/realised
+    FDR unchanged from `150` (1.0 / 0.0 throughout) on every cell. `150` was
+    chosen to match `s <= 0.01`, the resolution `null_replicates=100` was
+    originally picked for; that target predates the corrected realised-FDR
+    measurement (a 95% upper bound of 1.6% against the 5% nominal target, i.e.
+    substantially conservative), which the extra resolution beyond `75` was not
+    found to be buying. `75` cuts measured wall-clock at genome scale from
+    ~219s to ~160s per cell (~27%, and closer to a 2x cut in the null
+    construction's own share of that time) with no measured cost to any gate.
+    Set `n_lag_draws=150` explicitly to restore the previous default if
+    resolution finer than 0.02 is specifically wanted.
+    """
+
+    min_subtrack_length: int = 100
+    """``region_null_mode="member_step"`` only: the shortest sub-track length a
+    drawn lag is allowed to produce. Bounds the maximum lag drawable:
+    ``L_max = n_cpg // (min_subtrack_length + window - 1)``; lags are drawn
+    uniformly from ``[null_min_lag, L_max]``. Raises (naming ``n_cpg``,
+    ``null_min_lag``, and the implied minimum input size) rather than silently
+    degrading when ``L_max < null_min_lag`` -- a too-small floor produces
+    short sub-tracks and an inadequate null silently. Use
+    ``region_null_mode="lag"`` on inputs too small for ``"member_step"``, not
+    a smaller ``min_subtrack_length``: a shorter floor reintroduces the
+    segmentation edge effects it exists to prevent.
     """
 
     # --- segmentation
@@ -216,13 +277,13 @@ class Eiger2Config:
     min_paired_fraction: float = 0.0
     """Minimum fraction of the cohort observed at *both* CpGs of an edge.
 
-    Off by default, and measured to be counter-productive on the benchmark: at
-    25% structured missingness, raising it from 0.0 to 0.5 dropped recovery from
-    45/48 to 0/48 while *increasing* false regions from 17 to 136, because it
-    removes DMR edges faster than artefact edges and fragments true regions below
-    ``min_cpgs``. Exposed as a diagnostic lever for cohorts with a genuinely
-    bimodal coverage profile; do not raise it without re-running the benchmark on
-    your own missingness pattern.
+    Off by default, and measured to be counter-productive on the benchmark:
+    at 25% structured missingness, raising it from 0.0 to 0.5 dropped
+    recovery from 45/48 to 0/48 while *increasing* false regions from 17 to
+    136 -- it removes DMR edges faster than artefact edges and fragments true
+    regions below ``min_cpgs``. Exposed as a diagnostic lever for cohorts
+    with a genuinely bimodal coverage profile; do not raise it without
+    re-running the benchmark on your own missingness pattern.
     """
     max_cpg_gap_bp: int | None = 300
     min_observed_samples: int = 2
@@ -249,19 +310,15 @@ class Eiger2Config:
     min_sample_fraction: float = 0.0
     """Drop a CpG observed in fewer than this fraction of samples.
 
-    The primary control for targeted assays. On an EPIC-style panel most rows
-    are absent in every sample or present in only a handful, and they cost time
-    at every stage while contributing nothing: an edge needs
-    ``min_paired_samples`` co-observed samples, so a sparsely covered CpG cannot
-    form a usable edge but is still centred, deflated and scanned.
-
-    Setting this to, say, 0.5 typically removes the majority of rows on a panel
-    and is close to free statistically, because those rows could not have
-    contributed edges. Dropped CpGs never appear in the output; the counts and
-    the realised threshold are recorded in the manifest. Region coordinates are
-    reported in the original input indexing, so filtering does not shift them.
-
-    0.0 disables the filter, which is the behaviour of earlier versions.
+    The primary control for targeted assays: on an EPIC-style panel most rows
+    are absent or nearly so, and cost time at every stage while contributing
+    nothing (a sparsely covered CpG cannot form a usable edge, needing
+    ``min_paired_samples`` co-observed samples, but is still centred,
+    deflated and scanned). Setting this to, say, 0.5 typically removes most
+    rows on a panel and is close to free statistically, since those rows
+    could not have contributed edges. Dropped CpGs never appear in the
+    output; region coordinates are reported in the original input indexing,
+    so filtering does not shift them. 0.0 (default) disables the filter.
     """
 
     length_stratified_fdr: bool = True
@@ -281,7 +338,14 @@ class Eiger2Config:
     """``"point"``: significant = region_qvalue <= target_fdr (unchanged from
     v2.0.0). ``"upper"``: significant = region_qvalue_upper_95 <= target_fdr, the
     conservative decision under finite-null uncertainty. Never switches silently --
-    always read from the manifest's ``fdr_decision`` field."""
+    always read from the manifest's ``fdr_decision`` field.
+
+    Depends on ``min_null_regions_for_fdr`` being an aggregate (not
+    per-stratum) check: a stratum whose own null pool is empty still gets a
+    finite ``K=0`` Garwood upper bound rather than being refused, which is
+    what makes this mode usable rather than rejecting almost everything -- see
+    ``docs/FDR.md``.
+    """
 
     min_null_values: int = 1_000
     """Warn below this many usable null positions.
@@ -299,38 +363,58 @@ class Eiger2Config:
 
     compute_posterior: bool = False
     """Attach the per-region two-groups evidence score, ``1 - fdr(area)``.
-
-    ``region_qvalue`` is a tail-area rate: among regions at least this extreme,
-    the expected proportion that are null. ``region_evidence_score`` is the
+    ``region_qvalue`` is a tail-area rate; ``region_evidence_score`` is the
     per-region quantity from :mod:`eiger2.probability`.
 
-    **The output is named a score, not a probability, because measurement says
-    it is not calibrated.** On planted-truth simulations the expected
-    calibration error is 0.35 (with ``pi0 = 1``) to 0.50 (with ``pi0``
-    estimated): regions scoring 0.86 were real 0% of the time. The cause is
-    diagnosed in ``PROBABILITY.md`` §6 — the null tracks are generated from
-    signal-free data, whereas false positives in real data arise beside real
-    signal and inherit its area distribution, so ``f0`` is the wrong null
-    density for them. It is still a useful monotone ranking; it is not a
-    probability, and it must not be thresholded as one.
+    **Named a score, not a probability, because measurement says it is not
+    calibrated.** On planted-truth simulations the expected calibration error
+    is 0.35-0.50: regions scoring 0.86 were real 0% of the time. Cause
+    (``PROBABILITY.md``): null tracks come from signal-free data, but false
+    positives in real data arise beside real signal and inherit its area
+    distribution, so ``f0`` is the wrong null density for them. Still a
+    useful monotone ranking; not a probability, must not be thresholded as
+    one.
 
-    Off by default. A density also needs far more null regions than a tail count
-    does, so enabling this without raising ``null_replicates`` (to 100-300) will
-    usually return ``status = insufficient_null_regions`` and leave the columns
-    NaN, which is the intended behaviour rather than a failure.
+    Off by default. A density also needs far more null regions than a tail
+    count does, so enabling this without raising ``null_replicates`` (to
+    100-300) will usually return ``status = insufficient_null_regions`` and
+    leave the columns NaN -- intended, not a failure.
     """
 
     min_null_regions_for_posterior: int = 50
     """Refuse the posterior below this many pooled null regions."""
 
+    min_null_regions_for_fdr: int = 50
+    """Refuse ``region_qvalue`` for the WHOLE run when the pooled null-region
+    count, summed across every stratum and every replicate, falls below this
+    floor. Below the floor, every inferential column (``region_qvalue`` and
+    friends) becomes ``NaN``, every count column becomes ``-1``,
+    ``significant`` is forced ``False``, and
+    ``manifest["fdr"]["pooled_null_regions"]`` records the total against the
+    floor.
+
+    **This is an AGGREGATE, run-level guard, not a per-stratum one.** A
+    stratum whose OWN pooled null count is thin, or even exactly zero, is not
+    refused once the run as a whole is adequate -- it is let through the
+    estimator like any other stratum, and the Garwood interval it already
+    computes is what represents that thinness (a narrow pool gives a wide
+    ``region_qvalue_upper_95``, not an outright ``NaN``). A stratum whose OWN
+    pool is exactly empty gets ``K=0`` at every cutoff, which is
+    arithmetically well-defined (point estimate ``q=0``, a finite Garwood
+    upper bound) and is recorded, not refused, in
+    ``manifest["fdr"]["zero_exceedance_strata"]`` -- the null having millions
+    of opportunities and never producing a region that long is decisive
+    evidence, not missing information; see ``docs/FDR.md`` and
+    ``region_fdr_result``'s docstring for the arithmetic that justifies it.
+    """
+
     support_binned_threshold: str = "auto"
     """``"auto"`` | ``"on"`` | ``"off"``. When enabled, the null-quantile
     threshold is computed per support bin (samples observed at every CpG in the
-    window) instead of once genome-wide, correcting the region-level FDR
-    inflation that survives Stage 1b's null-window fix under structured
-    missingness. ``"auto"`` enables it only when observed support varies enough
-    to matter (``support_dispersion > support_dispersion_cut``). See
-    docs/FDR.md, "Support conditioning" (added Stage 1e)."""
+    window) instead of once genome-wide, correcting region-level FDR inflation
+    under structured missingness. ``"auto"`` enables it only when observed
+    support varies enough to matter (``support_dispersion >
+    support_dispersion_cut``). See ``docs/FDR.md``, "Support conditioning"."""
 
     support_bins: int = 4
     """Quantile bins for support-conditioned thresholding. Adjacent bins merge
@@ -341,10 +425,7 @@ class Eiger2Config:
     support_dispersion_cut: float | None = None
     """Auto-enable threshold for ``support_binned_threshold="auto"``. ``None``
     uses the calibrated default, ``_DEFAULT_SUPPORT_DISPERSION_CUT = 0.5``
-    (Stage 1c, Task 8: separates the 5 standard scenarios' measured
-    ``support_dispersion`` at 10 seeds/scenario -- clean/nuisance/small_n/
-    high_noise at 0.0, missingness in [1.0417, 1.1250] -- see STOP 1c report),
-    pending Stage 1e's full-scale confirmation."""
+    (see that constant's own comment for the measurement behind it)."""
 
     def __post_init__(self) -> None:
         if self.statistic not in {"correlation", "covariance"}:
@@ -367,6 +448,30 @@ class Eiger2Config:
             raise ValueError("max_gap_edges cannot be negative")
         if self.min_paired_samples < 3:
             raise ValueError("min_paired_samples must be at least 3")
+        if self.min_null_regions_for_fdr < 0:
+            raise ValueError("min_null_regions_for_fdr cannot be negative")
+        if self.null_mode not in {"lag", "permutation"}:
+            raise ValueError("null_mode must be 'lag' or 'permutation'")
+        if self.null_mode == "permutation":
+            raise ValueError(
+                "null_mode='permutation' is broken and no longer supported: "
+                "measured at zero null regions across 400 replicates "
+                "(edge-wise permutation destroys the same autocorrelation "
+                "the corrected 'lag' null exists to preserve). Use the "
+                "default null_mode='lag' for the edge-level null; for the "
+                "region-level null, see region_null_mode='member_step' (or "
+                "leave it at its default 'auto', which resolves to "
+                "'member_step' automatically on input large enough to "
+                "support it)."
+            )
+        if self.region_null_mode not in {"auto", "member_step", "lag", "off"}:
+            raise ValueError(
+                "region_null_mode must be 'auto', 'member_step', 'lag', or 'off'"
+            )
+        if self.n_lag_draws < 1:
+            raise ValueError("n_lag_draws must be positive")
+        if self.min_subtrack_length < 1:
+            raise ValueError("min_subtrack_length must be positive")
         if not 0 <= self.min_paired_fraction <= 1:
             raise ValueError("min_paired_fraction must lie in [0, 1]")
         if not 0 < self.target_fdr < 1:
@@ -586,15 +691,92 @@ def deflate(
 # step 3 — the local co-variation statistic
 # --------------------------------------------------------------------------
 
+# Optional accelerated kernel (the `fast` extra, `pip install eiger[fast]`).
+# numba is NOT a hard dependency: every path below works identically, if more
+# slowly, without it. Import failure of any kind (not installed, incompatible
+# version, no working C compiler for the JIT) falls back to the pure-numpy
+# path silently -- this must never be the reason a user's analysis fails.
+#
+# Even when numba IS installed, this kernel is opt-in, not automatic: it
+# computes the identical quantity via a different summation order (a scalar
+# accumulation loop, not numpy's vectorised reduction), which differs from
+# the numpy path at the ~1e-15 floating-point noise floor (see
+# test_pair_statistic_numba_matches_numpy_nan_pattern_exactly for the
+# measured bound). That is invisible at any statistical scale this method
+# operates at, but it is enough to break exact-equality invariant fixtures
+# elsewhere in the test suite, so a caller must ask for it explicitly --
+# `EIGER2_USE_NUMBA=1` in the environment (the parallel paper-grid sweep this
+# kernel exists for sets it in every worker) -- rather than every user with
+# numba installed for an unrelated reason (e.g. the `legacy` extra) silently
+# getting numerically different results from the same input.
+try:
+    from numba import njit, prange
 
-def _pair_statistic(
+    @njit(cache=True, parallel=True)
+    def _pair_statistic_numba(
+        left: np.ndarray,
+        right: np.ndarray,
+        want_correlation: bool,
+        required: int,
+    ) -> np.ndarray:
+        # fastmath=True MUST NOT be added to this decorator. It was measured
+        # to produce an apparent 60x speedup that was entirely fake:
+        # fastmath permits the compiler to assume no NaNs and elides the
+        # `l == l` finiteness check below, so the kernel silently returned
+        # ALL-NaN. Every downstream gate happened to report "no data" rather
+        # than a wrong number that time, but a different code path could as
+        # easily return a plausible wrong answer instead. See
+        # test_pair_statistic_numba_matches_numpy_nan_pattern_exactly, which
+        # would catch a regression here.
+        n_pairs, n_samples = left.shape
+        out = np.empty(n_pairs, dtype=np.float64)
+        for i in prange(n_pairs):
+            count = 0
+            sum_l = 0.0
+            sum_r = 0.0
+            sum_lr = 0.0
+            sum_ll = 0.0
+            sum_rr = 0.0
+            for j in range(n_samples):
+                lv = left[i, j]
+                rv = right[i, j]
+                if lv == lv and rv == rv:  # finite check; NaN != NaN
+                    count += 1
+                    sum_l += lv
+                    sum_r += rv
+                    sum_lr += lv * rv
+                    if want_correlation:
+                        sum_ll += lv * lv
+                        sum_rr += rv * rv
+            if count < 2 or count < required:
+                out[i] = np.nan
+                continue
+            denom = count - 1
+            cross = sum_lr - sum_l * sum_r / count
+            covariance = cross / denom
+            if want_correlation:
+                var_l = (sum_ll - sum_l * sum_l / count) / denom
+                var_r = (sum_rr - sum_r * sum_r / count) / denom
+                scale = np.sqrt(var_l * var_r)
+                out[i] = covariance / scale if scale > 0 else np.nan
+            else:
+                out[i] = covariance
+        return out
+
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+
+def _pair_statistic_numpy(
     left: np.ndarray,
     right: np.ndarray,
     statistic: str,
     min_paired_samples: int,
     min_paired_fraction: float = 0.0,
 ) -> np.ndarray:
-    """Vectorised pairwise-complete covariance or correlation, row by row.
+    """Pairwise-complete covariance or correlation, row by row -- the
+    reference numpy implementation, always available and always correct.
 
     Pairwise-complete matters: filling missing entries with the CpG mean
     contributes a zero residual to the cross-product while still counting in the
@@ -632,6 +814,39 @@ def _pair_statistic(
         int(np.ceil(min_paired_fraction * left.shape[1])),
     )
     return np.where(counts >= required, result, np.nan)
+
+
+def _pair_statistic(
+    left: np.ndarray,
+    right: np.ndarray,
+    statistic: str,
+    min_paired_samples: int,
+    min_paired_fraction: float = 0.0,
+) -> np.ndarray:
+    """Pairwise-complete covariance or correlation, row by row.
+
+    Uses the fused numba kernel above when the optional ``fast`` extra is
+    installed AND ``EIGER2_USE_NUMBA=1`` is set in the environment
+    (bit-for-bit NaN pattern, max abs difference <= 1e-12 against
+    ``_pair_statistic_numpy`` -- see the acceptance test); otherwise defers
+    to ``_pair_statistic_numpy`` directly. See the module-level comment above
+    the kernel for why this is opt-in rather than automatic.
+    """
+
+    if not (_HAS_NUMBA and os.environ.get("EIGER2_USE_NUMBA") == "1"):
+        return _pair_statistic_numpy(
+            left, right, statistic, min_paired_samples, min_paired_fraction,
+        )
+    required = max(
+        int(min_paired_samples),
+        int(np.ceil(min_paired_fraction * left.shape[1])),
+    )
+    return _pair_statistic_numba(
+        np.ascontiguousarray(left, dtype=np.float64),
+        np.ascontiguousarray(right, dtype=np.float64),
+        statistic != "covariance",
+        required,
+    )
 
 
 def _lag_statistic(
@@ -706,7 +921,7 @@ def _support_bin_edges(
     pooled_null_support: np.ndarray,
 ) -> dict:
     """Quantile bin edges from observed support, merged upward until every bin
-    has at least ``min_null_values`` pooled null values, per spec §1c.2.
+    has at least ``min_null_values`` pooled null values.
 
     Returns ``{"bin_edges": np.ndarray, "merges": list[dict], "collapsed": bool}``.
     ``bin_edges`` has one fewer entry than the final bin count (interior edges
@@ -821,23 +1036,21 @@ def _lag_null_track(
     """One null track: window members are ``lag`` CpGs apart, not adjacent.
 
     The window at null position ``i`` comprises CpGs ``i, i+lag, ..., i+(w-1)*lag``
-    and the statistic is the mean over the complete pairwise set among *those*
+    (rows ``i, i+lag, i+2*lag, ...`` instead of ``i, i+1, i+2, ...``) and the
+    statistic is the mean over the complete pairwise set among *those*
     members: pair ``(a, b)`` is ``S_{b-a}[i + a*lag]`` where
-    ``S_d[j] = stat(CpG j, CpG j + d*lag)``.
+    ``S_d[j] = stat(CpG j, CpG j + d*lag)``. Reusing ``_window_from_lags``
+    here would be wrong: it assumes members sit at consecutive indices, which
+    is true of the observed track and false of this one. See docs/FDR.md,
+    "Null window assembly".
 
-    Reusing ``_window_from_lags`` here would be wrong: it assumes members sit at
-    consecutive indices, which is true of the observed track and false of this
-    one. See docs/FDR.md, "Null window assembly".
-
-    The window at null position ``i`` is made of rows ``i, i+lag, i+2*lag, ...``
-    instead of ``i, i+1, i+2, ...``. Every sample moves together, so batch,
-    purity, cell composition and every other cross-sample dependency survives
-    intact — that is what EIGER 1's per-sample resampling null destroyed, which
-    is why its threshold came out several-fold too low and DMR-free matrices lit
-    up. Consecutive null positions still slide by one CpG, so locally
-    autocorrelated nuisance — runs of low coverage, runs of high missingness —
-    is preserved as well. Only adjacency, and therefore only regional
-    coordination, is broken.
+    Every sample moves together, so batch, purity, cell composition and every
+    other cross-sample dependency survives intact -- that is what EIGER 1's
+    per-sample resampling null destroyed, which is why its threshold came out
+    several-fold too low and DMR-free matrices lit up. Consecutive null
+    positions still slide by one CpG, so locally autocorrelated nuisance
+    (runs of low coverage or high missingness) is preserved as well. Only
+    adjacency, and therefore only regional coordination, is broken.
     """
 
     w = config.window
@@ -868,28 +1081,59 @@ def _lag_null_track(
 
 
 def _null_eligibility(
-    chromosome: np.ndarray | None, lag: int, config: Eiger2Config, size: int
+    chromosome: np.ndarray | None,
+    lag: int,
+    config: Eiger2Config,
+    size: int,
+    observed_eligible: np.ndarray | None = None,
 ) -> np.ndarray:
     """Which null positions are admissible, by the same rule as the data.
 
     The observed track is masked by :func:`eligible_edges`, which forbids an
-    edge spanning two chromosomes. The null must be masked by a rule of the same
-    kind, or the two are not passed through the identical segmenter and the
-    calibration argument does not hold. A null position ``i`` at lag ``L`` draws
-    on rows ``i, i+L, ..., i+(w-1)L``; it is admissible only if all of them lie
-    on one chromosome.
+    edge spanning two chromosomes OR whose bp gap exceeds ``max_cpg_gap_bp``.
+    The null must be masked the same way, or the two are not passed through
+    the identical segmenter and the calibration argument does not hold. A
+    null position ``i`` at lag ``L`` draws on rows ``i, i+L, ..., i+(w-1)L``;
+    the chromosome check below requires all of them lie on one chromosome.
+
+    ``observed_eligible`` is the SAME ``eligible_edges()`` array the observed
+    track is held to, additionally requiring the LOCAL adjacent edge at EVERY
+    member offset (not just the chromosome loop's ``w-1`` pairs) to itself be
+    gap-eligible -- each null member must sit in as ordinary a local
+    neighbourhood as any observed CpG does (16-50% of null positions violate
+    this on realistic layouts if left unchecked). Deliberately NOT applied to
+    the long lag ``L`` *between* members -- that gap is the intentional
+    locality-breaking part of the construction. ``observed_eligible=None``
+    (the default) skips the check and is a no-op on ``dense`` regardless.
     """
 
     if chromosome is None:
-        return np.ones(size, dtype=bool)
-    span = max(config.window, 2)
-    eligible = np.ones(size, dtype=bool)
-    first = chromosome[:size]
-    for step in range(1, span):
-        offset = step * lag
-        if offset + size > chromosome.size:
-            return np.zeros(size, dtype=bool)
-        eligible &= first == chromosome[offset : offset + size]
+        eligible = np.ones(size, dtype=bool)
+    else:
+        span = max(config.window, 2)
+        eligible = np.ones(size, dtype=bool)
+        first = chromosome[:size]
+        for step in range(1, span):
+            offset = step * lag
+            if offset + size > chromosome.size:
+                return np.zeros(size, dtype=bool)
+            eligible &= first == chromosome[offset : offset + size]
+
+    if observed_eligible is not None:
+        # `observed_eligible` is edge-indexed (n_cpg - 1 entries: entry k is the
+        # edge AFTER CpG k), one shorter than the CpG-indexed `chromosome` array
+        # the loop above bounds against. A member sitting at the very last CpG
+        # has no following edge to check -- not a violation, just nothing to
+        # check -- so pad one trailing `True` (vacuously eligible) rather than
+        # bounds-failing the whole null position over a member that has no edge
+        # to have failed.
+        padded = np.concatenate([observed_eligible, [True]])
+        w = max(config.window, 1)
+        for a in range(w):
+            offset = a * lag
+            if offset + size > padded.size:
+                return np.zeros(size, dtype=bool)
+            eligible &= padded[offset : offset + size]
     return eligible
 
 
@@ -900,14 +1144,16 @@ def null_tracks(
 ) -> list[tuple[np.ndarray, np.ndarray, int]]:
     """Statistic tracks under the locality-breaking null, one per replicate.
 
-    Returns ``(track, eligible, lag)`` triples. ``eligible`` restricts the null
-    to positions whose window members share a chromosome, mirroring the
-    constraint applied to the observed track. ``lag`` is that replicate's own
-    draw, needed by Stage 1c's support-conditioned threshold to reconstruct the
-    replicate's own window-member set (mirroring ``_lag_null_track``'s
-    construction) when computing that replicate's own support. Passing
-    ``locations=None`` disables the chromosome restriction and is retained only
-    for single-chromosome use and for tests.
+    Returns ``(track, eligible, lag)`` triples. ``eligible`` restricts the null to
+    positions whose window members (a) share a chromosome and (b) each sit at a
+    locally gap-eligible position -- the same ``eligible_edges()`` rule the
+    observed track is held to, applied to every member except across the
+    intentional long lag itself. ``lag`` is that replicate's own draw, needed
+    by the support-conditioned threshold to reconstruct the replicate's own
+    window-member set (mirroring ``_lag_null_track``'s construction) when
+    computing that replicate's own support. Passing ``locations=None``
+    disables BOTH restrictions and is retained only for single-chromosome use
+    and for tests.
     """
 
     n_rows = residuals.shape[0]
@@ -918,6 +1164,9 @@ def null_tracks(
     chromosome = (
         locations["chr"].to_numpy() if locations is not None else None
     )
+    observed_eligible = (
+        eligible_edges(locations, config) if locations is not None else None
+    )
     rng = np.random.default_rng(config.random_seed + 977)
     tracks: list[tuple[np.ndarray, np.ndarray, int]] = []
     for _ in range(config.null_replicates):
@@ -925,10 +1174,151 @@ def null_tracks(
         track = _lag_null_track(residuals, lag, config)
         if not track.size:
             continue
-        eligible = _null_eligibility(chromosome, lag, config, track.size)
+        eligible = _null_eligibility(
+            chromosome, lag, config, track.size,
+            observed_eligible=observed_eligible,
+        )
         if eligible.any():
             tracks.append((track, eligible, lag))
     return tracks
+
+
+def member_step_lag_null_tracks(
+    residuals: np.ndarray,
+    lag: int,
+    config: Eiger2Config,
+    locations: pd.DataFrame | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    """The member-step lag null: one sub-track per starting offset at a fixed lag.
+
+    ``null_tracks()``'s construction steps its position index ``p`` by one
+    CpG: position ``p``'s members are ``{p, p+lag, ..., p+(w-1)*lag}`` and
+    position ``p+1``'s are ``{p+1, p+1+lag, ...}`` -- DISJOINT sets, unlike
+    consecutive OBSERVED windows, which share ``w-1`` of ``w`` members. That
+    mismatch is why that null's autocorrelation does not match the observed
+    track's.
+
+    This construction re-parameterises: fix a starting offset ``i`` and step a
+    SECOND index ``j``, so the null "position" is ``p = i + j*lag`` and
+    consecutive positions share ``w-1`` of ``w`` members by construction --
+    reproducing the autocorrelation directly, not tuning toward it.
+
+    Implementation: ``_lag_null_track(residuals, lag, config)`` already
+    computes the per-``p`` value for every ``p``; re-slicing its output at
+    stride ``lag`` from each offset ``i`` in ``[0, lag)`` recovers exactly the
+    ``j``-indexed sub-track for that offset, with no new pair-assembly code.
+    Eligibility likewise re-slices ``_null_eligibility``'s existing output.
+
+    Returns one ``(sub_track, sub_eligible, offset)`` triple per offset ``i``
+    with at least one eligible position. ``offset`` takes the third-element
+    slot ``null_tracks()`` uses for ``lag``, so both are drop-in compatible
+    with ``acf_gate``'s ``(track, eligible, *_rest)`` unpacking.
+    """
+
+    full = _lag_null_track(residuals, lag, config)
+    if not full.size:
+        return []
+    chromosome = locations["chr"].to_numpy() if locations is not None else None
+    observed_eligible = (
+        eligible_edges(locations, config) if locations is not None else None
+    )
+    full_eligible = _null_eligibility(
+        chromosome, lag, config, full.size, observed_eligible=observed_eligible,
+    )
+    sub_tracks: list[tuple[np.ndarray, np.ndarray, int]] = []
+    for i in range(min(lag, full.size)):
+        sub_track = full[i::lag]
+        sub_eligible = full_eligible[i::lag]
+        if sub_track.size and sub_eligible.any():
+            sub_tracks.append((sub_track, sub_eligible, i))
+    return sub_tracks
+
+
+def member_step_min_n_cpg(config: Eiger2Config) -> int:
+    """Minimum ``n_cpg`` for ``region_null_mode="member_step"`` to be buildable
+    at all: the smallest input at which ``L_max = n_cpg //
+    (min_subtrack_length + window - 1)`` still clears ``null_min_lag``. Shared
+    by ``member_step_lag_null_ensemble``'s raise and ``call_dmrs``'s
+    ``region_null_mode="auto"`` fallback check, so the two cannot drift apart.
+    """
+
+    span = config.min_subtrack_length + max(config.window, 1) - 1
+    return config.null_min_lag * span
+
+
+def member_step_lag_null_ensemble(
+    residuals: np.ndarray,
+    config: Eiger2Config,
+    locations: pd.DataFrame | None = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], list[int]]:
+    """The region-level null pool: ``config.n_lag_draws`` independent lag draws,
+    one ``(track, eligible, lag)`` triple per draw -- directly interchangeable
+    with ``null_tracks()``'s output everywhere it is consumed (``acf_gate``,
+    ``null_exchangeability``, ``_overdispersion_diagnostic``), with each lag
+    draw standing in for one "replicate" exactly as one ``"lag"``-construction
+    replicate does.
+
+    Each draw's members-share-``window - 1`` structure comes from
+    :func:`member_step_lag_null_tracks`, one sub-track per starting offset
+    ``i in [0, lag)``; concatenated into ONE array per lag, breaking the
+    eligible mask at every sub-track boundary so ``segment()`` can never
+    merge two unrelated offsets into one spurious region -- the same device
+    :func:`eligible_edges` uses to stop a region crossing a chromosome
+    boundary.
+
+    **Lag range**: drawn uniformly from ``[null_min_lag, L_max]`` where
+    ``L_max = n_cpg // (min_subtrack_length + window - 1)``. A narrow jitter
+    band near ``null_min_lag`` correlates nearby draws (lag 1006 and 1008
+    pair CpG ``i`` with ``i+1006`` and ``i+1008``, nearly the same
+    construction) and was rejected for that reason. At genome scale ``L_max``
+    is comfortably above ``null_min_lag``, so this wide range gives genuinely
+    different constructions per draw. Raises when ``L_max < null_min_lag``
+    rather than silently degrading to short sub-tracks.
+
+    Returns ``(replicates, lags_used)`` -- ``lags_used`` is recorded in
+    ``manifest["gates"]`` on every run.
+    """
+
+    n_rows = residuals.shape[0]
+    w = max(config.window, 1)
+    span = config.min_subtrack_length + w - 1
+    l_max = n_rows // span
+    if l_max < config.null_min_lag:
+        minimum_n_cpg = member_step_min_n_cpg(config)
+        raise ValueError(
+            f"region_null_mode='member_step' needs at least one lag able to "
+            f"produce sub-tracks of min_subtrack_length={config.min_subtrack_length} "
+            f"at null_min_lag={config.null_min_lag}, i.e. n_cpg >= "
+            f"null_min_lag * (min_subtrack_length + window - 1) = {minimum_n_cpg}; "
+            f"got n_cpg={n_rows} (L_max={l_max}). Use region_null_mode='lag' on "
+            f"input this small, or lower min_subtrack_length/null_min_lag "
+            f"knowingly (min_subtrack_length trades off segmentation edge "
+            f"effects; null_min_lag trades off the methylation correlation-"
+            f"length margin)."
+        )
+
+    rng = np.random.default_rng(config.random_seed + 61_093)
+    lags = [
+        int(rng.integers(config.null_min_lag, l_max + 1))
+        for _ in range(config.n_lag_draws)
+    ]
+
+    replicates: list[tuple[np.ndarray, np.ndarray, int]] = []
+    for lag in lags:
+        sub_tracks = member_step_lag_null_tracks(residuals, lag, config, locations)
+        if not sub_tracks:
+            continue
+        track_pieces, eligible_pieces = [], []
+        for track, sub_eligible, _offset in sub_tracks:
+            track_pieces.append(track)
+            boundary = sub_eligible.copy()
+            if boundary.size:
+                boundary[-1] = False  # never merge into the next offset's piece
+            eligible_pieces.append(boundary)
+        replicates.append((
+            np.concatenate(track_pieces), np.concatenate(eligible_pieces), lag,
+        ))
+    return replicates, lags
 
 
 def permutation_null_tracks(
@@ -939,48 +1329,20 @@ def permutation_null_tracks(
     replicates: int = 100,
     seed: int = 1,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Null tracks that preserve the marginal distribution and destroy the runs.
+    """Retired: edge-wise permutation (block length 1) of the observed statistic
+    within each chromosome, measured at zero usable null regions across 400
+    replicates. Always raises; kept only so old call sites get a clear error
+    naming the replacement rather than an import failure."""
 
-    The observed edge statistic is permuted within each chromosome. Every value
-    is retained exactly once, so the amount of local coordination in the genome
-    is unchanged; only its arrangement along the chromosome is randomised. A run
-    of consecutive high values in the data is then compared against runs that
-    arise by chance from the same pool of values.
-
-    This is the appropriate null once the cohort is large enough that "is there
-    any coordination here" is answered yes almost everywhere. Unlike a null
-    built from a different pairing of the data, it cannot be shifted away from
-    the observed marginal, so the resulting q-values cannot saturate at zero.
-
-    A circular shift would be the obvious alternative and is *wrong* here: it
-    preserves runs intact and merely moves them, so every observed region
-    reappears in the null and the q-values collapse to one.
-
-    Returns ``(track, eligible)`` pairs matching :func:`null_tracks`.
-    """
-
-    statistic = np.asarray(statistic, dtype=float)
-    eligible = np.asarray(eligible, dtype=bool)
-    rng = np.random.default_rng(seed + 5209)
-    if chromosome is None:
-        blocks = [np.arange(statistic.size)]
-    else:
-        chromosome = np.asarray(chromosome)[: statistic.size]
-        blocks = [
-            np.flatnonzero(chromosome == value)
-            for value in pd.unique(chromosome)
-        ]
-
-    tracks: list[tuple[np.ndarray, np.ndarray]] = []
-    for _ in range(replicates):
-        shuffled = np.full(statistic.size, np.nan, dtype=float)
-        for rows in blocks:
-            usable = rows[eligible[rows] & np.isfinite(statistic[rows])]
-            if usable.size < 2:
-                continue
-            shuffled[usable] = rng.permutation(statistic[usable])
-        tracks.append((shuffled, np.isfinite(shuffled)))
-    return tracks
+    raise ValueError(
+        "permutation_null_tracks is edge-wise permutation (block length 1), "
+        "measured at zero null regions across 400 replicates, and is no "
+        "longer usable. For the region-level null, use "
+        "region_null_mode='member_step' (or leave it at its default 'auto', "
+        "which resolves to 'member_step' automatically on input large enough "
+        "to support it); for the edge-level null, null_mode='lag' is the "
+        "only supported value."
+    )
 
 
 def region_minority_size(
@@ -1046,20 +1408,20 @@ def null_exchangeability(
 ) -> dict:
     """Split-half check that the null distribution matches the observed one.
 
-    Splits the null replicates into a calibration half (sets the threshold) and a
-    held-out half (measures exceedance against it). ``p_null`` is the held-out
-    exceedance and is a control: by construction it must equal
-    ``1 - config.null_quantile``, confirming the null is internally self-consistent.
-    ``p_obs`` is the observed track's exceedance against the SAME threshold. The
-    ratio ``p_obs / p_null`` is the actual gate: it is 1.0 when the null and the
-    data share the same upper-tail shape, and rises when the observed track is
-    more heavy-tailed than the null represents -- exactly the failure mode
-    described in docs/FDR.md, "Null exchangeability".
+    Splits the null replicates into a calibration half (sets the threshold)
+    and a held-out half (measures exceedance against it). ``p_null`` is the
+    held-out exceedance and is a control: by construction it must equal
+    ``1 - config.null_quantile``, confirming the null is internally
+    self-consistent. ``p_obs`` is the observed track's exceedance against the
+    SAME threshold. The ratio ``p_obs / p_null`` is the actual gate: 1.0 when
+    the null and data share the same upper-tail shape, rising when the
+    observed track is more heavy-tailed than the null represents -- see
+    docs/FDR.md, "Null exchangeability".
 
-    The split is deterministic given ``config.random_seed`` -- a fixed permutation
-    of replicate indices, not re-derived from tracks' own order, so results are
-    reproducible independent of how many replicates happen to survive filtering
-    upstream.
+    The split is deterministic given ``config.random_seed`` (a fixed
+    permutation of replicate indices, not re-derived from tracks' own order),
+    so results are reproducible independent of how many replicates happen to
+    survive filtering upstream.
     """
 
     n = len(tracks)
@@ -1110,6 +1472,154 @@ def null_exchangeability(
         "n_calibration_replicates": int(calibration_idx.size),
         "n_holdout_replicates": int(holdout_idx.size),
         "calibration_threshold": calibration_threshold,
+    }
+
+
+def track_autocorrelation(
+    values: np.ndarray, eligible: np.ndarray, lags: Sequence[int]
+) -> dict[int, float]:
+    """Lag-``k`` autocorrelation of ``values`` at every ``k`` in ``lags``.
+
+    Pairs ``(values[i], values[i+k])`` are used where both positions are
+    eligible and finite; the correlation is the Pearson coefficient over that
+    pooled pair set. ``NaN`` for a lag with fewer than 2 usable pairs or a
+    constant series (undefined correlation), not raised.
+    """
+
+    values = np.asarray(values, dtype=float)
+    usable = np.asarray(eligible, dtype=bool) & np.isfinite(values)
+    out: dict[int, float] = {}
+    for k in lags:
+        if k <= 0 or k >= values.size:
+            out[k] = float("nan")
+            continue
+        paired = usable[:-k] & usable[k:]
+        x = values[:-k][paired]
+        y = values[k:][paired]
+        if x.size < 2 or np.std(x) == 0 or np.std(y) == 0:
+            out[k] = float("nan")
+        else:
+            out[k] = float(np.corrcoef(x, y)[0, 1])
+    return out
+
+
+def acf_gate(
+    observed_statistic: np.ndarray,
+    eligible: np.ndarray,
+    null_tracks_: Sequence[tuple],
+    window: int,
+    *,
+    tolerance: float = 0.05,
+) -> dict:
+    """Gate 1: null autocorrelation must match the observed track's within
+    ``tolerance`` at lags 1..``window``, on DMR-free data. A sliding-window
+    statistic manufactures autocorrelation by construction (windows at edges
+    ``e`` and ``e+k`` share CpG pairs whenever ``|k| < w``), so validating a
+    null's marginal and variance is not enough -- its dependence structure has
+    to match too, or a run of elevated edges that is pure geometry looks like
+    signal.
+
+    ``null_tracks_`` pools every replicate's usable pairs at each lag BEFORE computing
+    the correlation (not an average of per-replicate correlations), matching how the
+    null is pooled everywhere else in this codebase. Accepts either
+    ``null_tracks()``'s ``(track, eligible, lag)`` triples or
+    ``permutation_null_tracks()``'s ``(track, eligible)`` pairs -- only the first two
+    elements are used, mirroring the ``*_rest`` unpacking ``call_dmrs`` already uses
+    for the same reason. Passes only when every lag has a finite, in-tolerance
+    difference; a lag that could not be measured (too few usable pairs) fails the gate
+    rather than being silently skipped, since an unmeasurable lag is not evidence of a
+    match.
+    """
+
+    lags = list(range(1, max(int(window), 1) + 1))
+    observed_acf = track_autocorrelation(observed_statistic, eligible, lags)
+
+    null_acf: dict[int, float] = {}
+    for k in lags:
+        xs, ys = [], []
+        for track, track_eligible, *_rest in null_tracks_:
+            track = np.asarray(track, dtype=float)
+            usable = np.asarray(track_eligible, dtype=bool) & np.isfinite(track)
+            if k <= 0 or k >= track.size:
+                continue
+            paired = usable[:-k] & usable[k:]
+            xs.append(track[:-k][paired])
+            ys.append(track[k:][paired])
+        x = np.concatenate(xs) if xs else np.empty(0)
+        y = np.concatenate(ys) if ys else np.empty(0)
+        if x.size < 2 or np.std(x) == 0 or np.std(y) == 0:
+            null_acf[k] = float("nan")
+        else:
+            null_acf[k] = float(np.corrcoef(x, y)[0, 1])
+
+    diff: dict[int, float] = {}
+    for k in lags:
+        o, n = observed_acf[k], null_acf[k]
+        diff[k] = (n - o) if (np.isfinite(o) and np.isfinite(n)) else float("nan")
+
+    passed = bool(lags) and all(
+        np.isfinite(diff[k]) and abs(diff[k]) <= tolerance for k in lags
+    )
+    return {
+        "lags": lags,
+        "observed_acf": observed_acf,
+        "null_acf": null_acf,
+        "diff": diff,
+        "tolerance": tolerance,
+        "passed": passed,
+    }
+
+
+def region_exchangeability_gate(
+    *,
+    observed_regions: int,
+    observed_eligible_edges: int,
+    null_regions_total: int,
+    null_eligible_edges: int,
+    min_null_regions_for_fdr: int,
+) -> dict:
+    """Gate 2: region-level exchangeability, on DMR-free data.
+
+    ``observed_rate``/``null_rate`` are candidate REGIONS (pre-FDR, i.e. segmenter
+    output) per 10,000 eligible edges. ``region_exchangeability_ratio`` is their
+    ratio; ``inf`` is reported EXPLICITLY (not coerced to ``NaN`` or dropped) when
+    ``null_rate`` is zero and ``observed_rate`` is positive -- that must be visible,
+    not hidden. ``NaN`` only when BOTH rates are zero (nothing happened on either
+    side; the ratio is genuinely undefined, not infinite). ``null_count_adequate``
+    records whether the pooled null-region count clears
+    ``min_null_regions_for_fdr``, i.e. whether the ratio is "estimated from
+    something" -- reported alongside the ratio, not a refusal gate like the FDR
+    estimator's own guard; the ratio is still returned either way, for the same
+    reason ``inf`` is reported rather than hidden.
+    """
+
+    observed_rate = (
+        10_000 * observed_regions / observed_eligible_edges
+        if observed_eligible_edges > 0 else float("nan")
+    )
+    null_rate = (
+        10_000 * null_regions_total / null_eligible_edges
+        if null_eligible_edges > 0 else float("nan")
+    )
+    if not (np.isfinite(observed_rate) and np.isfinite(null_rate)):
+        ratio = float("nan")
+    elif null_rate > 0:
+        ratio = observed_rate / null_rate
+    elif observed_rate > 0:
+        ratio = float("inf")
+    else:
+        ratio = float("nan")
+
+    return {
+        "observed_regions": int(observed_regions),
+        "observed_eligible_edges": int(observed_eligible_edges),
+        "observed_rate": observed_rate,
+        "null_regions_total": int(null_regions_total),
+        "null_eligible_edges": int(null_eligible_edges),
+        "null_rate": null_rate,
+        "region_exchangeability_ratio": ratio,
+        "null_count_adequate": null_regions_total >= min_null_regions_for_fdr,
+        "min_null_regions_for_fdr": int(min_null_regions_for_fdr),
     }
 
 
@@ -1181,8 +1691,8 @@ def segment(
     """Contiguous runs of passing edges, tolerating short internal gaps.
 
     ``threshold`` may be a scalar or a per-edge array matching ``statistic``'s
-    shape (support-conditioned mode, Stage 1c). The scalar path is unchanged and
-    stays bit-identical.
+    shape (support-conditioned mode). The scalar path is unchanged and stays
+    bit-identical.
 
     Returns an ``(n_regions, 2)`` array of inclusive CpG index bounds. A run of
     ``E`` passing edges spans ``E + 1`` CpGs; ``min_cpgs`` counts CpGs.
@@ -1231,7 +1741,7 @@ def region_area(
     """Summed excess of the statistic over the threshold, per region.
 
     ``threshold`` may be a scalar or a per-edge array matching ``statistic``'s
-    shape (Stage 1c support-conditioned mode); the scalar path is unchanged.
+    shape (support-conditioned mode); the scalar path is unchanged.
 
     Area rewards both strength and length, which is the behaviour wanted for a
     region-level statistic and matches the ``bumphunter`` convention.
@@ -1380,9 +1890,9 @@ def length_stratum(n_cpg: int) -> str:
     return "50+"
 
 
-# Spec §1c.6: minimum pooled null-region count for a joint (length x support-bin)
-# stratum to be estimated on its own. Below this the stratum falls back to
-# length-only pooling. Fixed by the spec, deliberately not user-configurable.
+# Minimum pooled null-region count for a joint (length x support-bin) stratum
+# to be estimated on its own. Below this the stratum falls back to
+# length-only pooling. Not user-configurable.
 _MIN_NULL_REGIONS_PER_JOINT_STRATUM = 50
 
 
@@ -1394,8 +1904,8 @@ def _overdispersion_diagnostic(
     ``region_qvalue_upper_95`` assumes a Poisson count model (Garwood). If the
     replicate-to-replicate exceedance counts are overdispersed relative to Poisson,
     the Garwood interval understates the true uncertainty -- it becomes a LOWER
-    bound on the real interval, not a correct one. This is reported, never silently
-    corrected (spec §1.5: no uncalibrated dispersion correction in this release).
+    bound on the real interval, not a correct one. This is reported, never
+    silently corrected: no uncalibrated dispersion correction is applied.
     """
 
     b = len(per_replicate_null_areas)
@@ -1428,37 +1938,46 @@ def region_fdr_result(
     observed_support_bins: np.ndarray | None = None,
     null_support_bin_sets: Sequence[np.ndarray] | None = None,
     confidence_level: float = 0.95,
+    min_null_regions_for_fdr: int = 50,
 ) -> RegionFdrResult:
     """Region-level empirical FDR: point estimate, resolution, and simultaneous
     Garwood Monte Carlo bounds, computed within length strata with a common
-    Bonferroni ``m`` (spec §1.4) so ``qvalue_upper`` is comparable across strata.
+    Bonferroni ``m`` so ``qvalue_upper`` is comparable across strata. See
+    ``docs/FDR.md`` for the full derivation and the three distinct quantities
+    this keeps apart (point estimate, empirical resolution, Monte Carlo
+    interval).
 
-    For a cut-off ``a``, the expected number of null regions at least as extreme
-    is the mean count across replicates, rescaled to the size of the real
-    genome. The FDR is that expectation divided by the observed count.
+    For a cut-off ``a``, the expected number of null regions at least as
+    extreme is the mean count across replicates, rescaled to the size of the
+    real genome. The FDR is that expectation divided by the observed count.
 
-    When ``observed_lengths`` and ``null_length_sets`` are supplied the
-    calculation is done **within length strata**. This matters because region
-    area grows with length, so a pooled FDR silently makes short regions look
-    worse than long ones and pushes the caller towards a minimum-length cutoff.
-    A 4-CpG DMR is real biology; it should compete against 4-CpG null regions,
-    not against 50-CpG ones.
+    When ``observed_lengths``/``null_length_sets`` are supplied, the
+    calculation is done **within length strata**: region area grows with
+    length, so a pooled FDR silently makes short regions look worse than long
+    ones. A 4-CpG DMR should compete against 4-CpG null regions, not 50-CpG
+    ones.
 
-    When ``observed_support_bins`` and ``null_support_bin_sets`` are ALSO
-    supplied (they require the length arrays; support-only stratification is not
-    supported), the null pool is stratified jointly, by
-    ``"<length_stratum>|sbin<b>"`` -- spec §1c.6's escalation. Equalising the
-    per-edge threshold across support bins does not equalise the rate at which
-    regions FORM per bin, so a region from a well-supported bin must compete
-    against null regions from that same bin. A joint stratum whose pooled null
-    count is below ``_MIN_NULL_REGIONS_PER_JOINT_STRATUM`` is too thin to
-    estimate on its own; those regions fall back to the length-only pool (every
-    support bin of that length stratum, unioned) and the joint label is listed in
-    ``diagnostics["support_stratification_fallback_strata"]``.
+    When ``observed_support_bins``/``null_support_bin_sets`` are ALSO
+    supplied, the null pool is stratified jointly, by
+    ``"<length_stratum>|sbin<b>"`` -- equalising the per-edge threshold across
+    support bins does not equalise the rate regions FORM per bin. A joint
+    stratum whose pooled null count is below
+    ``_MIN_NULL_REGIONS_PER_JOINT_STRATUM`` falls back to the length-only
+    pool, listed in ``diagnostics["support_stratification_fallback_strata"]``.
 
-    See ``docs/FDR.md`` for the derivation and the three distinct quantities this
-    keeps apart: the point estimate, the empirical resolution, and the Monte Carlo
-    interval.
+    ``min_null_regions_for_fdr`` guards null adequacy as a single AGGREGATE
+    check summed across every stratum and replicate -- not a per-stratum one.
+    A per-stratum floor conflates "merely small" (arithmetically well-defined,
+    refusing it hides real evidence as certainty) with "genuinely, decisively
+    empty" -- but with the run as a whole adequately backed by null volume,
+    ``K=0`` at a stratum's own cutoff is the strongest evidence the estimator
+    can produce (point estimate ``q=0``, a finite Garwood ``qvalue_upper_95``).
+    Below the aggregate floor, every inferential field is ``NaN``, every count
+    field is ``-1``. At or above it, every stratum is let through, including
+    empty ones, named with their exposure in
+    ``diagnostics["zero_exceedance_strata"]`` -- reported, not refused.
+    ``diagnostics["insufficient_null_strata"]`` is kept for schema
+    compatibility and is now always ``[]``.
     """
 
     observed_areas = np.asarray(observed_areas, dtype=float)
@@ -1471,7 +1990,10 @@ def region_fdr_result(
             qvalue_upper=empty_f, qvalue_resolution=empty_f,
             null_exceedances=empty_i, qvalue_cutoff_rank=empty_i,
             confidence_level=confidence_level,
-            diagnostics={"pooled_fallback_strata": []},
+            diagnostics={
+                "pooled_fallback_strata": [], "insufficient_null_strata": [],
+                "zero_exceedance_strata": [],
+            },
         )
 
     replicates = len(null_area_sets)
@@ -1486,7 +2008,11 @@ def region_fdr_result(
             qvalue_upper=nan_f, qvalue_resolution=nan_f,
             null_exceedances=neg_i, qvalue_cutoff_rank=neg_i,
             confidence_level=confidence_level,
-            diagnostics={"status": status, "pooled_fallback_strata": []},
+            diagnostics={
+                "status": status, "pooled_fallback_strata": [],
+                "zero_exceedance_strata": [],
+                "insufficient_null_strata": [],
+            },
         )
 
     # ``null_edges`` is the TOTAL number of null edges summed over replicates, and
@@ -1579,6 +2105,48 @@ def region_fdr_result(
     }
     m_bonferroni = max(cutoffs_by_stratum.values())
 
+    # The null-adequacy floor is a single AGGREGATE check on the run as a
+    # whole, not a per-stratum one -- see this function's docstring. Run AFTER
+    # stratification (and its validation, e.g. the strict support-bin zips
+    # above) and Pass A, so a caller bug still raises regardless of null
+    # adequacy and the diagnostics keys stay present either way; a stratum
+    # whose own pool happens to be thin, or exactly empty, is not refused once
+    # the run clears this bar -- handled in the per-stratum loop below
+    # (``zero_exceedance_strata``), not here.
+    pooled_null_regions = int(sum(a.size for a in null_area_sets))
+    if pooled_null_regions < min_null_regions_for_fdr:
+        nan_f = np.full(m, np.nan, dtype=float)
+        neg_i = np.full(m, -1, dtype=np.int64)
+        rate = pooled_null_regions / replicates if replicates else 0.0
+        return RegionFdrResult(
+            qvalue=nan_f, tail_fdr=nan_f, qvalue_lower=nan_f,
+            qvalue_upper=nan_f, qvalue_resolution=nan_f,
+            null_exceedances=neg_i, qvalue_cutoff_rank=neg_i,
+            confidence_level=confidence_level,
+            diagnostics={
+                "status": "aggregate null inadequate",
+                "pooled_null_regions": pooled_null_regions,
+                "replicates": replicates,
+                "null_regions_per_replicate": rate,
+                "min_null_regions_for_fdr": int(min_null_regions_for_fdr),
+                "replicates_required": (
+                    math.ceil(min_null_regions_for_fdr / rate) if rate > 0 else None
+                ),
+                "scale": scale,
+                "fdr_interval_bonferroni_m": m_bonferroni,
+                "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
+                "fdr_interval_family": "per_stratum",
+                "pooled_fallback_strata": [],
+                "insufficient_null_strata": [],
+                "zero_exceedance_strata": [],
+                "support_stratified": support_stratified,
+                "support_stratification_fallback_strata": sorted(
+                    set(support_fallback_joint_strata)
+                ),
+                "min_null_regions_per_joint_stratum": _MIN_NULL_REGIONS_PER_JOINT_STRATUM,
+            },
+        )
+
     # --- Pass B: run the estimator per stratum with that common m
     qvalue = np.empty(m, dtype=float)
     tail_fdr = np.empty(m, dtype=float)
@@ -1587,7 +2155,14 @@ def region_fdr_result(
     qvalue_resolution = np.empty(m, dtype=float)
     null_exceedances = np.empty(m, dtype=np.int64)
     qvalue_cutoff_rank = np.empty(m, dtype=np.int64)
+    # DEPRECATED: always [] now. Kept for schema compatibility with older
+    # manifest parsers; scheduled for removal at the next schema bump.
     pooled_fallback_strata: list[str] = []
+    # DEPRECATED: the per-stratum refusal that used to populate this list was
+    # retracted -- see this function's docstring. Always [] now, kept for
+    # schema compatibility alongside `pooled_fallback_strata` above.
+    insufficient_null_strata: list[dict] = []
+    zero_exceedance_strata: list[dict] = []
     overdispersion_by_stratum: dict[str, dict] = {}
 
     for stratum in strata:
@@ -1607,10 +2182,21 @@ def region_fdr_result(
             for b in range(replicates)
         ]
         pooled = np.concatenate(per_replicate) if per_replicate else np.empty(0)
+        # A stratum whose own pool is completely empty is not refused -- the
+        # run as a whole already cleared the aggregate floor above, so an
+        # empty own pool means the null, given real opportunity, essentially
+        # never produces a region this long: `K=0` at every cutoff,
+        # arithmetically well-defined below (point estimate `q=0`, a finite
+        # Garwood upper bound), not an absence of information. Recorded, not
+        # refused, so a reader can see the evidence was real.
         if pooled.size == 0:
-            pooled_fallback_strata.append(str(stratum))
-            pooled = np.concatenate(null_area_sets)
-            per_replicate = null_area_sets
+            zero_exceedance_strata.append({
+                "stratum": str(stratum),
+                "null_regions": 0,
+                "replicates": replicates,
+                "null_regions_per_replicate": 0.0,
+            })
+
         piece = _fdr_from_areas_result(
             observed_areas[rows], pooled, scale,
             confidence_level=confidence_level, m_bonferroni=m_bonferroni,
@@ -1640,6 +2226,9 @@ def region_fdr_result(
         "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
         "fdr_interval_family": "per_stratum",
         "pooled_fallback_strata": pooled_fallback_strata,
+        "insufficient_null_strata": insufficient_null_strata,
+        "zero_exceedance_strata": zero_exceedance_strata,
+        "pooled_null_regions": pooled_null_regions,
         "null_count_dispersion_by_stratum": overdispersion_by_stratum,
         "null_count_overdispersion_warning": overdispersion_warning,
         "scale": scale,
@@ -1985,6 +2574,19 @@ def call_dmrs(
 
     statistic = edge_statistic(deflated, config)
     eligible = eligible_edges(frame, config)
+
+    # Deferred import: eiger2.layouts imports FROM this module, so importing it
+    # back here (module already fully initialised) avoids a circular import at
+    # module load time.
+    from .layouts import LENGTH_STRATA, describe_layout, realised_length_strata
+
+    layout_diagnostics = describe_layout(frame, config.max_cpg_gap_bp)
+    realised = realised_length_strata(layout_diagnostics["layout_max_detectable_region_cpgs"])
+    layout_diagnostics["realised_length_strata"] = list(realised)
+    layout_diagnostics["collapsed_length_strata"] = [
+        s for s in LENGTH_STRATA if s not in realised
+    ]
+    manifest["layout"] = layout_diagnostics
     # The threshold always comes from the locality-breaking null: it decides
     # which individual edges count as elevated, and that question is unaffected
     # by cohort size in the way the region-level question is.
@@ -1992,32 +2594,84 @@ def call_dmrs(
         deflated, config, frame, statistic=statistic, eligible=eligible,
     )
     null_diagnostics["mode"] = config.null_mode
-
-    if config.null_mode == "permutation":
-        # Only the REGION-level calibration changes. The permuted track holds
-        # the same edges above the same threshold, scattered at random, so the
-        # null asks how often a run this long and this strong arises by chance
-        # given how many elevated edges the genome actually contains. That
-        # cannot saturate, because the null shares the data's marginal.
-        tracks = permutation_null_tracks(
-            statistic, eligible, frame["chr"].to_numpy(),
-            replicates=config.null_replicates, seed=config.random_seed,
-        )
-        above = float(np.mean(statistic[eligible & np.isfinite(statistic)]
-                              > threshold))
-        null_diagnostics["fraction_edges_above_threshold"] = above
-    else:
-        tracks = null_tracks(deflated, config, frame)
+    # null_mode="permutation" is rejected at Eiger2Config construction, so
+    # this is the only edge-level null reachable here.
+    tracks = null_tracks(deflated, config, frame)
     manifest["null"] = null_diagnostics
 
-    # --- Stage 1c: support-conditioned threshold ---
+    # The REGION-level null, a separate axis from the edge-level `tracks`
+    # above. `"lag"` reuses `tracks` directly; `"member_step"` builds an
+    # independent ensemble reproducing the observed track's autocorrelation;
+    # `"off"` uses `region_fdr_result`'s existing degenerate (NaN/-1) path for
+    # `replicates == 0`. `"auto"` (the default) resolves to `"member_step"`
+    # when the input clears its minimum-size floor, else falls back to
+    # `"lag"` and records why in `region_null_mode_fallback` below (`cli.py`
+    # turns that into a stderr warning; this function does no I/O). An
+    # EXPLICIT `"member_step"` request does not fall back and still raises
+    # below the floor. Every branch from here on keys on
+    # `resolved_region_null_mode`, not `config.region_null_mode`.
+    region_null_mode_fallback: dict | None = None
+    resolved_region_null_mode = config.region_null_mode
+    if config.region_null_mode == "auto":
+        n_cpg_here = deflated.shape[0]
+        min_n_cpg = member_step_min_n_cpg(config)
+        if n_cpg_here < min_n_cpg:
+            resolved_region_null_mode = "lag"
+            region_null_mode_fallback = {
+                "requested": "auto",
+                "used": "lag",
+                "reason": "input below member_step minimum",
+                "n_cpg": int(n_cpg_here),
+                "n_cpg_required": int(min_n_cpg),
+            }
+        else:
+            resolved_region_null_mode = "member_step"
+
+    if resolved_region_null_mode == "lag":
+        region_tracks = tracks
+        region_lags = [lag for _, _, lag in tracks]
+    elif resolved_region_null_mode == "off":
+        region_tracks = []
+        region_lags = []
+    else:
+        region_tracks, region_lags = member_step_lag_null_ensemble(
+            deflated, config, frame,
+        )
+    manifest["gates"] = {
+        "region_null_mode": resolved_region_null_mode,
+        "n_lag_draws": len(region_lags),
+        "lags_used": region_lags,
+    }
+    if region_null_mode_fallback is not None:
+        manifest["gates"]["region_null_mode_fallback"] = region_null_mode_fallback
+    if resolved_region_null_mode == "member_step" and region_lags:
+        w_for_subtrack = max(config.window, 1)
+        n_for_subtrack = deflated.shape[0]
+        manifest["gates"]["implied_subtrack_length_range"] = [
+            int(n_for_subtrack / lag - w_for_subtrack + 1)
+            for lag in (max(region_lags), min(region_lags))
+        ]
+
+    # Gate 1 (ACF match): computed unconditionally, here, because it needs
+    # only the observed track / eligibility / region null already built above
+    # -- unlike Gate 2 (region exchangeability, below), it does not depend on
+    # any region ever being called, so it is available even on the
+    # "no_regions" early-return path. Informative regardless of whether real
+    # signal is present; only a red flag on genuinely DMR-free data. Uses
+    # `region_tracks`, not the edge-level `tracks` -- Gate 1 validates
+    # whichever null actually forms regions.
+    manifest["gates"]["acf"] = acf_gate(
+        statistic, eligible, region_tracks, config.window,
+    )
+
+    # --- support-conditioned threshold ---
     n_cpg_total = deflated.shape[0]
     w = max(config.window, 1)
     finite_mask = np.isfinite(deflated)
 
     def _member_offsets(window: int, lag: int = 1) -> np.ndarray:
-        """Window-member offsets from a base position, per spec §1c.1: the
-        adjacent pair at w=1 (offsets [0, lag]), else [0, lag, 2*lag, ..., (w-1)*lag].
+        """Window-member offsets from a base position: the adjacent pair at
+        w=1 (offsets [0, lag]), else [0, lag, 2*lag, ..., (w-1)*lag].
         `lag=1` gives the observed-track convention; any other `lag` gives a null
         position's member set, matching `_lag_null_track`'s own construction."""
         if window == 1:
@@ -2045,7 +2699,6 @@ def call_dmrs(
             )
 
     dispersion_cut = (
-        # calibrated in Task 8, module-level constant
         config.support_dispersion_cut if config.support_dispersion_cut is not None
         else _DEFAULT_SUPPORT_DISPERSION_CUT
     )
@@ -2060,21 +2713,25 @@ def call_dmrs(
         support_binning = "auto_off"
 
     support_binning_skipped_reason: str | None = None
-    if config.null_mode == "permutation" and support_binning != "forced_off":
-        # Support-conditioned thresholding requires per-replicate lag-null
-        # tracks (each with their own member-set support); permutation mode has
-        # no such per-replicate geometry (it permutes the observed track's own
-        # values). Stage 1d addresses permutation mode's own calibration
-        # separately -- combining the two is out of this stage's scope.
-        support_binning_skipped_reason = "permutation_mode_not_supported"
+    if resolved_region_null_mode != "lag" and support_binning != "forced_off":
+        # Support-conditioned thresholding's per-replicate reconstruction
+        # assumes each null track's per-position member set follows
+        # _lag_null_track's single-lag formula on a CONTIGUOUS track -- true
+        # of "lag"'s tracks, false of "member_step"'s (several offset
+        # sub-tracks concatenated, so the formula misdescribes positions near
+        # a boundary) and vacuous for "off". Not extended to either -- a
+        # known, documented limitation, not a silent miscalibration -- so
+        # both fall back to the plain scalar threshold (see
+        # `region_track_thresholds` below).
+        support_binning_skipped_reason = "region_null_mode_not_lag"
         support_binning = "forced_off"
 
     support_bin_edges: np.ndarray = np.empty(0)
     support_bin_merges: list = []
     support_thresholds: list = []
     # `null_full_support`/`pooled_null_support` are only ever assigned inside the
-    # `if binning_requested and ...:` block below, but the Task 9/10 diagnostic
-    # code later references `null_full_support` unconditionally under a
+    # `if binning_requested and ...:` block below, but diagnostic code later
+    # references `null_full_support` unconditionally under a
     # `support_binning in ("auto_on", "forced_on")` gate that is today always
     # equivalent to "that block ran". There's no structural guarantee of that
     # equivalence holding forever, so initialize defensively here to turn a
@@ -2082,23 +2739,22 @@ def call_dmrs(
     null_full_support: list[np.ndarray] = []
     per_edge_threshold: float | np.ndarray = threshold
     # Per-replicate threshold arrays fed to segment()/region_area() for each
-    # null track, aligned 1:1 with `tracks`. Defaults to the scalar threshold
-    # (mirroring the pre-Stage-1c flow); replaced below when binning succeeds.
-    # Each null track's threshold must come from THAT replicate's own support
+    # null track, aligned 1:1 with `tracks`. Defaults to the scalar threshold;
+    # replaced below when binning succeeds. Each null track's threshold must
+    # come from THAT replicate's own support
     # geometry (own lag), never from slicing the observed per_edge_threshold
     # array, since null tracks are not the same length as the observed track
     # and do not share its position-to-bin mapping.
     null_edge_thresholds: list[float | np.ndarray] = [threshold] * len(tracks)
 
     binning_requested = support_binning in ("forced_on", "auto_on")
-    if binning_requested and config.null_mode != "permutation":
+    if binning_requested:
         # Per null replicate, compute that replicate's OWN support (using its own
         # lag, mirroring _lag_null_track's member set exactly) and pool this
         # replicate's STATISTIC VALUES -- not its support values -- into the bin
         # each position's support falls into. threshold[b] is then the
         # null_quantile of all pooled statistic values across every replicate
-        # whose position landed in bin b (spec §1c.3: "threshold[b] = null_quantile
-        # of the pooled null values whose null-position support falls in bin b").
+        # whose position landed in bin b.
         null_support_parts = []
         # (support_array, value_array) per replicate, usable-filtered
         null_value_by_replicate = []
@@ -2165,11 +2821,19 @@ def call_dmrs(
     if support_binning_skipped_reason is not None:
         manifest["support_binning_skipped_reason"] = support_binning_skipped_reason
 
-    # region_threshold_mode_value/region_support_median_descriptive are computed
-    # here (needed by Task 9 too) and wired into _REGION_COLUMNS/the row dict
-    # below (Task 7: output schema, schema_version -> "2.2").
     region_threshold_mode_value = (
         "support_binned" if support_binning in ("auto_on", "forced_on") else "single"
+    )
+
+    # `null_edge_thresholds` is 1:1 with `tracks` (the edge null); when
+    # `region_null_mode="lag"`, `region_tracks IS tracks`, so it applies
+    # directly. Otherwise support-conditioning is forced off above (this
+    # `region_threshold_mode_value` will read "single"), so every region-null
+    # entry gets the same plain scalar `threshold` the observed track itself
+    # gets in that case -- observed and null stay on the identical segmenter.
+    region_track_thresholds: list[float | np.ndarray] = (
+        null_edge_thresholds if resolved_region_null_mode == "lag"
+        else [threshold] * len(region_tracks)
     )
 
     regions = segment(
@@ -2184,10 +2848,9 @@ def call_dmrs(
         manifest["status"] = "no_regions"
         return empty_regions, empty_values, manifest
 
-    # Recorded in the manifest here so `region_support_median_descriptive` is
-    # computed once, in one place, and available both to the row-building loop
-    # below (Task 7, which reads this list by position rather than recomputing
-    # it) and to Task 9 (region-level exposure diagnostic) without recomputation.
+    # Computed once, in one place, so both the row-building loop below and the
+    # region-level exposure diagnostic can read it by position rather than
+    # recomputing it.
     manifest["region_support_median_descriptive"] = [
         float(np.median(observed_support[first:last])) for first, last in regions
     ]
@@ -2196,17 +2859,17 @@ def call_dmrs(
     null_areas = []
     null_lengths = []
     null_edge_total = 0
-    # Task 9 reuses these per-replicate null regions (rather than re-segmenting)
-    # for `region_rate_by_support_bin`: each entry is the `segment()` output for
-    # that replicate, already computed against that replicate's OWN per-bin
-    # threshold array (`null_track_threshold` below), exactly mirroring the
-    # observed-region convention. Populated for every replicate regardless of
-    # whether support binning is active, since it's cheap to keep and the
-    # gating on `support_binning in ("auto_on", "forced_on")` happens once,
-    # below, before it's used.
+    # Reused (rather than re-segmenting) for `region_rate_by_support_bin`:
+    # each entry is the `segment()` output for that replicate, already
+    # computed against that replicate's OWN per-bin threshold array
+    # (`null_track_threshold` below), exactly mirroring the observed-region
+    # convention. Populated for every replicate regardless of whether support
+    # binning is active, since it's cheap to keep and the gating on
+    # `support_binning in ("auto_on", "forced_on")` happens once, below,
+    # before it's used.
     null_regions_by_replicate: list[np.ndarray] = []
     for (track, null_eligible, *_rest), null_track_threshold in zip(
-        tracks, null_edge_thresholds, strict=True
+        region_tracks, region_track_thresholds, strict=True
     ):
         # the null is masked by the same kind of rule as the data, so that the
         # two are genuinely passed through the identical segmenter. Each track's
@@ -2233,33 +2896,44 @@ def call_dmrs(
         null_regions_by_replicate.append(null_regions)
     observed_lengths = regions[:, 1] - regions[:, 0] + 1
 
-    # --- Task 9: region-level exposure diagnostic (spec §1c.6) ---
+    # Gate 2 (region-level exchangeability). Unlike Gate 1 above, this needs
+    # `null_regions_by_replicate` -- the null tracks actually segmented into
+    # candidate regions -- which is only built on this (regions.size > 0)
+    # path, matching the region_rate_by_support_bin diagnostic's own scope
+    # below: both are silent on the "no_regions" early return, same as
+    # `manifest["fdr"]`.
+    manifest["gates"]["region_exchangeability"] = region_exchangeability_gate(
+        observed_regions=len(regions),
+        observed_eligible_edges=int(np.sum(eligible & np.isfinite(statistic))),
+        null_regions_total=int(sum(len(r) for r in null_regions_by_replicate)),
+        null_eligible_edges=null_edge_total,
+        min_null_regions_for_fdr=config.min_null_regions_for_fdr,
+    )
+    # `s = observed_eligible_edges / null_eligible_edges` is
+    # `region_fdr_result`'s finite-null resolution scale
+    # (`region_qvalue_resolution = s / R`) -- SMALLER is better (more null
+    # volume). Recorded explicitly, the right way round, so a user can see
+    # what their q-values are quantised at without re-deriving it from
+    # `region_exchangeability`'s edge counts.
+    manifest["gates"]["s"] = (
+        int(np.sum(eligible & np.isfinite(statistic))) / max(null_edge_total, 1)
+    )
+    manifest["gates"]["implied_region_qvalue_resolution_at_R1"] = manifest["gates"]["s"]
+
+    # --- region-level exposure diagnostic ---
     # Compares the observed rate of CALLED REGIONS per support bin against the
-    # null's rate of REGIONS per support bin (both per 10,000 eligible edges),
-    # keyed by bin index. This is distinct from the per-EDGE threshold
-    # equalisation already performed above: equalising the marginal per edge
-    # does not guarantee observed and null regions FORM at the same rate per
-    # bin (spec §1c.6's own framing) -- clustering could still be
-    # support-driven even though individual edges are fairly thresholded.
-    #
-    # Null regions are the SAME `null_regions_by_replicate` segmented just
-    # above, against each replicate's own per-bin threshold array -- reusing
-    # the existing null-segmentation mechanism rather than inventing a
-    # parallel one, so this diagnostic cannot lie about whether the null was
-    # segmented consistently with the observed convention. Each null region's
-    # support-median is read from that SAME replicate's own full-length
-    # support array (`null_full_support[i]`, Task 6), mirroring exactly how
-    # `region_support_median_descriptive` reads `observed_support` above.
-    #
-    # Eligible-edge counts per bin reuse `observed_support[usable_mask]` and
-    # `pooled_null_support` (both already computed above, when binning was
-    # set up): `pooled_null_support` is precisely the eligible+finite null
-    # support values pooled across every replicate, and `usable_mask` is the
-    # observed analogue -- no separate occupancy count needed.
-    # Task 10 (spec §1c.6 escalation): the same per-region support-bin
-    # assignments also stratify the region-FDR null pool below. Default None ==
-    # length-only pooling == pre-Task-10 behaviour, which is what every run with
-    # support binning off (and every other caller of region_fdr_result) gets.
+    # null's rate (both per 10,000 eligible edges): equalising the per-edge
+    # threshold does not guarantee regions FORM at the same rate per bin --
+    # clustering could still be support-driven even with fair edges. Null
+    # regions reuse `null_regions_by_replicate` (already segmented against
+    # each replicate's own per-bin threshold) rather than re-segmenting, so
+    # this cannot drift from how the null was actually segmented; each null
+    # region's support-median comes from that replicate's own full-length
+    # support array. Eligible-edge counts per bin reuse
+    # `observed_support[usable_mask]`/`pooled_null_support` from the binning
+    # setup above. These same per-region bin assignments also stratify the
+    # region-FDR null pool below; default None is length-only pooling, which
+    # is what every run with support binning off gets.
     observed_support_bins_for_fdr = None
     null_support_bin_sets_for_fdr = None
     if support_binning in ("auto_on", "forced_on"):
@@ -2375,6 +3049,7 @@ def call_dmrs(
         null_length_sets=null_lengths if config.length_stratified_fdr else None,
         observed_support_bins=observed_support_bins_for_fdr,
         null_support_bin_sets=null_support_bin_sets_for_fdr,
+        min_null_regions_for_fdr=config.min_null_regions_for_fdr,
     )
     if config.fdr_decision == "upper":
         # Spec §1.8 frames this guard as running "before computing regions";
@@ -2423,10 +3098,9 @@ def call_dmrs(
         }
         # `local_fdr` above is only ever given `observed_lengths`/`null_length_sets`
         # (never support-bin arguments), so this posterior path is length-stratified
-        # at most, never support-stratified -- unlike `region_fdr_result` above, which
-        # spec §1c.6 names explicitly for support-bin stratification. Recorded here so
-        # a consumer of `manifest["posterior"]` doesn't assume parity with the
-        # region-level q-values.
+        # at most, never support-stratified -- unlike `region_fdr_result` above.
+        # Recorded here so a consumer of `manifest["posterior"]` doesn't assume
+        # parity with the region-level q-values.
         manifest["posterior"]["support_stratified"] = False
 
     decision_qvalue = (

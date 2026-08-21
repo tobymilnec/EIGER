@@ -263,3 +263,15 @@ direction. Fixed, with a parametrised regression test at
 
 Any q-value produced by EIGER 2 before this fix should be multiplied by the
 `null_replicates` used for that run.
+
+## 9. v2.1.0: `qvalue_result_from_track`/`qvalues_from_track` no longer reachable via
+`permutation_null_tracks`
+
+Both functions (this module's callers via `--legacy --fdr-replicates`, §7-§8 above)
+built their null through `core.permutation_null_tracks` -- edge-wise permutation,
+block length 1. That construction is unrelated to `_tail_area_fdr`'s direction/tie fix
+above, but it shared the same measured failure the region-level null had: zero usable
+null regions across 400 replicates. `permutation_null_tracks` now raises immediately
+rather than returning that null, so both functions raise too, naming
+`region_null_mode="member_step"` as the region-level replacement. See `docs/FDR.md`
+§11-§12 and `STAGE1D_D_STOP_REPORT.md` §6.1/§6.3.

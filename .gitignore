@@ -29,3 +29,8 @@ examples/data/
 examples/out_*/
 benchmarking/out*/
 *.tsv.gz
+
+# development process record -- archived locally, never published
+.superpowers/
+docs/superpowers/
+/STAGE*_STOP_REPORT.md

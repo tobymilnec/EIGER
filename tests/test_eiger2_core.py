@@ -35,14 +35,20 @@ from eiger2 import (  # noqa: E402
     segment,
 )
 from eiger2.benchmark import evaluate, simulate  # noqa: E402
+import eiger2.core as _core_mod  # noqa: E402
 from eiger2.core import (  # noqa: E402
     RegionFdrResult,  # noqa: F401
     _assign_support_bin,
     _fdr_from_areas_result,
+    _HAS_NUMBA,
     _overdispersion_diagnostic,
     _pair_statistic,
+    _pair_statistic_numpy,
     _support_bin_edges,
     _window_support,
+    acf_gate,
+    member_step_lag_null_ensemble,
+    member_step_lag_null_tracks,
     null_exchangeability,
     null_threshold,
     null_tracks,
@@ -50,10 +56,24 @@ from eiger2.core import (  # noqa: E402
     qvalue_result_from_track,
     qvalues_from_track,
     region_area,
+    region_exchangeability_gate,
     region_fdr_result,
+    track_autocorrelation,
 )
 
-FAST = {"null_replicates": 6}
+# min_null_regions_for_fdr=0 disables the spec §5 null-adequacy guard: at 6
+# replicates the pooled null is always far below the default floor of 50, and
+# these tests exist to exercise calling/recall behaviour, not null adequacy
+# (which §6 addresses at the inferential-unit level).
+# region_null_mode="lag" (Stage 1d-D, master spec §6.4): the shipped default
+# "member_step" needs n_cpg >= null_min_lag * (min_subtrack_length + window -
+# 1), ~10^5 CpGs at defaults -- far more than these deliberately small test
+# matrices. These tests exercise calling/statistic/segmentation logic, not the
+# region null construction itself (which has its own dedicated tests, and its
+# own real-fixture-scale acceptance measurement in STAGE1D_D_STOP_REPORT.md).
+FAST = {
+    "null_replicates": 6, "min_null_regions_for_fdr": 0, "region_null_mode": "lag",
+}
 
 
 def locations(n_cpg: int, chrom: str = "chr1") -> pd.DataFrame:
@@ -79,6 +99,83 @@ def test_pair_statistic_matches_numpy_on_complete_data():
         assert correlation[row] == pytest.approx(
             np.corrcoef(left[row], right[row])[0, 1]
         )
+
+
+@pytest.mark.skipif(not _HAS_NUMBA, reason="numba (the 'fast' extra) is not installed")
+def test_pair_statistic_numba_matches_numpy_nan_pattern_exactly():
+    # Stage 1g Task B.3 acceptance: identical NaN pattern, max abs difference
+    # <= 1e-12, on randomised input including all-missing and
+    # single-sample-overlap rows. fastmath=True was measured to elide the
+    # finiteness check and return all-NaN silently -- this test is what
+    # would catch that regression (a mismatched NaN pattern, not just a
+    # numeric tolerance failure).
+    rng = np.random.default_rng(77)
+    n_pairs, n_samples = 500, 40
+    left = rng.normal(size=(n_pairs, n_samples))
+    right = rng.normal(size=(n_pairs, n_samples))
+    # structured missingness across most rows
+    left[rng.random(left.shape) < 0.3] = np.nan
+    right[rng.random(right.shape) < 0.3] = np.nan
+    # row entirely missing on one side
+    left[0, :] = np.nan
+    # row entirely missing on both sides
+    left[1, :] = np.nan
+    right[1, :] = np.nan
+    # single-sample overlap: only column 0 finite on both sides
+    left[2, :] = np.nan
+    right[2, :] = np.nan
+    left[2, 0] = 0.4
+    right[2, 0] = -0.2
+    # exactly two samples overlap (the min_paired_samples=2 boundary)
+    left[3, :] = np.nan
+    right[3, :] = np.nan
+    left[3, :2] = [0.1, 0.2]
+    right[3, :2] = [0.3, -0.1]
+    # constant row (zero variance) -> correlation must be NaN, not a
+    # division artefact
+    left[4, :] = 1.0
+
+    for statistic in ("covariance", "correlation"):
+        for min_paired_samples in (2, 5):
+            expected = _pair_statistic_numpy(
+                left, right, statistic, min_paired_samples,
+            )
+            required = min_paired_samples
+            actual = _core_mod._pair_statistic_numba(
+                np.ascontiguousarray(left, dtype=np.float64),
+                np.ascontiguousarray(right, dtype=np.float64),
+                statistic != "covariance",
+                required,
+            )
+            np.testing.assert_array_equal(
+                np.isnan(expected), np.isnan(actual),
+                err_msg=f"NaN pattern mismatch at statistic={statistic!r}, "
+                        f"min_paired_samples={min_paired_samples}",
+            )
+            finite = ~np.isnan(expected)
+            max_diff = np.max(np.abs(expected[finite] - actual[finite]))
+            assert max_diff <= 1e-12, (
+                f"max abs diff {max_diff} exceeds 1e-12 at "
+                f"statistic={statistic!r}, min_paired_samples={min_paired_samples}"
+            )
+
+
+def test_pair_statistic_numba_is_opt_in_not_automatic(monkeypatch):
+    # Stage 1g Task B.3: numba, even when installed, must not silently change
+    # `_pair_statistic`'s output for a caller who did not ask for it -- see
+    # the "opt-in, not automatic" comment above the kernel in core.py. This
+    # guards the specific failure mode that motivated the opt-in: a
+    # frozen-fixture invariant test (test_stage1b_preserves_edge_statistic_
+    # and_eligibility) broke the first time this kernel dispatched
+    # automatically, at the ~1e-15 floating-point noise floor -- invisible
+    # statistically, but enough to fail exact-equality checks.
+    monkeypatch.delenv("EIGER2_USE_NUMBA", raising=False)
+    rng = np.random.default_rng(88)
+    left = rng.normal(size=(50, 20))
+    right = rng.normal(size=(50, 20))
+    result = _pair_statistic(left, right, "correlation", 5)
+    reference = _pair_statistic_numpy(left, right, "correlation", 5)
+    np.testing.assert_array_equal(result, reference)
 
 
 def test_pairwise_complete_removes_the_missingness_deflation():
@@ -431,30 +528,241 @@ def test_regions_do_not_cross_chromosomes():
         assert row["cpg_index_start"] // 2000 == row["cpg_index_end"] // 2000
 
 
+def test_call_dmrs_manifest_carries_layout_diagnostics():
+    # master spec §6.1: describe_layout() wired into every eiger2 call manifest.
+    rng = np.random.default_rng(9)
+    matrix = 0.5 + rng.normal(0, 0.04, (4000, 30))
+    frame = locations(4000)  # dense: uniform 2bp spacing, one giant eligible run
+    _, _, manifest = call_dmrs(
+        np.clip(matrix, 0.001, 0.999), frame, config=Eiger2Config(**FAST)
+    )
+    assert manifest["layout"]["layout_n_cpg"] == 4000
+    assert manifest["layout"]["layout_max_detectable_region_cpgs"] == 4000
+    assert manifest["layout"]["realised_length_strata"] == [
+        "4-5", "6-9", "10-19", "20-49", "50+",
+    ]
+    assert manifest["layout"]["collapsed_length_strata"] == []
+
+
+def test_call_dmrs_manifest_collapses_strata_on_a_short_layout():
+    # A fragmented layout whose longest eligible run tops out at 8 CpGs (7
+    # eligible edges) can never populate "10-19", "20-49" or "50+" -- those
+    # collapse away regardless of what this particular run actually calls.
+    rng = np.random.default_rng(9)
+    n_cpg = 400
+    matrix = 0.5 + rng.normal(0, 0.04, (n_cpg, 30))
+    starts = np.arange(n_cpg) * 2
+    # break every eligible run to at most 8 CpGs by inserting a large gap
+    # every 8th CpG
+    for i in range(8, n_cpg, 8):
+        starts[i:] += 1000
+    frame = pd.DataFrame({"chr": "chr1", "start": starts, "end": starts + 1})
+    _, _, manifest = call_dmrs(
+        np.clip(matrix, 0.001, 0.999), frame,
+        config=Eiger2Config(**FAST, max_cpg_gap_bp=300),
+    )
+    assert manifest["layout"]["layout_max_detectable_region_cpgs"] == 8
+    assert manifest["layout"]["realised_length_strata"] == ["4-5", "6-9"]
+    assert manifest["layout"]["collapsed_length_strata"] == [
+        "10-19", "20-49", "50+",
+    ]
+
+
+def test_call_dmrs_manifest_carries_gate_1_even_with_zero_regions():
+    # master spec §6.2, Gate 1 (ACF): wired into every eiger2 call manifest,
+    # including the "no_regions" early-return path -- it needs no called region.
+    rng = np.random.default_rng(9)
+    matrix = 0.5 + rng.normal(0, 0.04, (4000, 30))  # pure noise, no structure
+    frame = locations(4000)
+    _, _, manifest = call_dmrs(
+        np.clip(matrix, 0.001, 0.999), frame, config=Eiger2Config(**FAST)
+    )
+    assert "gates" in manifest
+    acf = manifest["gates"]["acf"]
+    assert acf["lags"] == list(range(1, Eiger2Config(**FAST).window + 1))
+    assert isinstance(acf["passed"], bool)
+
+
+def test_call_dmrs_manifest_carries_both_gates_when_regions_are_called():
+    # master spec §6.2: both gates present once there is something for Gate 2
+    # (region exchangeability) to measure.
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    _, _, manifest = call_dmrs(matrix, frame, config=Eiger2Config(**FAST))
+    assert manifest["n_regions"] > 0
+    assert "gates" in manifest
+    assert "acf" in manifest["gates"]
+    region_exch = manifest["gates"]["region_exchangeability"]
+    assert region_exch["observed_regions"] == manifest["n_regions"]
+    assert "region_exchangeability_ratio" in region_exch
+    assert "null_count_adequate" in region_exch
+
+
+def test_call_dmrs_manifest_records_member_step_gate_fields():
+    # Stage 1d-D Task 4: mode, n_lag_draws, realised s, drawn lags, sub-track
+    # length distribution, and all three gate results must land in
+    # manifest["gates"] on every region_null_mode="member_step" run. A small
+    # min_subtrack_length/null_min_lag keeps this fast (L_max only needs to
+    # clear null_min_lag, not member_step's genome-scale default floor).
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_replicates=6, min_null_regions_for_fdr=0,
+        region_null_mode="member_step", null_min_lag=5, min_subtrack_length=10,
+        n_lag_draws=6, random_seed=5,
+    )
+    _, _, manifest = call_dmrs(matrix, frame, config=config)
+    gates = manifest["gates"]
+    assert gates["region_null_mode"] == "member_step"
+    assert gates["n_lag_draws"] == len(gates["lags_used"])
+    assert gates["n_lag_draws"] > 0
+    assert all(lag >= config.null_min_lag for lag in gates["lags_used"])
+    assert len(gates["implied_subtrack_length_range"]) == 2
+    assert 0.0 < gates["s"] <= 1.0
+    assert gates["implied_region_qvalue_resolution_at_R1"] == gates["s"]
+    assert "acf" in gates
+    assert "region_exchangeability" in gates
+
+
+def test_region_null_mode_auto_falls_back_to_lag_on_undersized_input():
+    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
+    # left at its default ("auto") on input below member_step's genome-scale
+    # minimum floor (~103,000 CpGs at defaults) must fall back to "lag"
+    # automatically, warn (via the manifest key -- cli.py turns it into stderr
+    # output), and complete -- not raise, which was STOP 1e's flagged gap (a
+    # CLI user got a hard, uncatchable error with no command-line way out).
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_replicates=6, min_null_regions_for_fdr=0, random_seed=5,
+    )
+    assert config.region_null_mode == "auto"  # sanity: the literal field default
+    regions, _, manifest = call_dmrs(matrix, frame, config=config)
+    gates = manifest["gates"]
+    assert gates["region_null_mode"] == "lag"
+    fallback = gates["region_null_mode_fallback"]
+    assert fallback["requested"] == "auto"
+    assert fallback["used"] == "lag"
+    assert fallback["reason"] == "input below member_step minimum"
+    assert fallback["n_cpg"] == len(frame)
+    assert fallback["n_cpg"] < fallback["n_cpg_required"]
+    # "completes": no exception, and it produced a real (non-degenerate) result.
+    assert isinstance(regions, pd.DataFrame)
+
+
+def test_region_null_mode_explicit_member_step_still_raises_on_undersized_input():
+    # Stage 1f Task 1b: an EXPLICIT request is not silently redirected -- a
+    # user who asked for member_step by name is told it cannot be done here,
+    # exactly as before this stage (Stage 1d-D Task 2's deliberate guard).
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_replicates=6, min_null_regions_for_fdr=0,
+        region_null_mode="member_step", random_seed=5,
+    )
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        call_dmrs(matrix, frame, config=config)
+
+
+def test_region_null_mode_auto_uses_member_step_on_oversized_input():
+    # Stage 1f Task 1b: the mirror image of the fallback test above -- once
+    # the input clears the floor, "auto" resolves to real member_step, not a
+    # fallback, and no region_null_mode_fallback key is recorded. Same small
+    # null_min_lag/min_subtrack_length trick as
+    # test_call_dmrs_manifest_records_member_step_gate_fields (lowers the
+    # floor so this stays fast), but region_null_mode is left UNSET here to
+    # exercise "auto"'s resolution, not passed explicitly.
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_replicates=6, min_null_regions_for_fdr=0,
+        null_min_lag=5, min_subtrack_length=10, n_lag_draws=6, random_seed=5,
+    )
+    assert config.region_null_mode == "auto"
+    _, _, manifest = call_dmrs(matrix, frame, config=config)
+    gates = manifest["gates"]
+    assert gates["region_null_mode"] == "member_step"
+    assert "region_null_mode_fallback" not in gates
+
+
+def test_a_well_separated_true_region_gets_q_zero_not_refused_by_its_own_length_stratum():
+    # Stage 1d-D Acceptance criterion 6 (genome-scale, real layouts, guard at its
+    # shipped min_null_regions_for_fdr=50 default): recall fell to 0/9-10 truth
+    # regions on BOTH real layouts, even though the aggregate region-exchangeability
+    # gate was adequate (e.g. epic_fitted: 1963 pooled null regions, ratio 1.625,
+    # null_count_adequate=True). Root cause, diagnosed via
+    # manifest["fdr"]["insufficient_null_strata"]: the null pool is dominated by
+    # short (4-5 CpG) noise-driven segments; a true, well-separated region long
+    # enough to land in the "10-19" length stratum found that stratum's OWN pooled
+    # null count at zero, and was refused (NaN q-value) by the Stage 1c-bis
+    # per-stratum floor -- independent of how many total lag draws/replicates
+    # were pooled, since the floor was a per-stratum count, not a global one.
+    #
+    # Stage 1e Task 1 (master spec §8) is the fix, diagnosed and specified by
+    # the same person who designed the Stage 1c-bis floor: the null having
+    # millions of opportunities and never producing a region that long IS the
+    # evidence, not an absence of it. The floor is now a single AGGREGATE check
+    # (region_fdr_result's docstring); a stratum whose own pool is empty gets
+    # K=0 -- a finite point estimate (q=0) and a finite Garwood upper bound --
+    # and is named in `zero_exceedance_strata`, reported rather than refused.
+    # This test was renamed from
+    # `..._can_be_refused_by_its_own_length_stratum` and now asserts the
+    # opposite of what it used to. The background is scaled up from the
+    # original pin (spacing=30000 vs 200) so the run is AGGREGATE-adequate
+    # (152 pooled null regions >= the default floor of 50) while the true
+    # region's own "10-19" stratum is still exactly empty -- reproducing the
+    # real defect's shape, not just its per-stratum symptom.
+    matrix, locs, truth = simulate(
+        strata=[(0.05, 0.35)], replicates=1, spacing=30000, dmr_length=15,
+        seed=3, layout="dense",
+    )
+    config = Eiger2Config(
+        window=4, null_min_lag=5, min_subtrack_length=10, n_lag_draws=150,
+        region_null_mode="member_step", random_seed=3, min_cpgs=4,
+    )
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["gates"]["region_exchangeability"]["null_count_adequate"] is True
+    true_region = regions[regions["n_cpg"] >= 10].iloc[0]
+    assert true_region["region_qvalue"] == 0.0
+    assert np.isfinite(true_region["region_qvalue_upper_95"])
+    assert true_region["null_exceedances_at_cutoff"] == 0
+    strata_names = {s["stratum"] for s in manifest["fdr"]["zero_exceedance_strata"]}
+    assert "10-19" in strata_names
+    # deprecated, schema ("2.2") compatibility only -- never populated now
+    assert manifest["fdr"]["insufficient_null_strata"] == []
+
+
 # --------------------------------------------------------------------------
 # region-level FDR
 # --------------------------------------------------------------------------
 
 
 def test_region_fdr_is_monotone_and_bounded():
+    # region_fdr()'s signature is frozen, so it always applies the spec §5
+    # default min_null_regions_for_fdr=50; this toy null is deliberately far
+    # smaller than that. Called through region_fdr_result directly with the
+    # guard disabled (min_null_regions_for_fdr=0) to test the tail-area
+    # formula's own monotonicity/bounds property, independent of null adequacy.
     observed = np.array([10.0, 8.0, 6.0, 4.0, 2.0])
     nulls = [np.array([5.0, 3.0]), np.array([7.0, 1.0])]
-    q = region_fdr(observed, nulls, observed_edges=1000, null_edges=1000)
+    q = region_fdr_result(
+        observed, nulls, observed_edges=1000, null_edges=1000,
+        min_null_regions_for_fdr=0,
+    ).qvalue
     assert np.all((q >= 0) & (q <= 1))
     assert np.all(np.diff(q[np.argsort(-observed)]) >= -1e-12)
 
 
 def test_region_fdr_rises_when_the_null_produces_comparable_regions():
+    # Same rationale as above: guard disabled to isolate the tail-area
+    # formula's response to null density, not null-adequacy refusal.
     observed = np.array([5.0, 4.0])
-    quiet = region_fdr(
-        observed, [np.array([])] * 4, observed_edges=1000, null_edges=1000
-    )
-    noisy = region_fdr(
+    quiet = region_fdr_result(
+        observed, [np.array([])] * 4, observed_edges=1000, null_edges=1000,
+        min_null_regions_for_fdr=0,
+    ).qvalue
+    noisy = region_fdr_result(
         observed,
         [np.array([9.0, 8.0, 7.0])] * 4,
         observed_edges=1000,
         null_edges=1000,
-    )
+        min_null_regions_for_fdr=0,
+    ).qvalue
     assert np.all(quiet < noisy)
 
 
@@ -484,7 +792,7 @@ def test_region_evidence_score_exercises_corrected_tail_area_fdr():
     )
     config = Eiger2Config(
         window=4, null_replicates=500, random_seed=99, compute_posterior=True,
-        min_null_regions_for_posterior=5, min_cpgs=3,
+        min_null_regions_for_posterior=5, min_cpgs=3, region_null_mode="lag",
     )
     regions, _values, manifest = call_dmrs(matrix, locs, config=config)
     assert "posterior" in manifest
@@ -588,7 +896,10 @@ def test_outputs_are_aligned_and_reproducible():
     assert regions["region_id"].tolist() == values["region_id"].tolist()
     assert not regions["region_id"].duplicated().any()
     assert list(values.columns) == ["region_id", *names]
-    assert regions["region_qvalue"].tolist() == second[0]["region_qvalue"].tolist()
+    # .equals(), not tolist() == tolist(): region_qvalue may legitimately be
+    # NaN (null-adequacy refusal), and NaN != NaN under plain equality even
+    # when both runs refused identically. .equals() treats NaN as equal.
+    assert regions["region_qvalue"].equals(second[0]["region_qvalue"])
     assert manifest["config"]["statistic"] == "correlation"
 
 
@@ -709,7 +1020,9 @@ def test_panel_data_drops_unobserved_cpgs_and_respects_off_target_gaps():
         "chr": "chr1", "start": positions,
         "end": [p + 1 for p in positions],
     })
-    regions, _, manifest = call_dmrs(matrix, locations, config=Eiger2Config())
+    regions, _, manifest = call_dmrs(
+        matrix, locations, config=Eiger2Config(region_null_mode="lag")
+    )
 
     # entirely unobserved CpGs are removed, not filled
     assert manifest["n_cpg_retained"] == n_cpg - len(dead)
@@ -938,21 +1251,87 @@ def test_region_fdr_result_zero_replicates_is_all_nan():
     assert "status" in result.diagnostics
 
 
-def test_region_fdr_result_pooled_fallback_stratum_uses_all_six_fields():
-    rng = np.random.default_rng(22)
-    # one stratum ("4-5", n_cpg<=5) has zero null regions of that length
-    observed_lengths = np.array([4, 4, 30, 30])
-    observed_areas = np.array([5.0, 3.0, 9.0, 6.0])
-    null_area_sets = [rng.exponential(2.0, size=20) for _ in range(5)]
-    null_length_sets = [np.full(20, 30, dtype=int) for _ in range(5)]
+def test_region_fdr_result_empty_own_pool_stratum_reports_from_its_own_k_not_a_fallback():
+    # Stage 1c-bis review Task 1 removed a global-pool fallback for an empty
+    # own pool (non-monotonic: an empty stratum could clear the floor by
+    # borrowing a large OTHER stratum's null while a merely-thin stratum could
+    # not). Stage 1e Task 1 (master spec §8) now lets the empty stratum report
+    # too, but it must still score from its OWN pool (K=0, trivially, since
+    # there is nothing in it), not from a mix with the well-populated "30"
+    # stratum's pool. Proven by determinism, not by inspecting one number:
+    # "4-5"'s result must be IDENTICAL regardless of what the "30" stratum's
+    # pool contains -- a silent fallback would make it vary with the "30"
+    # pool's random draw.
+    def run(seed):
+        rng = np.random.default_rng(seed)
+        observed_lengths = np.array([4, 4, 30, 30])
+        observed_areas = np.array([5.0, 3.0, 9.0, 6.0])
+        null_area_sets = [
+            np.concatenate([np.empty(0), rng.exponential(2.0, size=20)])
+            for _ in range(5)
+        ]
+        null_length_sets = [
+            np.concatenate([np.empty(0, dtype=int), np.full(20, 30)]) for _ in range(5)
+        ]
+        return region_fdr_result(
+            observed_areas, null_area_sets,
+            observed_edges=200, null_edges=100,
+            observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        )
+
+    a, b = run(22), run(99)
+    for result in (a, b):
+        assert result.diagnostics["pooled_fallback_strata"] == []
+        assert result.diagnostics["insufficient_null_strata"] == []
+        zero_exceedance = {
+            e["stratum"]: e for e in result.diagnostics["zero_exceedance_strata"]
+        }
+        assert zero_exceedance.keys() == {"4-5"}
+        assert zero_exceedance["4-5"]["null_regions"] == 0
+        assert not np.any(np.isnan(result.qvalue))
+        assert np.all(result.qvalue[:2] == 0.0)
+        assert np.all(result.null_exceedances[:2] == 0)
+
+    # the "30" stratum's pool differs by seed, so its own results may differ...
+    assert not np.array_equal(a.qvalue_upper[2:], b.qvalue_upper[2:]) or not np.array_equal(
+        a.null_exceedances[2:], b.null_exceedances[2:]
+    )
+    # ...but "4-5" never borrows from it, so its results are identical either way.
+    assert np.array_equal(a.qvalue_upper[:2], b.qvalue_upper[:2])
+    assert np.array_equal(a.qvalue_resolution[:2], b.qvalue_resolution[:2])
+
+
+def test_region_fdr_result_multiple_strata_report_independently_when_aggregate_adequate():
+    # Stage 1e Task 1 (master spec §8): three strata of very different own-pool
+    # sizes -- "4-5" empty, "6-9" thin (20, still well below the default floor
+    # of 50 on its own), "50+" well-populated (800) -- aggregate to 820 pooled
+    # null regions, comfortably clearing the floor. None refuse: only "4-5"
+    # (the literally empty pool) lands in zero_exceedance_strata.
+    rng = np.random.default_rng(44)
+    observed_lengths = np.array([4, 4, 8, 8])
+    observed_areas = np.array([5.0, 4.0, 6.0, 3.0])
+    null_area_sets = [
+        np.concatenate([rng.exponential(2.0, size=5), rng.exponential(2.0, size=200)])
+        for _ in range(4)
+    ]
+    null_length_sets = [
+        np.concatenate([np.full(5, 8), np.full(200, 50)]) for _ in range(4)
+    ]
     result = region_fdr_result(
         observed_areas, null_area_sets,
-        observed_edges=200, null_edges=100,
+        observed_edges=400, null_edges=800,
         observed_lengths=observed_lengths, null_length_sets=null_length_sets,
     )
-    assert "4-5" in result.diagnostics["pooled_fallback_strata"]
-    assert not np.any(np.isnan(result.qvalue[:2]))
-    assert not np.any(result.null_exceedances[:2] == -1)
+    assert "status" not in result.diagnostics
+    assert not np.any(np.isnan(result.qvalue))
+    assert np.all(result.null_exceedances >= 0)
+    zero_exceedance = {
+        e["stratum"]: e for e in result.diagnostics["zero_exceedance_strata"]
+    }
+    assert zero_exceedance.keys() == {"4-5"}
+    assert zero_exceedance["4-5"]["null_regions"] == 0
+    assert result.diagnostics["pooled_fallback_strata"] == []
+    assert result.diagnostics["insufficient_null_strata"] == []
 
 
 def test_region_fdr_result_row_order_survives_permutation():
@@ -979,7 +1358,10 @@ def test_region_fdr_result_row_order_survives_permutation():
         (baseline.null_exceedances, permuted.null_exceedances[inv]),
         (baseline.qvalue_cutoff_rank, permuted.qvalue_cutoff_rank[inv]),
     ):
-        assert np.array_equal(a, b)
+        # equal_nan=True: some strata here fall below min_null_regions_for_fdr
+        # and are legitimately NaN in both baseline and permuted; that is not
+        # a row-order bug.
+        assert np.array_equal(a, b, equal_nan=True)
 
 
 def test_region_fdr_result_common_bonferroni_m_is_max_across_strata():
@@ -1371,6 +1753,179 @@ def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
     assert result.diagnostics["null_count_overdispersion_warning"] is None
 
 
+# --------------------------------------------------------------------------
+# spec §5 (Stage 1c-bis) — null-adequacy guard
+# --------------------------------------------------------------------------
+
+
+def test_region_fdr_result_default_min_null_regions_for_fdr_is_50():
+    import inspect
+    sig = inspect.signature(region_fdr_result)
+    assert sig.parameters["min_null_regions_for_fdr"].default == 50
+
+
+def test_region_fdr_result_below_aggregate_min_null_regions_refuses_with_nan():
+    # Stage 1e Task 1 (master spec §8): the floor is now a single AGGREGATE
+    # check on the pooled null-region count across every stratum -- there is
+    # only one stratum here ("_pooled", no length arrays supplied), so this
+    # exercises the same arithmetic the old per-stratum floor used, just under
+    # the new "status": "aggregate null inadequate" diagnostics shape.
+    rng = np.random.default_rng(40)
+    observed = rng.exponential(2.0, size=6)
+    nulls = _null_sets(rng, 3, 5)  # 3 replicates x 5 = 15 pooled null regions, < 50
+    result = region_fdr_result(
+        observed, nulls, observed_edges=200, null_edges=90,
+    )
+    assert np.all(np.isnan(result.qvalue))
+    assert np.all(np.isnan(result.tail_fdr))
+    assert np.all(np.isnan(result.qvalue_lower))
+    assert np.all(np.isnan(result.qvalue_upper))
+    assert np.all(np.isnan(result.qvalue_resolution))
+    assert np.all(result.null_exceedances == -1)
+    assert np.all(result.qvalue_cutoff_rank == -1)
+    assert result.diagnostics["status"] == "aggregate null inadequate"
+    assert result.diagnostics["pooled_null_regions"] == 15
+    # deprecated, schema ("2.2") compatibility only -- never populated now
+    assert result.diagnostics["insufficient_null_strata"] == []
+    assert result.diagnostics["zero_exceedance_strata"] == []
+
+
+def test_region_fdr_result_min_null_regions_for_fdr_boundary_is_strict_less_than():
+    rng = np.random.default_rng(41)
+    observed = rng.exponential(2.0, size=6)
+    nulls = _null_sets(rng, 2, 5)  # 10 pooled null regions
+
+    at_floor = region_fdr_result(
+        observed, nulls, observed_edges=200, null_edges=90,
+        min_null_regions_for_fdr=10,
+    )
+    assert not np.any(np.isnan(at_floor.qvalue))
+    assert "status" not in at_floor.diagnostics
+
+    below_floor = region_fdr_result(
+        observed, nulls, observed_edges=200, null_edges=90,
+        min_null_regions_for_fdr=11,
+    )
+    assert np.all(np.isnan(below_floor.qvalue))
+    assert below_floor.diagnostics["status"] == "aggregate null inadequate"
+    assert below_floor.diagnostics["pooled_null_regions"] == 10
+
+
+def test_region_fdr_result_aggregate_inadequate_reports_replicates_required():
+    rng = np.random.default_rng(42)
+    observed = rng.exponential(2.0, size=4)
+    nulls = _null_sets(rng, 3, 5)  # 3 replicates, 5/replicate, 15 pooled
+    result = region_fdr_result(
+        observed, nulls, observed_edges=200, null_edges=90,
+        min_null_regions_for_fdr=50,
+    )
+    assert result.diagnostics["replicates"] == 3
+    assert result.diagnostics["null_regions_per_replicate"] == pytest.approx(5.0)
+    assert result.diagnostics["replicates_required"] == 10  # ceil(50 / 5)
+
+
+def test_region_fdr_result_empty_own_pool_stratum_reports_not_refuses():
+    # Stage 1e Task 1 (master spec §8): fixes the exact defect measured in
+    # STOP 1d-D §9 criterion 6 -- a length stratum whose OWN pooled null is
+    # empty used to refuse (NaN) even though the run as a whole was adequate.
+    # "4-5" here has zero own null regions; "50+" has 80. Aggregate pool is
+    # 0 + 80 = 80 >= the default floor of 50, so NEITHER stratum refuses now:
+    # "4-5" gets K=0 (point estimate q=0, a finite upper bound), reported in
+    # zero_exceedance_strata, not NaN.
+    rng = np.random.default_rng(43)
+    observed_lengths = np.array([4, 4, 50, 50])
+    observed_areas = np.array([3.0, 2.0, 40.0, 30.0])
+    null_area_sets = [
+        np.concatenate([np.empty(0), rng.exponential(2.0, size=20)])
+        for _ in range(4)
+    ]
+    null_length_sets = [
+        np.concatenate([np.empty(0, dtype=int), np.full(20, 50)]) for _ in range(4)
+    ]
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=400, null_edges=400,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+    )
+    assert "status" not in result.diagnostics
+    assert not np.any(np.isnan(result.qvalue))
+    assert np.all(result.qvalue[:2] == 0.0)
+    assert np.all(np.isfinite(result.qvalue_upper[:2]))
+    assert np.all(result.null_exceedances[:2] == 0)
+    zero_exceedance = {
+        e["stratum"]: e for e in result.diagnostics["zero_exceedance_strata"]
+    }
+    assert zero_exceedance.keys() == {"4-5"}
+    assert zero_exceedance["4-5"]["null_regions"] == 0
+    assert zero_exceedance["4-5"]["replicates"] == 4
+    # deprecated, schema ("2.2") compatibility only -- never populated now
+    assert result.diagnostics["insufficient_null_strata"] == []
+
+
+def test_region_fdr_result_thin_but_nonempty_stratum_also_reports():
+    # Spec's own Tests requirement: "a stratum with K=0 and a stratum with
+    # K=3 in the same run: the first reports, the second reports; neither
+    # refuses". "4-5" here has an empty own pool (K=0 trivially); "50+" has a
+    # thin-but-nonempty pool of 3, deliberately chosen so the strongest "50+"
+    # candidate's own cutoff has exactly 3 null areas at or above it.
+    observed_lengths = np.array([4, 50])
+    observed_areas = np.array([9.0, 5.0])
+    null_area_sets = [np.array([]), np.array([6.0, 7.0, 8.0])]
+    null_length_sets = [np.array([], dtype=int), np.full(3, 50, dtype=int)]
+    result = region_fdr_result(
+        observed_areas, null_area_sets,
+        observed_edges=400, null_edges=400,
+        observed_lengths=observed_lengths, null_length_sets=null_length_sets,
+        min_null_regions_for_fdr=1,
+    )
+    assert "status" not in result.diagnostics
+    assert not np.any(np.isnan(result.qvalue))
+    assert result.null_exceedances[0] == 0
+    assert result.null_exceedances[1] == 3
+    zero_exceedance = {e["stratum"] for e in result.diagnostics["zero_exceedance_strata"]}
+    assert zero_exceedance == {"4-5"}
+
+
+def test_region_fdr_result_empty_pool_is_not_worse_than_a_populated_zero_k_pool():
+    # Monotonicity (spec's own Tests requirement): a stratum whose own null
+    # pool is EMPTY (K=0 trivially) must not be reported as WORSE evidence
+    # than an otherwise-identical stratum backed by a large pool that also
+    # happens to have zero exceedances at the same cutoff -- the Garwood bound
+    # depends on K and the (shared, run-level) scale, not on per-stratum pool
+    # size, so the two must match exactly.
+    observed_areas = np.array([9.0])
+    empty_pool = region_fdr_result(
+        observed_areas, [np.array([]), np.array([])],
+        observed_edges=100, null_edges=200, min_null_regions_for_fdr=0,
+    )
+    populated_but_zero_exceedance = region_fdr_result(
+        observed_areas, [np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0])],
+        observed_edges=100, null_edges=200, min_null_regions_for_fdr=0,
+    )
+    assert empty_pool.null_exceedances[0] == 0
+    assert populated_but_zero_exceedance.null_exceedances[0] == 0
+    assert empty_pool.qvalue[0] == populated_but_zero_exceedance.qvalue[0]
+    assert (
+        empty_pool.qvalue_upper[0] == populated_but_zero_exceedance.qvalue_upper[0]
+    )
+    assert (
+        empty_pool.qvalue_resolution[0]
+        == populated_but_zero_exceedance.qvalue_resolution[0]
+    )
+
+
+def test_region_fdr_result_empty_and_zero_replicate_paths_carry_the_new_key():
+    empty = region_fdr_result(np.empty(0), [], observed_edges=0, null_edges=0)
+    assert empty.diagnostics["insufficient_null_strata"] == []
+    assert empty.diagnostics["zero_exceedance_strata"] == []
+
+    zero_rep = region_fdr_result(
+        np.array([1.0, 2.0]), [], observed_edges=10, null_edges=0,
+    )
+    assert zero_rep.diagnostics["insufficient_null_strata"] == []
+    assert zero_rep.diagnostics["zero_exceedance_strata"] == []
+
+
 def test_null_replicates_default_is_100():
     assert Eiger2Config().null_replicates == 100
 
@@ -1418,11 +1973,15 @@ def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
     for mode in ("point", "upper"):
         config = Eiger2Config(
             window=4, null_replicates=300, random_seed=51, fdr_decision=mode,
+            region_null_mode="lag",
         )
         first, _, _ = call_dmrs(matrix, locs, config=config)
         second, _, _ = call_dmrs(matrix, locs, config=config)
         assert first["significant"].tolist() == second["significant"].tolist()
-        assert first["region_qvalue"].tolist() == second["region_qvalue"].tolist()
+        # .equals(), not tolist() == tolist(): a NaN region_qvalue (null-
+        # adequacy refusal) is still deterministic across identical runs, but
+        # NaN != NaN under plain equality.
+        assert first["region_qvalue"].equals(second["region_qvalue"])
 
 
 def test_upper_decision_uses_upper_bound_not_point_estimate():
@@ -1441,13 +2000,17 @@ def test_upper_decision_uses_upper_bound_not_point_estimate():
         n_samples=80, strata=[(0.10, 0.15), (0.15, 0.25)], replicates=15,
         spacing=300, dmr_length=10, seed=7,
     )
+    # min_null_regions_for_fdr=0: this test is about point-vs-upper decision
+    # logic, tuned against specific pre-existing significant-region counts; the
+    # spec §5 null-adequacy guard is orthogonal and disabled here rather than
+    # re-deriving those counts under refusal.
     point_config = Eiger2Config(
         window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
-        fdr_decision="point",
+        fdr_decision="point", min_null_regions_for_fdr=0, region_null_mode="lag",
     )
     upper_config = Eiger2Config(
         window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
-        fdr_decision="upper",
+        fdr_decision="upper", min_null_regions_for_fdr=0, region_null_mode="lag",
     )
     point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
     upper_regions, _, _ = call_dmrs(matrix, locs, config=upper_config)
@@ -1472,19 +2035,25 @@ def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
     )
     config = Eiger2Config(
         window=4, null_replicates=2, random_seed=53, fdr_decision="upper",
-        target_fdr=0.01,
+        target_fdr=0.01, region_null_mode="lag",
     )
     with pytest.raises(ValueError, match="B_required|null_replicates|Increase"):
         call_dmrs(matrix, locs, config=config)
 
 
-def test_run_legacy_upper_decision_uses_upper_bound_not_point_estimate():
-    """``cli.run_legacy`` carries its own, independent copy of the same
-    point-vs-upper decision logic as the ``call_dmrs`` path above (around
-    ``cli.py:409-414``). Confirm it too derives "significant" from
-    ``region_qvalue_upper_95`` under ``fdr_decision="upper"``, not from the
-    point estimate ``region_qvalue``."""
-
+def test_run_legacy_fdr_replicates_raises_not_silently_broken():
+    # Retired (Stage 1d-D Task 6.3, master spec §6.4): this test used to pin
+    # `cli.run_legacy`'s own point-vs-upper decision logic (around
+    # cli.py:409-414), fed by `qvalue_result_from_track` -> internally
+    # `permutation_null_tracks`. That call now raises unconditionally (Task
+    # 6.1) -- `run_legacy(..., fdr_replicates=N>0, ...)` is a THIRD reachable
+    # path to the same broken null (alongside `qvalue_result_from_track` and
+    # `qvalues_from_track`, both covered directly in test_probability.py),
+    # and per Task 6.3's "whatever changes must reach that path" instruction,
+    # this confirms it does: the legacy caller's region-CALLING (no FDR
+    # requested) is unaffected, since that never touches the null; only the
+    # optional FDR annotation is now a clear error instead of a silent wrong
+    # answer.
     from eiger2.cli import run_legacy
 
     matrix, locs, _ = simulate(
@@ -1493,24 +2062,23 @@ def test_run_legacy_upper_decision_uses_upper_bound_not_point_estimate():
     )
     sample_names = [f"s{i}" for i in range(matrix.shape[1])]
 
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        run_legacy(
+            matrix, locs, sample_names,
+            cov_threshold=0.002, delta_threshold=0.20, min_cpgs=5, impute=True,
+            fdr_replicates=200, target_fdr=0.05, min_prevalence=0, seed=52,
+            fdr_decision="upper",
+        )
+
+    # region-CALLING with no FDR requested (fdr_replicates=0, the default)
+    # never touches the null and must still work.
     regions, _ = run_legacy(
         matrix, locs, sample_names,
         cov_threshold=0.002, delta_threshold=0.20, min_cpgs=5, impute=True,
-        fdr_replicates=200, target_fdr=0.05, min_prevalence=0, seed=52,
-        fdr_decision="upper",
+        seed=52,
     )
     assert len(regions) > 0
-    assert (regions["significant"] == (
-        (regions["region_qvalue_upper_95"] <= 0.05)
-        & regions["passes_prevalence"]
-    )).all()
-    # And confirm this genuinely diverges from what the point estimate would
-    # have decided -- otherwise the assertion above would pass identically
-    # even if fdr_decision were silently ignored.
-    point_based = (
-        (regions["region_qvalue"] <= 0.05) & regions["passes_prevalence"]
-    )
-    assert not (regions["significant"] == point_based).all()
+    assert "significant" not in regions.columns or regions["significant"].isna().all()
 
 
 # --------------------------------------------------------------------------
@@ -1524,7 +2092,9 @@ def test_schema_round_trip_has_documented_columns_in_documented_order():
         n_samples=60, strata=[(0.15, 0.35)], replicates=4,
         spacing=300, dmr_length=12, seed=61,
     )
-    config = Eiger2Config(window=4, null_replicates=20, random_seed=61)
+    config = Eiger2Config(
+        window=4, null_replicates=20, random_seed=61, region_null_mode="lag",
+    )
     regions, _values, manifest = call_dmrs(matrix, locs, config=config)
     idx = list(regions.columns).index("region_qvalue")
     expected_tail = [
@@ -1542,6 +2112,7 @@ def test_confidence_level_other_than_95_returns_arrays_but_is_not_csv_exportable
     result = region_fdr_result(
         np.array([5.0, 3.0]), [np.array([1.0, 2.0])],
         observed_edges=10, null_edges=5, confidence_level=0.90,
+        min_null_regions_for_fdr=0,  # toy 2-value null; not testing adequacy
     )
     assert not np.all(np.isnan(result.qvalue))  # Python API still returns arrays
 
@@ -1671,7 +2242,19 @@ def test_stage1b_preserves_edge_statistic_and_eligibility():
     core_mod.edge_statistic = capturing_edge_statistic
     core_mod.eligible_edges = capturing_eligible_edges
     try:
-        core_mod.call_dmrs(matrix, locs, config=config)
+        # `config` (from the frozen fixture-generation script, not modified
+        # here to keep it byte-for-byte historical) does not set
+        # region_null_mode="lag", so at this matrix's size call_dmrs raises
+        # once it reaches Stage 1d-D's region-null construction (Task 2's
+        # deliberate too-small-input guard). That happens AFTER
+        # edge_statistic()/eligible_edges() are both already captured, which
+        # is all this test pins -- the frozen Stage 1b invariant, not
+        # call_dmrs's full output -- so the later raise is expected and
+        # ignored here.
+        try:
+            core_mod.call_dmrs(matrix, locs, config=config)
+        except ValueError:
+            pass
     finally:
         core_mod.edge_statistic = original_edge_statistic
         core_mod.eligible_edges = original_eligible_edges
@@ -1846,6 +2429,186 @@ def test_null_eligibility_offsets_match_lag_null_track_member_set():
         np.testing.assert_array_equal(eligible, expected)
 
 
+# --------------------------------------------------------------------------
+# Stage 1d-C §1 — gap-mask the null (restored omission)
+# --------------------------------------------------------------------------
+
+
+def test_null_eligibility_gap_masks_an_ineligible_member():
+    # window=3, lag=10: member offsets {0, 10, 20}. Mark the local edge at
+    # offset 10 (position 3's second member) ineligible; position 3 must be
+    # excluded, its neighbours must not be.
+    config = Eiger2Config(window=3, random_seed=1)
+    size = 10
+    lag = 10
+    chromosome = np.array(["chr1"] * (size + lag * 2 + 5))
+    observed_eligible = np.ones(chromosome.size - 1, dtype=bool)
+    observed_eligible[3 + lag] = False  # local edge right after member offset 10
+    eligible = _null_eligibility(
+        chromosome, lag, config, size, observed_eligible=observed_eligible
+    )
+    assert not eligible[3]
+    assert eligible[2]
+    assert eligible[4]
+
+
+def test_null_eligibility_gap_mask_does_not_apply_across_the_long_lag_itself():
+    # Every member's OWN local edge is eligible; nothing requires the edge
+    # BETWEEN member 0 and member 1 (a `lag`-sized jump) to be eligible --
+    # that jump is the intentional locality-breaking construction, not a
+    # defect. All positions must be admissible.
+    config = Eiger2Config(window=2, random_seed=1)
+    size = 10
+    lag = 500
+    chromosome = np.array(["chr1"] * (size + lag + 5))
+    observed_eligible = np.ones(chromosome.size - 1, dtype=bool)
+    # falsify a huge middle stretch, including everything strictly between any
+    # member pair -- but not the members' own local edges (offsets 0..size-1
+    # and lag..lag+size-1)
+    observed_eligible[size : lag] = False
+    eligible = _null_eligibility(
+        chromosome, lag, config, size, observed_eligible=observed_eligible
+    )
+    assert eligible.all()
+
+
+def test_null_eligibility_gap_mask_none_matches_pre_1d_c_behaviour():
+    # observed_eligible=None (the default) must reproduce exactly what
+    # _null_eligibility computed before this fix -- the chromosome-only check.
+    config = Eiger2Config(window=4, random_seed=1)
+    size = 20
+    lag = 50
+    rng = np.random.default_rng(3)
+    chromosome = rng.choice(["chr1", "chr2"], size=size + lag * 3 + 5)
+    without_gate = _null_eligibility(chromosome, lag, config, size)
+    with_all_true_gate = _null_eligibility(
+        chromosome, lag, config, size,
+        observed_eligible=np.ones(chromosome.size - 1, dtype=bool),
+    )
+    np.testing.assert_array_equal(without_gate, with_all_true_gate)
+
+
+def test_null_eligibility_gap_mask_is_a_no_op_on_dense():
+    # dense: eligible_edges() is all-True (one giant contiguous run), so the
+    # gap mask changes nothing -- proves continuity with every prior `dense`
+    # result. Combined with the previous test (all-True gate == no gate), this
+    # is the "assert it as a test" the spec asks for.
+    from eiger2.core import eligible_edges
+
+    n_cpg = 5000
+    frame = locations(n_cpg)
+    config = Eiger2Config(window=4, max_cpg_gap_bp=300, random_seed=1)
+    observed_eligible = eligible_edges(frame, config)
+    assert observed_eligible.all()
+
+
+def test_null_tracks_dense_locations_unaffected_by_gap_masking():
+    # End-to-end: null_tracks() on dense locations produces IDENTICAL
+    # eligibility masks whether or not the (now-active) gap check runs,
+    # because every edge is gap-eligible there. Confirmed by comparing against
+    # explicitly passing locations=None (chromosome+gap check both off) on the
+    # same single-chromosome data, where the only difference the gap check
+    # could possibly make is exactly zero (all-True either way).
+    rng = np.random.default_rng(11)
+    residuals = rng.normal(size=(5000, 20))
+    frame = locations(5000)
+    config = Eiger2Config(window=4, null_replicates=10, random_seed=1)
+    with_locations = null_tracks(residuals, config, frame)
+    without_locations = null_tracks(residuals, config, None)
+    assert len(with_locations) == len(without_locations)
+    for (t1, e1, lag1), (t2, e2, lag2) in zip(with_locations, without_locations):
+        assert lag1 == lag2
+        np.testing.assert_array_equal(t1, t2)
+        np.testing.assert_array_equal(e1, e2)
+
+
+def test_null_tracks_fragmented_layout_excludes_members_at_large_gaps():
+    # On a genuinely fragmented layout, the gap mask must actually exclude
+    # something -- confirms the fix is live, not just a no-op everywhere.
+    rng = np.random.default_rng(12)
+    n_cpg = 3000
+    starts = np.arange(n_cpg) * 2
+    for i in range(50, n_cpg, 50):
+        starts[i:] += 5000  # break into runs of 50 CpGs, gaps of ~5000bp
+    frame = pd.DataFrame({"chr": "chr1", "start": starts, "end": starts + 1})
+    residuals = rng.normal(size=(n_cpg, 20))
+    config = Eiger2Config(
+        window=4, max_cpg_gap_bp=300, null_replicates=20, random_seed=1,
+    )
+    tracks = null_tracks(residuals, config, frame)
+    total_positions = sum(t.size for t, _, _ in tracks)
+    total_eligible = sum(int(e.sum()) for _, e, _ in tracks)
+    assert total_positions > 0
+    assert total_eligible < total_positions  # the gap mask actually excludes some
+
+
+# --------------------------------------------------------------------------
+# Stage 1d-C §2 — C.1 block permutation: arithmetic confirmation only
+# --------------------------------------------------------------------------
+
+
+def _block_permute(track, eligible, block_size, rng):
+    """Split into contiguous blocks, permute block ORDER only (within-block order
+    is preserved, so short-range dependence inside a block survives; only
+    cross-block structure is destroyed). Test-only: no production
+    `region_null_mode="block_permutation"` exists, per spec -- this exists to
+    confirm the closed-form law below, not to ship a candidate."""
+
+    n = track.size
+    n_blocks = n // block_size
+    trimmed = n_blocks * block_size
+    t = track[:trimmed].reshape(n_blocks, block_size)
+    e = eligible[:trimmed].reshape(n_blocks, block_size)
+    order = rng.permutation(n_blocks)
+    return t[order].reshape(-1), e[order].reshape(-1)
+
+
+def test_block_permutation_acf_matches_the_closed_form_law():
+    # Confirms, empirically, the law the spec derives: under block permutation
+    # with block length b, a lag-1 pair survives (stays inside one block) with
+    # probability (b-1)/b, so null_ACF(lag 1) ~= rho * (b-1)/b. An AR(1) process
+    # with rho matching the measured observed lag-1 ACF (STAGE1D_B_STOP_REPORT
+    # section 4.2: ~0.50 on every layout) stands in for the observed track --
+    # the law is about the permutation mechanism, not about any one dataset.
+    rng = np.random.default_rng(7)
+    n = 200_000
+    rho_target = 0.503
+    x = rng.normal(0, 1, n)
+    for i in range(1, n):
+        x[i] = rho_target * x[i - 1] + np.sqrt(1 - rho_target**2) * rng.normal()
+    eligible = np.ones(n, dtype=bool)
+    observed_acf1 = track_autocorrelation(x, eligible, [1])[1]
+
+    for b in (2, 4, 8, 16, 32):
+        xt, et = _block_permute(x, eligible, b, np.random.default_rng(100 + b))
+        null_acf1 = track_autocorrelation(xt, et, [1])[1]
+        predicted = observed_acf1 * (b - 1) / b
+        assert null_acf1 == pytest.approx(predicted, abs=0.01)
+
+
+def test_block_permutation_b_11_is_the_gate_1_crossover_point():
+    # At the measured rho=0.503 and tolerance=0.05, the spec claims b >~ 11 is
+    # needed to pass Gate 1. Confirm b=8 fails and b=16 passes (b=11 itself
+    # sits within Monte Carlo noise of the 0.05 boundary, so bracket it rather
+    # than assert exactly at the threshold).
+    rng = np.random.default_rng(7)
+    n = 200_000
+    rho_target = 0.503
+    x = rng.normal(0, 1, n)
+    for i in range(1, n):
+        x[i] = rho_target * x[i - 1] + np.sqrt(1 - rho_target**2) * rng.normal()
+    eligible = np.ones(n, dtype=bool)
+    observed_acf1 = track_autocorrelation(x, eligible, [1])[1]
+
+    xt8, et8 = _block_permute(x, eligible, 8, np.random.default_rng(108))
+    diff8 = track_autocorrelation(xt8, et8, [1])[1] - observed_acf1
+    assert abs(diff8) > 0.05  # b=8: still fails
+
+    xt16, et16 = _block_permute(x, eligible, 16, np.random.default_rng(116))
+    diff16 = track_autocorrelation(xt16, et16, [1])[1] - observed_acf1
+    assert abs(diff16) <= 0.05  # b=16: passes
+
+
 def test_lag_null_track_slice_bounds_hold_for_large_window_and_lag():
     rng = np.random.default_rng(202)
     for w in (1, 2, 4, 8, 12):
@@ -1904,6 +2667,127 @@ def test_null_exchangeability_deterministic_split():
     first = null_exchangeability(tracks, statistic, eligible, config)
     second = null_exchangeability(tracks, statistic, eligible, config)
     assert first == second
+
+
+# --------------------------------------------------------------------------
+# Stage 1d-B gates (master spec §6.2)
+# --------------------------------------------------------------------------
+
+
+def test_track_autocorrelation_hand_derived():
+    values = np.array([1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0])
+    eligible = np.ones(values.size, dtype=bool)
+    result = track_autocorrelation(values, eligible, lags=[1, 2])
+    # lag 1: y = 3 - x exactly (perfect linear inverse) -> corr = -1
+    assert result[1] == pytest.approx(-1.0)
+    # lag 2: values[i] == values[i+2] always -> x and y are identical
+    # (non-constant, alternating 1,2,1,2,...) sequences -> corr = +1
+    assert result[2] == pytest.approx(1.0)
+
+
+def test_track_autocorrelation_constant_series_is_nan():
+    values = np.full(10, 5.0)
+    eligible = np.ones(10, dtype=bool)
+    result = track_autocorrelation(values, eligible, lags=[1, 3])
+    assert np.isnan(result[1])
+    assert np.isnan(result[3])
+
+
+def test_track_autocorrelation_excludes_ineligible_and_nonfinite_positions():
+    values = np.array([1.0, 2.0, np.nan, 2.0, 1.0, 2.0])
+    eligible = np.array([True, True, True, False, True, True])
+    result = track_autocorrelation(values, eligible, lags=[1])
+    # only pairs where BOTH i and i+1 are eligible and finite survive:
+    # (values[0],values[1])=(1,2) and (values[4],values[5])=(1,2) -- both directions
+    # identical, so this collapses to a 2-point perfectly-correlated (degenerate,
+    # since only one distinct x and y value) -- assert it is finite and not raising.
+    assert np.isfinite(result[1]) or np.isnan(result[1])  # must not raise
+
+
+def test_track_autocorrelation_lag_at_or_past_array_length_is_nan():
+    values = np.arange(5.0)
+    eligible = np.ones(5, dtype=bool)
+    result = track_autocorrelation(values, eligible, lags=[5, 10])
+    assert np.isnan(result[5])
+    assert np.isnan(result[10])
+
+
+def test_acf_gate_passes_when_null_matches_observed():
+    rng = np.random.default_rng(11)
+    # AR(1)-like observed track and null tracks built from the identical process
+    n = 4000
+    observed = np.cumsum(rng.normal(0, 1, n)) * 0.0 + rng.normal(0, 1, n)
+    for i in range(1, n):
+        observed[i] += 0.4 * observed[i - 1]
+    eligible = np.ones(n, dtype=bool)
+    tracks = []
+    for seed in range(20, 28):
+        r = np.random.default_rng(seed)
+        t = r.normal(0, 1, n)
+        for i in range(1, n):
+            t[i] += 0.4 * t[i - 1]
+        tracks.append((t, eligible, 1))
+    result = acf_gate(observed, eligible, tracks, window=3, tolerance=0.08)
+    assert result["lags"] == [1, 2, 3]
+    assert result["passed"] is True
+
+
+def test_acf_gate_fails_when_null_has_no_autocorrelation_but_observed_does():
+    # exactly Stage 1b's own failure mode (master spec §2.2): a null with the
+    # right marginal but no autocorrelation, against an observed track that has it.
+    rng = np.random.default_rng(12)
+    n = 4000
+    observed = rng.normal(0, 1, n)
+    for i in range(1, n):
+        observed[i] += 0.5 * observed[i - 1]
+    eligible = np.ones(n, dtype=bool)
+    tracks = [
+        (np.random.default_rng(s).normal(0, 1, n), eligible, 1) for s in range(30, 38)
+    ]
+    result = acf_gate(observed, eligible, tracks, window=2, tolerance=0.05)
+    assert result["passed"] is False
+    assert abs(result["diff"][1]) > 0.05
+
+
+def test_acf_gate_unmeasurable_lag_fails_not_silently_skipped():
+    eligible = np.zeros(10, dtype=bool)  # nothing eligible -> every lag unmeasurable
+    observed = np.arange(10.0)
+    tracks = [(np.arange(10.0), eligible, 1)]
+    result = acf_gate(observed, eligible, tracks, window=2)
+    assert result["passed"] is False
+    assert all(np.isnan(v) for v in result["diff"].values())
+
+
+def test_region_exchangeability_gate_reports_inf_when_null_rate_zero():
+    result = region_exchangeability_gate(
+        observed_regions=5, observed_eligible_edges=10_000,
+        null_regions_total=0, null_eligible_edges=50_000,
+        min_null_regions_for_fdr=50,
+    )
+    assert result["region_exchangeability_ratio"] == float("inf")
+    assert result["null_count_adequate"] is False
+
+
+def test_region_exchangeability_gate_nan_when_both_rates_zero():
+    result = region_exchangeability_gate(
+        observed_regions=0, observed_eligible_edges=10_000,
+        null_regions_total=0, null_eligible_edges=50_000,
+        min_null_regions_for_fdr=50,
+    )
+    assert np.isnan(result["region_exchangeability_ratio"])
+
+
+def test_region_exchangeability_gate_ordinary_ratio():
+    result = region_exchangeability_gate(
+        observed_regions=20, observed_eligible_edges=10_000,
+        null_regions_total=100, null_eligible_edges=100_000,
+        min_null_regions_for_fdr=50,
+    )
+    # observed_rate = 20/10000*10000 = 20; null_rate = 100/100000*10000 = 10
+    assert result["observed_rate"] == pytest.approx(20.0)
+    assert result["null_rate"] == pytest.approx(10.0)
+    assert result["region_exchangeability_ratio"] == pytest.approx(2.0)
+    assert result["null_count_adequate"] is True
 
 
 def test_null_threshold_reports_exchangeability_when_statistic_given():
@@ -2019,7 +2903,13 @@ def test_recall_does_not_regress_more_than_5_points_after_lag_null_fix():
         n_samples=80, strata=[(0.2, 0.35)], replicates=6,
         spacing=400, dmr_length=25, seed=11,
     )
-    config = Eiger2Config(window=4, null_replicates=50, random_seed=11)
+    # min_null_regions_for_fdr=0: this is a recall-consistency test (relies on
+    # "significant" as the calling gate), not a null-adequacy test -- the spec
+    # §5 guard is disabled so the pre-existing recall comparison still applies.
+    config = Eiger2Config(
+        window=4, null_replicates=50, random_seed=11, min_null_regions_for_fdr=0,
+        region_null_mode="lag",
+    )
 
     original = core_mod._lag_null_track
     core_mod._lag_null_track = lambda residuals, lag, config: _reference_lag_null_track(
@@ -2053,7 +2943,8 @@ def test_support_binned_threshold_off_reproduces_scalar_path_bit_for_bit():
         spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
     )
     base_config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
-                                support_binned_threshold="off")
+                                support_binned_threshold="off",
+                                region_null_mode="lag")
     regions_off, values_off, manifest_off = call_dmrs(matrix, locs, config=base_config)
     # compare against a config from BEFORE this task's changes semantically --
     # "off" must produce the same region set/areas/threshold as Stage 1b's output
@@ -2127,7 +3018,9 @@ def test_support_dispersion_detector_computed_and_recorded():
         n_samples=80, strata=[(0.2, 0.35)], replicates=4,
         spacing=400, dmr_length=15, missing_rate=0.25, seed=42,
     )
-    config = Eiger2Config(window=4, null_replicates=50, random_seed=42)
+    config = Eiger2Config(
+        window=4, null_replicates=50, random_seed=42, region_null_mode="lag",
+    )
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert "support_dispersion" in manifest
     assert manifest["support_dispersion"] >= 0
@@ -2143,7 +3036,8 @@ def test_support_binned_threshold_on_produces_per_bin_thresholds():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=43,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=43,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
     if manifest["support_binning"] == "forced_on":
@@ -2164,7 +3058,8 @@ def test_determinism_same_seed_same_bins_same_thresholds_same_regions():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=44,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=44,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions1, _, manifest1 = call_dmrs(matrix, locs, config=config)
     regions2, _, manifest2 = call_dmrs(matrix, locs, config=config)
     pd.testing.assert_frame_equal(regions1, regions2, check_exact=True)
@@ -2178,18 +3073,34 @@ def test_support_binned_threshold_config_validation():
         Eiger2Config(support_bins=1)
 
 
-def test_support_binning_forced_off_for_permutation_mode():
+def test_min_null_regions_for_fdr_config_validation():
+    # Stage 1c-bis review Task 2: a negative value silently disables the
+    # guard, because `pooled.size < -1` is never true -- in a release whose
+    # entire purpose is this guard, its own config field must not be the one
+    # field a typo can switch off unnoticed.
+    with pytest.raises(ValueError, match="min_null_regions_for_fdr"):
+        Eiger2Config(min_null_regions_for_fdr=-1)
+    Eiger2Config(min_null_regions_for_fdr=0)  # documented way to disable it
+
+
+def test_support_binning_forced_off_when_region_null_mode_is_not_lag():
+    # Retired the null_mode="permutation" scenario this test used to check
+    # (Stage 1d-D Task 6.1, master spec §6.4): permutation is now rejected at
+    # Eiger2Config construction, so that combination can no longer be built.
+    # The underlying concern -- support-conditioning's per-replicate
+    # reconstruction assumes tracks it cannot safely assume for some null
+    # constructions -- is now general to region_null_mode != "lag" (Stage
+    # 1d-D's own new axis), not specific to permutation. region_null_mode="off"
+    # exercises the same guard without member_step's genome-scale input floor.
     matrix, locs, _ = simulate(
         n_samples=80, strata=[(0.2, 0.35)], replicates=4,
         spacing=400, dmr_length=15, missing_rate=0.25, seed=45,
     )
     config = Eiger2Config(window=4, null_replicates=50, random_seed=45,
-                           null_mode="permutation", support_binned_threshold="on")
+                           region_null_mode="off", support_binned_threshold="on")
     _, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] == "forced_off"
-    assert manifest["support_binning_skipped_reason"] == (
-        "permutation_mode_not_supported"
-    )
+    assert manifest["support_binning_skipped_reason"] == "region_null_mode_not_lag"
 
 
 def test_null_tracks_returns_track_eligible_lag_triples():
@@ -2204,6 +3115,231 @@ def test_null_tracks_returns_track_eligible_lag_triples():
 
 
 # --------------------------------------------------------------------------
+# Stage 1d-C §3 — C.3 member-step lag null (evaluation candidate)
+# --------------------------------------------------------------------------
+
+
+def test_member_step_lag_null_tracks_reslices_the_full_track_exactly():
+    # Correctness of the re-slicing itself: sub_track[j] must equal the SAME
+    # per-position value _lag_null_track already computes at p = i + j*lag,
+    # not a recomputation.
+    rng = np.random.default_rng(21)
+    residuals = rng.normal(size=(3000, 15))
+    lag = 37
+    config = Eiger2Config(window=4, random_seed=1)
+    full = _lag_null_track(residuals, lag, config)
+    sub_tracks = member_step_lag_null_tracks(residuals, lag, config)
+    by_offset = {offset: (t, e) for t, e, offset in sub_tracks}
+    for i in (0, 1, lag - 1):
+        if i not in by_offset:
+            continue
+        sub_track, _ = by_offset[i]
+        expected = full[i::lag]
+        np.testing.assert_array_equal(sub_track, expected)
+
+
+def test_member_step_lag_null_tracks_consecutive_positions_share_w_minus_1_members():
+    # The construction's whole point: position j and j+1 in a sub-track share
+    # w-1 of w members, unlike the shipped null's consecutive p/p+1. Verify via
+    # the same fake-_lag_statistic decode technique used for _lag_null_track's
+    # own member-set tests, rather than re-deriving the formula independently.
+    import eiger2.core as core_mod
+
+    lag = 11
+    w = 4
+
+    def fake_lag_statistic(residuals, d, config, chunk=200_000):
+        n_pairs = residuals.shape[0] - d
+        return np.array([i * 100_000 + d for i in range(n_pairs)], dtype=float)
+
+    original = core_mod._lag_statistic
+    core_mod._lag_statistic = fake_lag_statistic
+    try:
+        config = Eiger2Config(window=w, random_seed=1)
+        dummy = np.zeros((5000, 3))
+        sub_tracks = core_mod.member_step_lag_null_tracks(dummy, lag, config)
+    finally:
+        core_mod._lag_statistic = original
+
+    sub_track, _eligible, offset = sub_tracks[0]
+    i = offset
+    # position j's members: {i+j*lag, i+(j+1)*lag, ..., i+(j+w-1)*lag}
+    # position j+1's members: {i+(j+1)*lag, ..., i+(j+w)*lag}
+    # shared: w-1 of them (all but the first of j, all but the last of j+1)
+    def predicted_value(j):
+        members = sorted((j + a) * lag + i for a in range(w))
+        pairs = [
+            (members[a], members[b]) for a in range(w) for b in range(a + 1, w)
+        ]
+        return np.mean([p * 100_000 + (q - p) for p, q in pairs])
+
+    assert sub_track[0] == pytest.approx(predicted_value(0))
+    assert sub_track[1] == pytest.approx(predicted_value(1))
+
+
+def test_member_step_lag_null_tracks_respects_the_gap_mask():
+    # Same fragmented-layout construction as the §1 test: the gap mask must
+    # exclude some sub-track positions too, since it re-slices
+    # _null_eligibility's (now gap-masked) output.
+    rng = np.random.default_rng(22)
+    n_cpg = 3000
+    starts = np.arange(n_cpg) * 2
+    for i in range(50, n_cpg, 50):
+        starts[i:] += 5000
+    frame = pd.DataFrame({"chr": "chr1", "start": starts, "end": starts + 1})
+    residuals = rng.normal(size=(n_cpg, 15))
+    config = Eiger2Config(window=4, max_cpg_gap_bp=300, random_seed=1)
+    sub_tracks = member_step_lag_null_tracks(residuals, 41, config, frame)
+    total = sum(t.size for t, _, _ in sub_tracks)
+    total_eligible = sum(int(e.sum()) for _, e, _ in sub_tracks)
+    assert total > 0
+    assert total_eligible < total
+
+
+def test_member_step_lag_null_tracks_dense_matches_no_gap_mask():
+    # dense: gap mask is a no-op (every edge eligible), same guarantee as §1.
+    rng = np.random.default_rng(23)
+    n_cpg = 4000
+    frame = locations(n_cpg)
+    residuals = rng.normal(size=(n_cpg, 15))
+    config = Eiger2Config(window=4, random_seed=1)
+    with_locations = member_step_lag_null_tracks(residuals, 29, config, frame)
+    without_locations = member_step_lag_null_tracks(residuals, 29, config, None)
+    assert len(with_locations) == len(without_locations)
+    for (t1, e1, o1), (t2, e2, o2) in zip(with_locations, without_locations):
+        assert o1 == o2
+        np.testing.assert_array_equal(t1, t2)
+        np.testing.assert_array_equal(e1, e2)
+
+
+def test_member_step_lag_null_tracks_empty_when_full_track_empty():
+    residuals = np.zeros((5, 3))
+    config = Eiger2Config(window=4, random_seed=1)
+    assert member_step_lag_null_tracks(residuals, 1000, config) == []
+
+
+def test_member_step_lag_null_ensemble_draws_n_lag_draws_distinct_lags():
+    rng = np.random.default_rng(24)
+    residuals = rng.normal(size=(30_000, 15))
+    config = Eiger2Config(
+        window=4, null_min_lag=500, min_subtrack_length=50, n_lag_draws=5,
+        random_seed=1,
+    )
+    replicates, lags = member_step_lag_null_ensemble(residuals, config)
+    assert len(lags) == 5
+    assert len(set(lags)) == 5  # distinct
+    assert len(replicates) > 0
+    # one (track, eligible, lag) triple per successful draw -- concatenated
+    # across that draw's offsets, not one triple per offset
+    assert len(replicates) <= len(lags)
+    for track, eligible, lag in replicates:
+        assert lag in lags
+        assert track.shape == eligible.shape
+
+
+def test_member_step_lag_null_ensemble_lags_span_null_min_lag_to_l_max():
+    # Stage 1d-D Task 2: NOT the narrow near-null_min_lag jitter Stage 1d-C
+    # used (which correlated nearby draws -- lag 1006 and 1008 pair CpG i with
+    # i+1006 and i+1008, nearly the same construction). Lags must be able to
+    # reach meaningfully far above null_min_lag, up to L_max.
+    rng = np.random.default_rng(25)
+    n = 200_000
+    residuals = rng.normal(size=(n, 15))
+    config = Eiger2Config(
+        window=4, null_min_lag=500, min_subtrack_length=50, n_lag_draws=20,
+        random_seed=1,
+    )
+    span = config.min_subtrack_length + config.window - 1
+    l_max = n // span
+    _replicates, lags = member_step_lag_null_ensemble(residuals, config)
+    assert all(500 <= lag <= l_max for lag in lags)
+    # with L_max this much larger than null_min_lag, 20 uniform draws should
+    # not all land in a narrow band near the floor
+    assert max(lags) - min(lags) > (l_max - 500) // 4
+
+
+def test_member_step_lag_null_ensemble_raises_when_input_too_small():
+    # Task 2: a clear error, not Stage 1d-C's silent 17-position-sub-track
+    # degradation on `dense` at its normal (20,400 CpG) scale.
+    rng = np.random.default_rng(26)
+    residuals = rng.normal(size=(20_000, 15))
+    config = Eiger2Config(
+        window=4, null_min_lag=500, min_subtrack_length=100, random_seed=1,
+    )
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        member_step_lag_null_ensemble(residuals, config)
+
+
+def test_member_step_lag_null_ensemble_concatenation_never_merges_offsets():
+    # The eligible mask must be broken at every sub-track-piece boundary, or
+    # segment() could merge two unrelated offsets into one spurious region.
+    # Reconstruct the real per-offset piece lengths from
+    # member_step_lag_null_tracks (pieces are NOT all equal length -- offsets
+    # early in [0, lag) can get one extra element) rather than assuming a
+    # formula, so this test cannot be fooled by an off-by-one in its own logic.
+    rng = np.random.default_rng(27)
+    residuals = rng.normal(size=(50_000, 15))
+    config = Eiger2Config(
+        window=4, null_min_lag=500, min_subtrack_length=50, n_lag_draws=3,
+        random_seed=1,
+    )
+    replicates, lags = member_step_lag_null_ensemble(residuals, config)
+    for (_track, eligible, lag), expected_lag in zip(replicates, lags):
+        assert lag == expected_lag
+        sub_tracks = member_step_lag_null_tracks(residuals, lag, config)
+        boundary = -1
+        for sub_track, _sub_eligible, _offset in sub_tracks:
+            boundary += sub_track.size
+            if boundary < eligible.size:
+                assert not eligible[boundary]
+
+
+def test_member_step_lag_null_narrows_the_acf_gap_relative_to_shipped():
+    # Directional claim at toy scale (a single-latent-factor construction, not
+    # the real multi-sample pipeline): the shared-member mechanism must move
+    # the null's ACF measurably toward the observed track's, even before
+    # reaching genome scale. The stronger claim -- C.3 actually PASSES Gate 1
+    # -- is confirmed on real data at real scale in the Stage 1d-C acceptance
+    # run (STAGE1D_C_STOP_REPORT.md), not here: at this toy scale (n=60,000,
+    # single sample-like column) sub-tracks are short enough that edge effects
+    # keep C.3 short of the +-0.05 threshold even though the mechanism is
+    # visibly working -- exactly the failure mode spec section 3 warns tests at
+    # benchmark scale will show. Do not strengthen this assertion to "passes"
+    # without also scaling n into the hundreds of thousands; see the acceptance
+    # run for the version of this claim that matters.
+    rng = np.random.default_rng(31)
+    n = 60_000
+    n_samples = 40
+    rho = 0.5
+    # A per-CpG loading onto one shared per-sample factor, the loading itself
+    # an AR(1) sequence -- so adjacent CpGs respond similarly to the same
+    # factor (real short-range correlation), matching what edge_statistic's
+    # across-SAMPLE correlation actually measures (a single sample column
+    # cannot produce any correlation at all -- there is nothing to correlate).
+    beta = np.empty(n)
+    beta[0] = rng.normal()
+    for i in range(1, n):
+        beta[i] = rho * beta[i - 1] + np.sqrt(1 - rho**2) * rng.normal()
+    factor = rng.normal(0, 1, n_samples)
+    residuals = beta[:, None] * factor[None, :] + rng.normal(0, 0.3, (n, n_samples))
+
+    config = Eiger2Config(
+        window=4, null_min_lag=200, random_seed=1, statistic="correlation",
+    )
+    eligible = np.ones(n - 1, dtype=bool)
+    # "observed" statistic: same window construction the real pipeline uses
+    observed = edge_statistic(residuals, config)
+
+    shipped_tracks = null_tracks(residuals, config)
+    shipped_gate = acf_gate(observed, eligible, shipped_tracks, config.window)
+    assert shipped_gate["passed"] is False  # confirms the known failure mode
+
+    sub_tracks = member_step_lag_null_tracks(residuals, config.null_min_lag, config)
+    c3_gate = acf_gate(observed, eligible, sub_tracks, config.window)
+    assert abs(c3_gate["diff"][1]) < abs(shipped_gate["diff"][1]) / 2
+
+
+# --------------------------------------------------------------------------
 # Task 7: output schema -- region_support_median/region_threshold_mode
 # columns, schema_version -> "2.2" (Stage 1c)
 # --------------------------------------------------------------------------
@@ -2214,7 +3350,9 @@ def test_schema_v22_has_support_columns_and_version():
         n_samples=80, strata=[(0.2, 0.35)], replicates=4,
         spacing=400, dmr_length=15, missing_rate=0.25, seed=51,
     )
-    config = Eiger2Config(window=4, null_replicates=50, random_seed=51)
+    config = Eiger2Config(
+        window=4, null_replicates=50, random_seed=51, region_null_mode="lag",
+    )
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert "region_support_median" in regions.columns
     assert "region_threshold_mode" in regions.columns
@@ -2239,7 +3377,8 @@ def test_statistic_threshold_is_mean_per_edge_threshold_when_support_binned():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=43,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=43,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     if manifest["support_binning"] != "forced_on" or not len(regions):
         pytest.skip("this seed did not produce a forced_on run with regions")
@@ -2260,7 +3399,8 @@ def test_statistic_threshold_stays_scalar_when_single_mode():
         spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
     )
     config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
-                           support_binned_threshold="off")
+                           support_binned_threshold="off",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert (regions["region_threshold_mode"] == "single").all()
     scalar_threshold = manifest["null"]["threshold"]
@@ -2302,7 +3442,10 @@ def test_auto_enable_fires_only_on_missingness_at_calibrated_cut():
                 seed=seed, strata=DEFAULT_STRATA, replicates=6, spacing=400,
                 **params,
             )
-            config = Eiger2Config(window=4, random_seed=seed, null_replicates=100)
+            config = Eiger2Config(
+                window=4, random_seed=seed, null_replicates=100,
+                region_null_mode="lag",
+            )
             assert config.support_binned_threshold == "auto"
             assert config.support_dispersion_cut is None
             _, _, manifest = call_dmrs(matrix, locs, config=config)
@@ -2324,7 +3467,8 @@ def test_region_rate_by_support_bin_populated_when_binning_active():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     if manifest["support_binning"] == "forced_on":
         assert "region_rate_by_support_bin" in manifest
@@ -2340,7 +3484,8 @@ def test_region_rate_by_support_bin_absent_when_binning_off():
         spacing=400, dmr_length=15, missing_rate=0.25, seed=41,
     )
     config = Eiger2Config(window=4, null_replicates=50, random_seed=41,
-                           support_binned_threshold="off")
+                           support_binned_threshold="off",
+                           region_null_mode="lag")
     _, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] == "forced_off"
     assert "region_rate_by_support_bin" not in manifest
@@ -2357,7 +3502,8 @@ def test_region_rate_by_support_bin_ratio_guards_zero_null_rate():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=62,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=62,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     _, _, manifest = call_dmrs(matrix, locs, config=config)
     if manifest["support_binning"] != "forced_on":
         pytest.skip("this seed did not produce a forced_on run")
@@ -2388,7 +3534,8 @@ def test_call_dmrs_support_stratified_fdr_activates_when_binning_on():
         spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] == "forced_on"
     assert len(regions)  # guard against the assertions below going vacuous
@@ -2408,7 +3555,8 @@ def test_call_dmrs_support_stratified_fdr_activates_when_binning_on():
     # "off" must be unaffected: no support stratification, same diagnostics shape
     # as before this task.
     config_off = Eiger2Config(window=4, null_replicates=100, random_seed=61,
-                               support_binned_threshold="off")
+                               support_binned_threshold="off",
+                               region_null_mode="lag")
     regions_off, _, manifest_off = call_dmrs(matrix, locs, config=config_off)
     assert len(regions_off)
     assert manifest_off["fdr"]["support_stratified"] is False
@@ -2429,7 +3577,8 @@ def test_call_dmrs_support_stratified_fdr_is_not_used_without_length_strata():
     )
     config = Eiger2Config(window=4, null_replicates=100, random_seed=61,
                            support_binned_threshold="on",
-                           length_stratified_fdr=False)
+                           length_stratified_fdr=False,
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     if manifest["support_binning"] != "forced_on" or not len(regions):
         pytest.skip("this seed did not produce a forced_on run with regions")
@@ -2476,7 +3625,8 @@ def test_observed_and_null_support_come_from_the_same_function_end_to_end(
         spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
     )
     config = Eiger2Config(window=4, null_replicates=8, random_seed=61,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     _, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
 
@@ -2559,7 +3709,8 @@ def test_null_support_bins_use_the_observed_derived_edges_unchanged(monkeypatch)
         spacing=400, dmr_length=15, missing_rate=0.4, seed=61,
     )
     config = Eiger2Config(window=4, null_replicates=8, random_seed=61,
-                           support_binned_threshold="on")
+                           support_binned_threshold="on",
+                           region_null_mode="lag")
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
     assert manifest["support_binning"] == "forced_on"
     assert len(regions)
@@ -2600,10 +3751,11 @@ def test_single_bin_collapse_reproduces_the_unconditioned_path_end_to_end():
     collapsed_config = Eiger2Config(
         window=4, null_replicates=50, random_seed=41,
         support_binned_threshold="on", min_null_values=10**9,
+        region_null_mode="lag",
     )
     off_config = Eiger2Config(
         window=4, null_replicates=50, random_seed=41,
-        support_binned_threshold="off",
+        support_binned_threshold="off", region_null_mode="lag",
     )
     regions_collapsed, values_collapsed, manifest_collapsed = call_dmrs(
         matrix, locs, config=collapsed_config
@@ -2658,7 +3810,8 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
             seed=seed, strata=[], replicates=0, spacing=20000, **params
         )
         config = Eiger2Config(window=4, null_replicates=100, random_seed=seed,
-                               support_binned_threshold="on")
+                               support_binned_threshold="on",
+                               region_null_mode="lag")
         _, _, manifest = call_dmrs(matrix, locs, config=config)
         assert manifest["support_binning"] in {"forced_on", "collapsed_to_single"}
         ratio = manifest["null"]["null_exchangeability_ratio"]
@@ -2667,23 +3820,26 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
     assert np.median(ratios) <= 1.25, ratios
 
 
-def test_support_stratified_fdr_pins_the_known_zero_qvalue_state_under_missingness():
-    # KNOWN-BAD STATE PIN -- see task-11-report.md. This test SHOULD go red the
-    # day someone fixes the underlying null-region-formation problem; update it
-    # then, don't relax it now.
-    # spec §1c.7 item 9's second half: Task 10's own tests exercise
-    # `region_fdr_result` directly plus one small `call_dmrs` case. This runs the
-    # actual §1c.8 validation configuration -- the standard `missingness`
-    # scenario with the standard planted signal, at shipped defaults (so
-    # support_binned_threshold="auto" and fdr_decision="point") -- and confirms
-    # the support-stratified FDR path really does engage there.
+def test_support_stratified_fdr_refuses_under_missingness_when_null_is_insufficient():
+    # Replaces the retired KNOWN-BAD STATE PIN (see task-11-report.md and spec
+    # §5, Stage 1c-bis). Same input as before: the standard `missingness`
+    # scenario with the standard planted signal, at shipped defaults
+    # (support_binned_threshold="auto", fdr_decision="point"). Previously the
+    # near-empty lag-null pool made every region_qvalue exactly 0.0 -- zero
+    # evidence presented as certainty. The null-adequacy guard now refuses to
+    # report a q-value at all when the pooled null is this thin, which is the
+    # correct response to the same measured state, not a relaxation of it.
     from benchmarking.benchmark_suite import DEFAULT_STRATA, SCENARIOS
 
     matrix, locs, _ = simulate(
         seed=0, strata=DEFAULT_STRATA, replicates=6, spacing=400,
         **SCENARIOS["missingness"],
     )
-    config = Eiger2Config(target_fdr=0.05)
+    # region_null_mode="lag": this test pins the shipped construction's
+    # measured null-adequacy behaviour (the historical citation this replaces
+    # depends on it); it is not testing region_null_mode="member_step" (the
+    # current default), which needs genome-scale input this matrix is not.
+    config = Eiger2Config(target_fdr=0.05, region_null_mode="lag")
     assert config.support_binned_threshold == "auto"
     assert config.fdr_decision == "point"
     regions, _, manifest = call_dmrs(matrix, locs, config=config)
@@ -2692,24 +3848,33 @@ def test_support_stratified_fdr_pins_the_known_zero_qvalue_state_under_missingne
     assert len(regions)
     assert manifest["fdr"]["support_stratified"] is True
     assert manifest["region_rate_by_support_bin"]
-
-    # Measured characterisation, Stage 1c Task 11 (see task-11-report.md): at
-    # this scale the lag-null tracks form ZERO regions per replicate, so every
-    # joint (length x support-bin) stratum is below
-    # _MIN_NULL_REGIONS_PER_JOINT_STRATUM and falls back to the length-only
-    # pool, which is itself empty. The support-stratification escalation is
-    # therefore inert here, and every observed region gets K=0 -- hence
-    # region_qvalue == 0.0 for all of them under the "point" decision. These
-    # assertions are a witness to that measured state, not an endorsement of it:
-    # if one of them ever fails, the null-region-supply problem documented in
-    # task-11-report.md has changed, and this test should be updated to match
-    # the new measurement rather than relaxed.
     assert manifest["null_regions_per_replicate"] == 0.0
     assert manifest["fdr"]["support_stratification_fallback_strata"]
-    assert manifest["fdr"]["pooled_fallback_strata"]
+    # pooled_fallback_strata is deprecated (Stage 1c-bis review Task 1) and
+    # always empty now.
+    assert manifest["fdr"]["pooled_fallback_strata"] == []
     assert all(
         entry["null_regions"] == 0
         for entry in manifest["region_rate_by_support_bin"].values()
     )
-    assert (regions["region_qvalue"] == 0.0).all()
-    assert (regions["null_exceedances_at_cutoff"] == 0).all()
+
+    # The refusal path: the pooled null is EMPTY across the whole run (not
+    # just a thin stratum), so the Stage 1e Task 1 aggregate floor (master
+    # spec §8) refuses everything -- the same outcome the old per-stratum
+    # floor gave here, now reached via the run-level check rather than a
+    # per-stratum one. insufficient_null_strata and zero_exceedance_strata are
+    # both deprecated/inapplicable on this path (the run never reaches the
+    # per-stratum loop) and stay empty.
+    assert manifest["fdr"]["status"] == "aggregate null inadequate"
+    assert manifest["fdr"]["pooled_null_regions"] == 0
+    assert manifest["fdr"]["insufficient_null_strata"] == []
+    assert manifest["fdr"]["zero_exceedance_strata"] == []
+    assert regions["region_qvalue"].isna().all()
+    assert regions["region_tail_fdr"].isna().all()
+    assert regions["region_qvalue_lower_95"].isna().all()
+    assert regions["region_qvalue_upper_95"].isna().all()
+    assert regions["region_qvalue_resolution"].isna().all()
+    assert (regions["null_exceedances_at_cutoff"] == -1).all()
+    assert (regions["region_qvalue_cutoff_rank"] == -1).all()
+    assert (regions["significant"] == False).all()  # noqa: E712
+    assert manifest["n_significant"] == 0

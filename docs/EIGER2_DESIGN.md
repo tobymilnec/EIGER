@@ -363,8 +363,20 @@ each *sample* independently, which also destroys the shared latent factor:
 
 The fixed 0.012 threshold called **zero** false blocks in the first two rows, so
 the adaptive threshold was strictly worse than the constant it replaced. The
-lag null restores calibration: 0.4–0.6% of DMR-free edges pass, against a
-nominal 0.5%.
+lag null restores **edge-level** calibration: 0.4–0.6% of DMR-free edges pass,
+against a nominal 0.5%. This number is unchanged by v2.1.0 and still describes
+`null_mode="lag"`, the only edge-level null.
+
+**As of v2.1.0 this is only half the calibration story.** Region-level FDR
+(the next step) is backed by a *separate* null construction,
+`region_null_mode`, not directly by the edge-level pass rate above — an
+edge-level null passing this check says nothing about whether the SAME null,
+segmented the same way as the data, forms multi-edge regions at the right
+rate, which is what region-level FDR actually depends on. That distinction —
+and the two defects (missing autocorrelation, then a per-stratum adequacy
+floor that refused decisive `K=0` evidence) found and fixed by validating the
+region-level null on its own terms rather than assuming the edge-level result
+above covered it — is `docs/FDR.md` §11–§12's subject, not this document's.
 
 ### Step 5 — segmentation and region-level FDR
 

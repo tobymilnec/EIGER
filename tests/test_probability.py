@@ -11,7 +11,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 
 from eiger2.benchmark import simulate  # noqa: E402
-from eiger2.core import Eiger2Config, call_dmrs, region_fdr  # noqa: E402
+from eiger2.core import (  # noqa: E402
+    Eiger2Config,
+    call_dmrs,
+    region_fdr,
+    region_fdr_result,
+)
 from eiger2.probability import (  # noqa: E402
     _tail_area_fdr,
     calibration_error,
@@ -43,12 +48,18 @@ def test_region_fdr_scale_is_not_double_discounted(replicates):
     # expected null count is the full per-replicate rate at every rank
     observed = np.linspace(1.9, 1.0, 100)
 
-    q = region_fdr(
+    # region_fdr()'s signature is frozen, so it always applies the spec §5
+    # default min_null_regions_for_fdr=50; at replicates in {1, 5} the pooled
+    # null (replicates * per_replicate = 4 or 20) is deliberately far below
+    # that. Called through region_fdr_result directly with the guard disabled
+    # to isolate the scale arithmetic this test targets from null adequacy.
+    q = region_fdr_result(
         observed,
         null_sets,
         observed_edges=observed_edges,
         null_edges=replicates * observed_edges,
-    )
+        min_null_regions_for_fdr=0,
+    ).qvalue
     # expected null regions in a genome of observed_edges edges = per_replicate
     assert q[-1] == pytest.approx(per_replicate / observed.size, rel=1e-9)
 
@@ -202,7 +213,8 @@ def test_call_dmrs_emits_posterior_columns():
         strata=[(0.25, 0.30)], replicates=2, seed=11, n_samples=40, spacing=300
     )
     regions, _, manifest = call_dmrs(
-        matrix, locations, config=Eiger2Config(compute_posterior=True)
+        matrix, locations,
+        config=Eiger2Config(compute_posterior=True, region_null_mode="lag"),
     )
     assert "region_evidence_score" in regions.columns
     assert "evidence_score_extrapolated" in regions.columns
@@ -213,7 +225,9 @@ def test_posterior_is_off_by_default():
     matrix, locations, _ = simulate(
         strata=[(0.25, 0.30)], replicates=2, seed=12, n_samples=40, spacing=300
     )
-    regions, _, manifest = call_dmrs(matrix, locations, config=Eiger2Config())
+    regions, _, manifest = call_dmrs(
+        matrix, locations, config=Eiger2Config(region_null_mode="lag")
+    )
     assert "posterior" not in manifest
     if len(regions):
         assert regions["region_evidence_score"].isna().all()
@@ -224,7 +238,16 @@ def test_posterior_is_off_by_default():
 # --------------------------------------------------------------------------
 
 
-def test_permutation_null_preserves_the_marginal_and_breaks_the_runs():
+def test_permutation_null_tracks_raises_naming_the_replacement():
+    # Stage 1d-D Task 6.1 (master spec §6.4): permutation_null_tracks is
+    # edge-wise permutation (block length 1) -- measured at zero null regions
+    # across 400 replicates and, before the Stage 1c-bis null-adequacy guard
+    # existed to catch it, 3/3 significant on DMR-free clean data
+    # (STAGE1D_C_COMPRESSED_SPEC.md §0; docs/MULTISCALE_BLOCKED.md). The
+    # "richer null than the lag null" narrative this test used to pin
+    # (replaced below) was itself part of the problem -- more candidate
+    # regions from a null this broken is anti-conservative, not an
+    # improvement. It must not be reachable, silently broken, any more.
     from eiger2.core import permutation_null_tracks
 
     rng = np.random.default_rng(20)
@@ -233,68 +256,40 @@ def test_permutation_null_preserves_the_marginal_and_breaks_the_runs():
     ])
     eligible = np.ones(statistic.size, dtype=bool)
     chrom = np.array(["chr1"] * statistic.size)
-    tracks = permutation_null_tracks(
-        statistic, eligible, chrom, replicates=5, seed=1
-    )
-    for track, usable in tracks:
-        # same multiset of values: the amount of coordination is unchanged
-        assert np.allclose(np.sort(track[usable]), np.sort(statistic[eligible]))
-        # but the long run of high values no longer survives intact
-        high = track[usable] > 0.5
-        longest = 0
-        run = 0
-        for value in high:
-            run = run + 1 if value else 0
-            longest = max(longest, run)
-        assert longest < 40
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        permutation_null_tracks(statistic, eligible, chrom, replicates=5, seed=1)
 
 
-def test_permutation_null_yields_a_richer_null_than_the_lag_null():
-    """The point of the change: the lag null can produce no regions at all,
-    which forces every q-value to zero regardless of the data."""
+def test_null_mode_permutation_rejected_at_config_construction():
+    # Fails as early as possible, not deep inside call_dmrs after potentially
+    # expensive computation.
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        Eiger2Config(null_mode="permutation")
 
-    from eiger2.core import (
-        centre_cpgs,
-        deflate,
-        edge_statistic,
-        eligible_edges,
-        estimate_latent_basis,
-        null_threshold,
-        null_tracks,
-        permutation_null_tracks,
-        segment,
-    )
 
-    matrix, locations, _ = simulate(
-        strata=[(0.25, 0.35)], replicates=6, seed=5, n_samples=120, spacing=250
-    )
-    config = Eiger2Config(null_replicates=40)
-    residuals = centre_cpgs(matrix)
-    basis, _ = estimate_latent_basis(residuals, config)
-    deflated = deflate(residuals, basis, missing=config.deflation_missing)
-    statistic = edge_statistic(deflated, config)
-    eligible = eligible_edges(locations, config)
-    threshold, _ = null_threshold(deflated, config, locations)
+def test_qvalue_result_from_track_legacy_path_raises_not_silently_broken():
+    # Stage 1d-D Task 6.3: qvalue_result_from_track (the --legacy
+    # --fdr-replicates CLI path, cli.py:286) calls permutation_null_tracks
+    # directly and unconditionally. This is the "explicit test" flagged as
+    # missing across three consecutive specs -- confirms the Task 6.1 fix
+    # actually reaches this path rather than leaving the legacy annotation
+    # silently using the broken null.
+    from eiger2.core import qvalue_result_from_track, qvalues_from_track
 
-    def count(tracks):
-        # `tracks` is either `null_tracks`' 3-tuples (track, eligible, lag) or
-        # `permutation_null_tracks`' 2-tuples (track, eligible) -- this helper is
-        # called with both (see below), so the star-unpack tolerates either shape.
-        total = 0
-        for track, usable, *_ in tracks:
-            found = segment(
-                track, usable & np.isfinite(track), threshold,
-                min_cpgs=config.min_cpgs, max_gap_edges=config.max_gap_edges,
-            )
-            total += len(found)
-        return total
-
-    lag = count(null_tracks(deflated, config, locations))
-    perm = count(permutation_null_tracks(
-        statistic, eligible, locations["chr"].to_numpy(),
-        replicates=config.null_replicates, seed=config.random_seed,
-    ))
-    assert perm > lag
+    rng = np.random.default_rng(20)
+    statistic = rng.normal(0, 0.05, 800)
+    statistic[300:340] = 0.8
+    regions = np.array([[300, 339]])
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        qvalue_result_from_track(
+            statistic, regions, threshold=0.25,
+            chromosome=np.array(["chr1"] * statistic.size),
+        )
+    with pytest.raises(ValueError, match="region_null_mode='member_step'"):
+        qvalues_from_track(
+            statistic, regions, threshold=0.25,
+            chromosome=np.array(["chr1"] * statistic.size),
+        )
 
 
 def test_prevalence_floor_demotes_single_sample_regions():
@@ -307,10 +302,12 @@ def test_prevalence_floor_demotes_single_sample_regions():
     matrix = np.clip(matrix, 0.01, 0.99)
 
     loose, _, _ = call_dmrs(
-        matrix, locations, config=Eiger2Config(min_prevalence_samples=0)
+        matrix, locations,
+        config=Eiger2Config(min_prevalence_samples=0, region_null_mode="lag"),
     )
     strict, _, _ = call_dmrs(
-        matrix, locations, config=Eiger2Config(min_prevalence_samples=3)
+        matrix, locations,
+        config=Eiger2Config(min_prevalence_samples=3, region_null_mode="lag"),
     )
     # the regions themselves are unchanged; only their significance differs
     assert len(loose) == len(strict)
@@ -320,23 +317,11 @@ def test_prevalence_floor_demotes_single_sample_regions():
     assert strict["significant"].sum() <= loose["significant"].sum()
 
 
-def test_qvalues_from_track_annotates_an_external_caller():
-    """The legacy caller defines no error rate; this supplies one without
-    changing which regions it reports."""
-
-    from eiger2.core import qvalues_from_track
-
-    rng = np.random.default_rng(22)
-    statistic = rng.normal(0, 0.05, 3000)
-    statistic[500:540] = 0.8          # one strong planted run
-    statistic[1500:1506] = 0.35       # one marginal run
-    regions = np.array([[500, 539], [1500, 1505]])
-    q, diagnostics = qvalues_from_track(
-        statistic, regions, threshold=0.25,
-        chromosome=np.array(["chr1"] * statistic.size),
-        min_cpgs=5, replicates=40, seed=1,
-    )
-    assert q.shape == (2,)
-    assert np.all((q >= 0) & (q <= 1))
-    assert q[0] <= q[1]               # the stronger region is never worse
-    assert diagnostics["n_regions"] == 2
+# test_qvalues_from_track_annotates_an_external_caller retired (Stage 1d-D,
+# master spec §6.4): it pinned qvalue_result_from_track's behaviour when its
+# internal permutation_null_tracks call returned zero null regions. That call
+# now raises unconditionally (Task 6.1) -- see
+# test_qvalue_result_from_track_legacy_path_raises_not_silently_broken in
+# test_probability.py's permutation-null section, which is what this test's
+# own comment said should replace it once §6.4 landed a decision (raise, not
+# repair).

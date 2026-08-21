@@ -9,7 +9,7 @@ Everything about *which* samples differ and *by how much* is post-selection
 characterisation and is kept strictly downstream of discovery.
 """
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 from .core import (
     Eiger2Config,

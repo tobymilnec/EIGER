@@ -5,8 +5,12 @@
 > had a confirmed direction/tie defect (see [docs/FDR.md](FDR.md)) and understated
 > the realised false discovery rate. See
 > [docs/FDR.md's "Known limitation" section](FDR.md#known-limitation-fdr-calibration-under-missingness-small-n-and-high-noise)
-> for the corrected, measured figures. Do not use these numbers to assess v2.0.1's
-> calibration.
+> for the v2.0.1 corrected, measured figures. Do not use these numbers to assess
+> v2.0.1's calibration, and note that even those v2.0.1 figures are themselves now
+> superseded: they used what is now called `region_null_mode="lag"`, which is known
+> to fail both region-level exchangeability gates on real layouts and is no longer
+> the default. Current (v2.1.0, `region_null_mode="member_step"`) figures are in
+> `benchmarking/results_v210/` and `STAGE1E_STOP_REPORT.md`.
 
 Seeds per scenario: 3. All values are means across seeds. The original method's covariance threshold is swept; EIGER 2 runs once at its automatic operating point.
 

@@ -239,9 +239,15 @@ assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneo
 ## 6. Options worth knowing
 
 ```bash
---null-mode lag|permutation          # see below; use permutation above ~100 samples
+--null-mode lag                      # edge-level null; the only supported value
+                                      # (see below -- large-cohort saturation no
+                                      # longer needs a different null-mode)
+--region-null-mode member_step|lag|off  # region-level null (see below); if
+                                      # unset (the default), resolves
+                                      # automatically to member_step when the
+                                      # input is large enough, else falls back
+                                      # to lag with a warning
 --min-prevalence-samples 3           # a region must be carried by >= 3 samples
---fdr-replicates 50                  # legacy only: attach a permutation q-value
 --statistic correlation|covariance   # default correlation; see README
 --window 4                           # CpGs per window; use 1 above ~30 samples
 --min-cpgs 4                         # minimum region length
@@ -285,27 +291,49 @@ replicate count cannot achieve the target even in the best case, `upper` refuses
 run rather than silently returning zero significant regions; the error names the
 replicate count required.
 
-### Choosing a null: `--null-mode`
+### Choosing a null: `--null-mode` and `--region-null-mode`
 
-`lag` (default) pairs CpGs far apart on the same chromosome and asks *is there
-any regional coordination here?* That is informative at modest cohort sizes and
-becomes trivially false as the cohort grows: with several hundred samples the
-edge statistic is precise, genuine coordination exists across most of the
-genome, and every region clears a threshold set from a near-zero null. On a
-519-sample cohort all 73,784 regions received q = 0 — arithmetically correct and
-useless.
+`--null-mode lag` (the only supported value; `permutation` was removed in v2.1.0,
+below) pairs CpGs far apart on the same chromosome for the **edge-level** null --
+which edges count as elevated. Region-level FDR (which *runs* of elevated edges are
+significant) is a separate null, `--region-null-mode` (Stage 1f, pre-release).
 
-`permutation` keeps that threshold, so which *edges* count as elevated is
-unchanged, but calibrates region **area** against tracks in which the observed
-statistic has been permuted within each chromosome. The same elevated edges are
-present, scattered at random, so the question becomes *is this run longer or
-stronger than chance, given how much coordination the genome contains?* The null
-shares the data's own marginal and therefore cannot saturate. On a 120-sample
-simulation it produced roughly 200 times as many null regions as the lag null,
-with a 35-fold larger maximum area.
+**Default: leave it unset.** With no `--region-null-mode` flag, the resolved
+behaviour is `"auto"`: `member_step` (below) is used when the input clears its
+genome-scale minimum size, and the CLI falls back to `lag` automatically --
+printing a loud warning naming the input size, the required size, and that `lag`'s
+q-values are not calibrated -- when it does not. This is what a CLI user hitting a
+small test file, a targeted panel, or a single-chromosome subset now gets instead
+of a hard, uncatchable error (the gap flagged in an earlier release note, now
+fixed). `eiger2 call`'s startup output always reports the computed floor and the
+input's CpG count before the run, e.g. `region_null_mode='auto', input has 5,000
+CpGs, member_step needs >= 103,000`.
 
-Both are sign-agnostic: hypo- and hypermethylated regions produce the same
-positive adjacent correlation, and direction is recovered afterwards from delta
+`member_step` (the resolved default on large-enough input) is what actually fixed
+large-cohort saturation: on a 519-sample cohort, the pre-v2.1.0 default assigned
+q = 0 to all 73,784 reported regions -- arithmetically correct given a near-empty
+null, but useless. A simulated 500-sample cohort under the current default
+produces finite, non-saturating q-values instead (measured minimum 0.27, zero
+exact-zeros; see `docs/FDR.md` §11-§12).
+
+`--region-null-mode member_step` (passed explicitly) skips the fallback: on input
+below the floor it raises, naming the required size, rather than silently using
+`lag` -- for a caller who wants to know for certain which construction ran.
+`--region-null-mode lag` (reproduces the pre-v2.1.0 region-level null, including
+the saturation above) is for small inputs below the floor
+(`null_min_lag * (min_subtrack_length + window - 1)`, 103,000 CpGs at shipped
+defaults) where you specifically want `lag`'s behaviour rather than the automatic
+fallback, or for reproducing historical comparisons -- not recommended for
+inference on real-sized data. `--region-null-mode off` skips the region-level null
+entirely (candidates only, no `region_qvalue`).
+
+**`--null-mode permutation` was removed in v2.1.0.** It was edge-wise permutation
+(block length 1), which destroys the same run-length autocorrelation region-level FDR
+depends on and was measured to produce zero usable null regions; requesting it now
+raises immediately, naming `region_null_mode="member_step"` as the replacement.
+
+Both edge-level nulls are sign-agnostic: hypo- and hypermethylated regions produce the
+same positive adjacent correlation, and direction is recovered afterwards from delta
 beta.
 
 ### A prevalence floor: `--min-prevalence-samples`
@@ -322,24 +350,16 @@ unfiltered set, `minority_size_descriptive` records how many samples carry the
 deviation, and `significant` requires both. It is exactly analogous to requiring
 a fold-change floor alongside a p-value.
 
-### A q-value for the published method: `--fdr-replicates`
+### `--legacy --fdr-replicates` no longer runs (removed in v2.1.0)
 
-`eiger2 call --legacy --fdr-replicates 50` attaches a region-level empirical FDR
-to the originally published caller by permuting **its own** covariance track and
-segmenting the result identically. Discovery is untouched: the regions are
-exactly those the published method reports and the q-value is an annotation on
-them. This is available as `eiger2.core.qvalues_from_track` for any caller that
-can supply a per-edge statistic, its regions and its threshold.
-
-Two warnings are emitted to the console and recorded in the manifest when they
-apply:
-
-- **thin null** — fewer than 1,000 usable null positions, or more than 75% of
-  offered positions discarded by the chromosome-aware mask. The threshold and
-  every q-value derived from it are then unreliable. Lower `--null-min-lag`,
-  raise `--null-replicates`, or call chromosomes separately.
-- **high missingness** — the realised false discovery rate is not calibrated at
-  25% dropout; see the limitations section of the README.
+This used to attach a region-level empirical FDR to the originally published caller
+by permuting **its own** covariance track and segmenting the result identically --
+the same edge-wise permutation null removed from `--null-mode` above. It now raises
+immediately, naming `region_null_mode="member_step"` as the replacement, rather than
+silently returning q-values from a null measured to contain zero usable regions.
+`eiger2.core.qvalues_from_track`/`qvalue_result_from_track` raise the same way for any
+other caller that reaches them. `--legacy` without `--fdr-replicates` is unaffected --
+it still reports the published method's regions with `region_qvalue` written as `NA`.
 
 ---
 

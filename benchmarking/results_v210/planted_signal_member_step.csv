@@ -1,0 +1,7 @@
+layout,scenario,seed,region_null_mode,n_cpg,runtime_seconds,n_truth,n_candidates,n_significant,true_positive,false_positive,realised_fdr,recall,n_qvalue_finite,n_qvalue_exact_zero,frac_qvalue_exact_zero,median_upper95_among_zeros,null_count_adequate
+wgbs_real,clean,0,member_step,600400,249.69536209106445,10,26,10,10,0,0.0,1.0,26,10,0.38461538461538464,0.0061201313478283816,True
+wgbs_real,nuisance,0,member_step,600400,252.84890294075012,10,24,10,10,0,0.0,1.0,24,10,0.4166666666666667,0.0059936539529677,True
+wgbs_real,missingness,0,member_step,600400,251.50609588623047,10,31,10,10,0,0.0,1.0,31,10,0.3225806451612903,0.0063776997535281155,True
+epic_fitted,clean,0,member_step,600400,245.0643618106842,7,22,7,7,0,0.0,1.0,22,7,0.3181818181818182,0.00884709068785817,True
+epic_fitted,nuisance,0,member_step,600400,235.7120430469513,7,21,7,7,0,0.0,1.0,21,7,0.3333333333333333,0.008751672069277168,True
+epic_fitted,missingness,0,member_step,600400,237.46730399131775,7,36,7,7,0,0.0,1.0,36,7,0.19444444444444445,0.011385315093538574,True
