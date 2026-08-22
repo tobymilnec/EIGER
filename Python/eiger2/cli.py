@@ -616,8 +616,9 @@ def command_call(args: argparse.Namespace) -> int:
             f"--region-null-mode member_step to raise instead of falling "
             f"back, or --region-null-mode off to skip region_qvalue entirely."
         )
-    if caller_manifest.get("fdr", {}).get("null_count_overdispersion_warning"):
-        ratio = caller_manifest["fdr"]["null_count_overdispersion_warning"]
+    fdr_diag = caller_manifest.get("fdr") or {}
+    if fdr_diag.get("null_count_overdispersion_warning"):
+        ratio = fdr_diag["null_count_overdispersion_warning"]
         warnings_list.append(
             f"pooled null region counts are overdispersed (variance/mean="
             f"{ratio:.2f})"
@@ -627,9 +628,8 @@ def command_call(args: argparse.Namespace) -> int:
     # docstring); a per-stratum empty pool is reported in
     # zero_exceedance_strata, not refused, so it is an informational note here,
     # not a "refused" warning.
-    fdr_status = caller_manifest.get("fdr", {}).get("status")
+    fdr_status = fdr_diag.get("status")
     if fdr_status == "aggregate null inadequate":
-        fdr_diag = caller_manifest["fdr"]
         required = fdr_diag.get("replicates_required")
         required_note = (
             f"; ~{required} replicates needed to reach the floor at the "
@@ -644,9 +644,7 @@ def command_call(args: argparse.Namespace) -> int:
             f"{fdr_diag.get('replicates')} replicates, below "
             f"min_null_regions_for_fdr{required_note}"
         )
-    zero_exceedance_strata = caller_manifest.get("fdr", {}).get(
-        "zero_exceedance_strata"
-    )
+    zero_exceedance_strata = fdr_diag.get("zero_exceedance_strata")
     if zero_exceedance_strata:
         for entry in zero_exceedance_strata:
             warnings_list.append(
