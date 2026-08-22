@@ -34,3 +34,6 @@ benchmarking/out*/
 .superpowers/
 docs/superpowers/
 /STAGE*_STOP_REPORT.md
+
+# working specs and stage reports -- never published
+.process/
