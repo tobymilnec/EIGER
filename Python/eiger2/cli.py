@@ -703,12 +703,6 @@ def command_call(args: argparse.Namespace) -> int:
             f"back, or --region-null-mode off to skip region_qvalue entirely."
         )
     fdr_diag = caller_manifest.get("fdr") or {}
-    if fdr_diag.get("null_count_overdispersion_warning"):
-        ratio = fdr_diag["null_count_overdispersion_warning"]
-        warnings_list.append(
-            f"pooled null region counts are overdispersed (variance/mean="
-            f"{ratio:.2f})"
-        )
     # Spec §2c: null-opportunity adequacy is a per-LENGTH-stratum check now,
     # not a single aggregate one -- a refused stratum's rows are suppressed,
     # every other stratum reports normally (run status `partial_inference`,
@@ -741,9 +735,27 @@ def command_call(args: argparse.Namespace) -> int:
             warnings_list.append(
                 f"stratum {entry['stratum']!r}: null pool is empty (0 pooled "
                 f"regions across {entry['replicates']} replicates) -- "
-                f"region_qvalue is reported at the finite K=0 Garwood bound, "
+                f"region_qvalue is reported with a finite positive K=0 "
+                f"replicate-cluster upper bound, "
                 f"not refused"
             )
+    for entry in fdr_diag.get("insufficient_cluster_replicates_strata") or []:
+        warnings_list.append(
+            f"stratum {entry['stratum']!r}: region_qvalue refused because "
+            f"{entry['clusters']} independent null clusters are below the "
+            f"fixed method minimum of {entry['minimum_clusters']}"
+        )
+    for entry in fdr_diag.get("insufficient_scale_opportunity_strata") or []:
+        warnings_list.append(
+            f"stratum {entry['stratum']!r}: region_qvalue refused because "
+            f"its observed/null opportunity scale is unavailable"
+        )
+    fallback_scale_strata = fdr_diag.get("fdr_scale_fallback_strata") or []
+    if fallback_scale_strata:
+        warnings_list.append(
+            "global edge scaling retained for FDR stratum/strata without "
+            f"measured matching opportunity: {fallback_scale_strata}"
+        )
     collapsed_strata = caller_manifest.get("layout", {}).get(
         "collapsed_length_strata"
     )
@@ -761,9 +773,10 @@ def command_call(args: argparse.Namespace) -> int:
             if not (np.isfinite(d) and abs(d) <= acf_gate_result["tolerance"])
         ]
         warnings_list.append(
-            f"Gate 1 (ACF match, master spec §6.2) failed at lag(s) {bad_lags} "
+            f"ACF calibration diagnostic differed at lag(s) {bad_lags} "
             f"of {acf_gate_result['lags']}: null autocorrelation does not match "
-            f"observed within {acf_gate_result['tolerance']}"
+            f"observed within {acf_gate_result['tolerance']}; this is not a "
+            f"hard gate on a signal-rich cohort"
         )
     region_exch = caller_manifest.get("gates", {}).get("region_exchangeability")
     if region_exch is not None:
@@ -896,18 +909,6 @@ def command_call(args: argparse.Namespace) -> int:
             f"region_qvalue entirely.",
             file=sys.stderr,
         )
-    overdispersion_ratio = (caller_manifest.get("fdr") or {}).get(
-        "null_count_overdispersion_warning"
-    )
-    if overdispersion_ratio is not None:
-        print(
-            f"[eiger2] WARNING: pooled null region counts are overdispersed\n"
-            f"         (variance/mean = {overdispersion_ratio:.2f}, Poisson assumes "
-            f"1.0).\n"
-            f"         region_qvalue_upper_95 is a LOWER BOUND on the true "
-            f"uncertainty.",
-            file=sys.stderr,
-        )
     # Spec §2c: per-LENGTH-stratum null-opportunity refusal -- that stratum's
     # rows only, not the whole run (see region_fdr_result's docstring).
     fdr_diag = caller_manifest.get("fdr") or {}
@@ -943,9 +944,35 @@ def command_call(args: argparse.Namespace) -> int:
         print(
             f"[eiger2] NOTE: stratum {entry['stratum']!r} has an empty pooled "
             f"null (0 across {entry['replicates']} replicates)\n"
-            f"         -- region_qvalue is reported at the finite K=0 Garwood "
-            f"bound for this stratum, not refused: the null had real "
-            f"opportunity and never produced a region this long.",
+            f"         -- region_qvalue point estimate is zero, while the "
+            f"replicate-cluster upper bound remains finite and positive.\n"
+            f"         The null had real opportunity and never produced a "
+            f"region this long; zero is not treated as zero uncertainty.",
+            file=sys.stderr,
+        )
+    for entry in fdr_diag.get("insufficient_cluster_replicates_strata") or []:
+        print(
+            f"[eiger2] WARNING: stratum {entry['stratum']!r} has only "
+            f"{entry['clusters']} independent null realisations\n"
+            f"         (minimum {entry['minimum_clusters']}) -- region_qvalue, "
+            f"its bounds, and significant are refused for this stratum.",
+            file=sys.stderr,
+        )
+    for entry in fdr_diag.get("insufficient_scale_opportunity_strata") or []:
+        print(
+            f"[eiger2] WARNING: stratum {entry['stratum']!r} has no valid "
+            f"observed/null opportunity scale\n"
+            f"         -- region_qvalue, its bounds, and significant are "
+            f"refused for this stratum.",
+            file=sys.stderr,
+        )
+    fallback_scale_strata = fdr_diag.get("fdr_scale_fallback_strata") or []
+    if fallback_scale_strata:
+        print(
+            "[eiger2] WARNING: matching opportunity was unavailable for FDR "
+            f"stratum/strata {fallback_scale_strata}\n"
+            "         -- the explicitly recorded global-edge fallback was used; "
+            "joint support-bin strata are not claimed to be opportunity-scaled.",
             file=sys.stderr,
         )
     collapsed_strata = (caller_manifest.get("layout") or {}).get(
@@ -973,11 +1000,12 @@ def command_call(args: argparse.Namespace) -> int:
             )
         ]
         print(
-            f"[eiger2] WARNING: Gate 1 (ACF match, master spec §6.2) failed\n"
+            f"[eiger2] WARNING: ACF calibration diagnostic differs\n"
             f"         null autocorrelation does not match the observed track's "
             f"within {tolerance} at lag(s) {bad_lags} of {acf_gate_result['lags']}.\n"
-            f"         Expected on current code at every layout (master spec §6.3 "
-            f"baseline); see manifest['gates']['acf'].",
+            f"         This is descriptive on a signal-rich cohort, where real "
+            f"coordination raises observed ACF; establish calibration on DMR-free "
+            f"controls/simulations. See manifest['gates']['acf'].",
             file=sys.stderr,
         )
     region_exch = (caller_manifest.get("gates") or {}).get("region_exchangeability")
@@ -1280,8 +1308,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="region-level null behind region_qvalue (distinct "
                             "from --null-mode above). Default (unset here) is "
                             "'auto': use 'member_step' when the input clears "
-                            "its genome-scale minimum size (about 103,000 "
-                            "CpGs at defaults), else fall back to 'lag' "
+                            "its min_cpgs-derived absolute floor (7,000 CpGs "
+                            "at defaults; 103,000 is preferred, with measured "
+                            "short-subtrack fallback below it), else fall back "
+                            "to 'lag' "
                             "automatically with a warning. Pass 'member_step' "
                             "explicitly to raise instead of falling back; "
                             "'lag' for small inputs or reproducing historical "

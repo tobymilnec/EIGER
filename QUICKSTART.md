@@ -65,10 +65,9 @@ Writes `examples/data/`: a 50,000 CpG × 24 sample matrix on one chromosome,
 with spatially autocorrelated background, two latent nuisance factors, read
 depth 15, 5% missing observations, and 20 planted regions spanning a grid of
 effect sizes and prevalences. `truth.tsv` records what was planted. 50,000
-CpGs is below `region_null_mode="member_step"`'s ~103,000-CpG floor, so
-`eiger2 call` on this data demonstrates the automatic `"lag"` fallback (see
-the README's quick-start note and `examples/make_example_data.py`'s
-docstring for why the run still reports `inference_unreliable`).
+CpGs is below member-step's preferred ~103,000-CpG size but above its exact
+7,000-CpG minimum at the defaults, so this fixture exercises the measured
+short-subtrack fallback without lowering the locality-breaking lag.
 
 ---
 
@@ -91,24 +90,10 @@ eiger2 compare --betas examples/data/betas.tsv \
                --out examples/out_compare
 ```
 
-Expected output for the first command:
-
-```
-[eiger2] region null: region_null_mode='auto', input has 50,000 CpGs, member_step needs >= 103,000
-[eiger2] caller     : eiger2
-[eiger2] regions    : 18
-[eiger2] significant: 0 at q <= 0.05
-[eiger2] status      : inference_unreliable
-[eiger2] written to : examples/out_eiger2
-```
-
-`regions` lists 18 candidates, but `status: inference_unreliable` -- expected on
-this fixture, and explained by the warnings the run also prints (see the
-quick-start note above and `examples/make_example_data.py`'s docstring):
-`"lag"`'s region-null essentially never forms a multi-CpG run on autocorrelated
-data, so `region_qvalue` and `significant` are withheld for the whole run rather
-than a fabricated q-value being reported. `eiger2 call` exits 1 in this
-situation; the exit code is not something to work around for this fixture.
+The exact candidate/significant counts can change with method revisions. Confirm in
+`run_manifest.json` that the resolved region null is `member_step`, inspect the
+preferred/fallback chromosome diagnostics, and check whether any length stratum was
+refused for insufficient opportunity before using its q-values.
 
 ---
 
@@ -232,14 +217,14 @@ defines no false discovery rate. That is the point of the comparison.
 | Column | Meaning |
 |---|---|
 | `region_tail_fdr` | point FDR at the region's own area cutoff |
-| `region_qvalue_lower_95` | simultaneous Garwood lower Monte Carlo bound |
-| `region_qvalue_upper_95` | simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| `region_qvalue_lower_95` | simultaneous replicate-cluster quasi-Poisson lower bound |
+| `region_qvalue_upper_95` | simultaneous replicate-cluster quasi-Poisson upper bound; positive when the point estimate is zero |
 | `region_qvalue_resolution` | one scaled null exceedance's worth of change at the q-achieving cutoff |
 | `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
 | `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
 
-See [docs/FDR.md](docs/FDR.md) for the full derivation, the Garwood interval's Poisson
-assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneous).
+See [docs/FDR.md](docs/FDR.md) for the derivation, model assumptions, simulation
+coverage checks, and simultaneity scope (per-stratum, not genome-wide).
 
 ### New in v2.2: two columns alongside `statistic_threshold`
 
@@ -267,6 +252,7 @@ assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneo
 --min-cpgs 4                         # minimum region length
 --null-replicates 100                # default since v2.0.1 (was 20); raise further
                                       # for --compute-posterior (100-300)
+--n-lag-draws 75                    # independent genome-wide region-null clusters
 --fdr-decision point|upper           # default point; upper decides on
                                       # region_qvalue_upper_95 instead (conservative)
 --support-binned-threshold auto|on|off  # condition the null-quantile threshold on
@@ -300,10 +286,11 @@ more than resolution.
 unchanged in spirit from v2.0.0. `upper` instead requires
 `region_qvalue_upper_95 <= target-fdr` — the conservative decision under finite-null
 estimation uncertainty. Use `upper` when few null replicates are available and a point
-estimate of exactly zero should not, on its own, be trusted as a call. If the current
-replicate count cannot achieve the target even in the best case, `upper` refuses to
-run rather than silently returning zero significant regions; the error names the
-replicate count required.
+estimate of exactly zero should not, on its own, be trusted as a call. A valid
+zero-rejection result is returned normally and recorded in
+`manifest["fdr"]["upper_decision_diagnostic"]`. A stratum is refused only when its
+null opportunity is inadequate or fewer than five usable independent region-null
+clusters remain.
 
 ### Choosing a null: `--null-mode` and `--region-null-mode`
 
@@ -314,14 +301,14 @@ significant) is a separate null, `--region-null-mode` (Stage 1f, pre-release).
 
 **Default: leave it unset.** With no `--region-null-mode` flag, the resolved
 behaviour is `"auto"`: `member_step` (below) is used when the input clears its
-genome-scale minimum size, and the CLI falls back to `lag` automatically --
+min_cpgs-derived absolute floor, and the CLI falls back to `lag` automatically --
 printing a loud warning naming the input size, the required size, and that `lag`'s
 q-values are not calibrated -- when it does not. This is what a CLI user hitting a
 small test file, a targeted panel, or a single-chromosome subset now gets instead
 of a hard, uncatchable error (the gap flagged in an earlier release note, now
-fixed). `eiger2 call`'s startup output always reports the computed floor and the
-input's CpG count before the run, e.g. `region_null_mode='auto', input has 50,000
-CpGs, member_step needs >= 103,000`.
+fixed). At the defaults the absolute floor is 7,000 CpGs; 103,000 CpGs is the
+preferred 100-position subtrack size. Chromosomes between the two use the measured
+fallback and are reported separately in the manifest.
 
 `member_step` (the resolved default on large-enough input) is what actually fixed
 large-cohort saturation: on a 519-sample cohort, the pre-v2.1.0 default assigned
@@ -334,8 +321,8 @@ exact-zeros; see `docs/FDR.md` §11-§12).
 below the floor it raises, naming the required size, rather than silently using
 `lag` -- for a caller who wants to know for certain which construction ran.
 `--region-null-mode lag` (reproduces the pre-v2.1.0 region-level null, including
-the saturation above) is for small inputs below the floor
-(`null_min_lag * (min_subtrack_length + window - 1)`, 103,000 CpGs at shipped
+the saturation above) is for small inputs below the absolute floor
+(`null_min_lag * (min_cpgs + window - 1)`, 7,000 CpGs at shipped
 defaults) where you specifically want `lag`'s behaviour rather than the automatic
 fallback, or for reproducing historical comparisons -- not recommended for
 inference on real-sized data. `--region-null-mode off` skips the region-level null

@@ -23,7 +23,7 @@ eiger2 call \
     --out results/
 ```
 
-The generated example is 50,000 CpGs on one chromosome -- below `region_null_mode="member_step"`'s ~103,000-CpG floor (see "Minimum input size" below), so this command demonstrates the automatic `"lag"` fallback, not the member-step construction. `region_qvalue` is not calibrated in that mode, so the run reports `status: ok_with_warnings` even though every length stratum's own pooled null happens to be genuinely empty (`K=0`, backed by real null opportunity, reported rather than refused -- see `examples/make_example_data.py`'s docstring) -- read the output as candidates-only, exactly as the run's own warnings say.
+The generated example is 50,000 CpGs on one chromosome. It is below the preferred ~103,000-CpG member-step size but above the exact minimum detectable-region floor, so it exercises the measured short-subtrack fallback while retaining the configured locality-breaking lag. Inspect the manifest's preferred/fallback diagnostics and per-length null opportunity before interpreting its q-values.
 
 Full installation instructions, input formats, and command-line options are provided in **[QUICKSTART.md](QUICKSTART.md)**.
 
@@ -61,13 +61,13 @@ A sliding-window co-variation statistic **manufactures autocorrelation**. The wi
 
 Any null used to calibrate *runs* of elevated edges must reproduce that autocorrelation, because run lengths depend on it. A null that does not will essentially never form multi-edge regions, and every observed run will then look impossible.
 
-EIGER2 v2.1.0 uses a **member-step lag null** (`region_null_mode="member_step"`, the default). Consecutive null positions share *w*−1 of their *w* member CpGs, exactly as consecutive observed windows do, so the autocorrelation is reproduced by construction; the members themselves are thousands of CpGs apart, so genuine regional coordination is broken.
+EIGER2 uses a **member-step lag null** (`region_null_mode="member_step"`, the default). Consecutive null positions share *w*−1 of their *w* member CpGs, matching the observed window-overlap mechanism while the members themselves remain at least `null_min_lag` CpGs apart. Observed-versus-null ACF is retained as a calibration diagnostic: real coordinated regions can raise the observed ACF, so it is not a hard gate on a signal-rich cohort.
 
 ### Chromosome-aware null construction
 
 Both the edge-level ("lag") and region-level ("member_step") nulls draw their locality-breaking lag **independently per chromosome**, not once genome-wide. A single genome-wide lag draw is far more likely to survive on the largest chromosome(s) than a smaller one -- a lag long enough to break locality genome-wide rarely also fits inside a short chromosome -- so the null ends up drawn almost entirely from the largest chromosomes even when the observed data spans every one of them. Each replicate now iterates every chromosome, draws that chromosome's own feasible lag (`U[null_min_lag, n_c // (span - 1)]`, where `n_c` is that chromosome's own CpG count), and concatenates every chromosome's own segment into one genome-wide realisation, with the eligibility mask broken at every chromosome boundary. This preserves chromosome composition in every replicate, and makes each replicate a clean cluster unit.
 
-A chromosome too small to admit a feasible lag (`n_c // (span - 1) < null_min_lag`) contributes nothing to the null in any replicate. It is not silently excluded: its share of the run's own eligible observed edges is measured (`manifest["gates"]["structural"]["chromosome_exposure"]`) and escalates to a structural gate -- see below -- when material.
+For the region null, `min_subtrack_length=100` is preferred rather than an all-or-nothing chromosome floor. A chromosome that cannot support 100-position subtracks may use a measured fallback down to the configured minimum detectable region length (`min_cpgs`), without changing the `null_min_lag=1000` locality-breaking floor. The per-length opportunity guard decides which length strata that shorter chromosome can support. Only chromosomes unable to support even `min_cpgs` at the minimum lag are absent and counted in `region_null_chromosome_exposure`. The manifest distinguishes preferred, fallback and truly infeasible chromosomes, realised subtrack lengths and the fraction of null positions used as forced boundaries.
 
 Two gates run automatically on every call and are recorded in `run_manifest.json`:
 
@@ -106,7 +106,7 @@ affect the exit code -- every other stratum's `region_qvalue` is unaffected and 
 
 ### Minimum input size, and automatic fallback
 
-The member-step construction needs enough CpGs to build sub-tracks of usable length: at default settings, **about 103,000 CpGs**. Below that, `region_null_mode="auto"` (the default) falls back to the older `"lag"` construction and prints a warning naming the input size, the required size, and the fact that `"lag"` fails both region gates and its q-values are not calibrated.
+The preferred 100-position member-step construction needs about **103,000 CpGs on a chromosome** at default settings. Shorter chromosomes now use the fallback above. The absolute construction floor is derived from the minimum detectable region: `null_min_lag × (min_cpgs + window − 1)`, **7,000 CpGs** at the defaults. Below that, `region_null_mode="auto"` falls back to the older `"lag"` construction and prints a warning.
 
 Pass `--region-null-mode member_step` to raise an error instead of falling back, or `--region-null-mode off` to skip `region_qvalue` entirely and report candidate regions only.
 
@@ -230,8 +230,8 @@ Six columns sit immediately after `region_qvalue`. Full derivation and worked ex
 | Column | Meaning |
 |---|---|
 | `region_tail_fdr` | point FDR at the region's own area cutoff |
-| `region_qvalue_lower_95` | simultaneous Garwood lower Monte Carlo bound |
-| `region_qvalue_upper_95` | simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| `region_qvalue_lower_95` | simultaneous replicate-cluster quasi-Poisson lower bound |
+| `region_qvalue_upper_95` | simultaneous replicate-cluster quasi-Poisson upper bound; finite and positive when the point estimate is zero |
 | `region_qvalue_resolution` | one scaled null exceedance's worth of change at the q-achieving cutoff |
 | `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
 | `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
@@ -250,11 +250,11 @@ eiger2 call --betas betas.tsv --locations cpgs.bed --out results/ \
     --fdr-decision upper
 ```
 
-`point` (default) calls a region significant when `region_qvalue <= target_fdr`. `upper` instead requires `region_qvalue_upper_95 <= target_fdr`: the conservative decision under finite-null estimation uncertainty. `upper` refuses to run, rather than silently returning zero significant regions, if the null cannot achieve the target even in the best case; the error names what would be required.
+`point` (default) calls a region significant when `region_qvalue <= target_fdr`. `upper` instead requires `region_qvalue_upper_95 <= target_fdr`. The upper bound uses each independently drawn genome-wide null realisation as one cluster, estimates exposure-adjusted replicate dispersion, and applies a Bonferroni band across the complete cutoff curve within each stratum. It is model-based (quasi-Poisson), not an assumption-free guarantee; its assumptions and simulation coverage checks are documented in `docs/FDR.md`. A valid zero-rejection result is returned normally and described in `manifest["fdr"]["upper_decision_diagnostic"]`; strata are refused only when the null opportunity or independent-cluster count is inadequate.
 
 ### Null adequacy
 
-If the pooled null contains too few regions to support an estimate, EIGER2 **refuses to report a q-value** rather than returning zero from no evidence. The affected regions receive `NaN` in every inferential column, `-1` in every count column, `significant = False`, and an entry in `manifest["fdr"]` naming the shortfall and what would be needed to clear it.
+If a length stratum has inadequate null opportunity, or there are fewer than five independent region-null realisations with positive exposure, EIGER2 **refuses to report a q-value**. The affected regions receive `NaN` in every inferential column, `-1` in every count column, nullable `significant = pd.NA`, and an entry in `manifest["fdr"]` naming the shortfall. Ordinary length strata scale expected null-region counts by their own observed/null opportunity ratio; joint length×support strata currently retain a prominently diagnosed global-edge fallback because matching joint opportunity is not yet measured.
 
 A stratum in which the null produced *no* region, while the run as a whole is adequate, is not a shortfall — it is strong evidence, and it is reported as `q = 0` with a finite upper bound.
 

@@ -4,10 +4,22 @@
 mirrored in `Python/eiger2/probability.py` (`_tail_area_fdr`, documented in
 [`docs/PROBABILITY.md`](PROBABILITY.md)).
 
-This document covers the v2.0.1 region-level FDR estimator: its derivation, the two
-defects corrected from v2.0.0, the three distinct quantities it reports, the Garwood
-Monte Carlo interval and its assumptions, and the output schema change. It also states,
-prominently and first, a real calibration problem found while benchmarking this release.
+This document covers the empirical region-FDR estimator, the member-step region null,
+the per-length opportunity guard, and the current replicate-cluster uncertainty band.
+Sections describing earlier Poisson/Garwood-only releases are historical where noted.
+
+> **Current uncertainty method (Stage 2d).** The empirical pooled exceedance count and
+> monotone q-value construction are retained, with an opportunity-specific scale for
+> each ordinary length stratum. The former Poisson-only Garwood interval is superseded by one fixed
+> replicate-cluster quasi-Poisson interval. One independently drawn genome-wide
+> member-step realisation is one cluster; regions inside it are never treated as
+> independent. Exposure-adjusted Pearson dispersion widens a scaled-count chi-square
+> interval, and Bonferroni correction makes the reported cutoff curve simultaneous
+> within a stratum. This is an approximate, model-based 95% band, conditional on
+> independent null realisations and `Var(K_b)=phi*E(K_b)`. It does not correct a
+> systematically non-exchangeable null. Negative-binomial simulation coverage and
+> DMR-free/signal decision regressions are permanent tests; broader publication-scale
+> calibration remains required.
 
 ---
 
@@ -55,7 +67,7 @@ every check run against real data:
 - **Monotonicity** (`region_qvalue` non-decreasing as area weakens, within each
   stratum): 0 violations across ~500 checked region-pairs on two independently
   generated datasets.
-- **The zero-q vacuity guard** (no exact-zero point estimate without a nonzero
+- **The zero-q uncertainty invariant** (no exact-zero point estimate without a nonzero
   `region_qvalue_upper_95`): 0 violations across 231 checked regions, 31.2% of which
   had an exact-zero point q-value and a median `region_qvalue_upper_95` of 0.0121.
 
@@ -100,7 +112,8 @@ scenario tested, before Stage 1's FDR machinery existed at all.
 - This release's benchmarks ran at reduced scale — 3-5 seeds, a single discovery
   statistic, no sweep over `null_mode`, `window`, or `null_replicates` (see
   `results_v201/`) — so it is not only the miscalibration (criterion 3) that is
-  confirmed only at this reduced scale: the monotonicity and zero-q vacuity guard
+  confirmed only at this reduced scale: the monotonicity and zero-q uncertainty
+  invariant
   checks reported above as "0 violations" (gate criteria 1 and 2) are likewise
   confirmed only at the 3-5 seed scale actually run, not at the spec's full
   100-seed design.
@@ -119,10 +132,10 @@ misrepresent this kind of estimate:
    estimate caused by one additional pooled-null exceedance. This is nonzero and
    assumption-free: it says nothing about a confidence level, only about how coarse
    the point estimate's grid is at that many null replicates.
-3. **Monte Carlo interval** (`region_qvalue_lower_95` / `region_qvalue_upper_95`) —
+3. **Replicate-cluster interval** (`region_qvalue_lower_95` / `region_qvalue_upper_95`) —
    uncertainty in the expected null count arising from having only a *finite* number
-   of null tracks. This requires a count model (Poisson, via Garwood — see below) and
-   the model's assumption must be stated, not left implicit.
+   of null tracks. This uses a quasi-Poisson count model over independent genome-wide
+   null realisations; its assumptions are stated below.
 
 A q-value is not a posterior probability. A Monte Carlo interval quantifies finite-null
 estimation uncertainty, not biological truth. Neither of the two new bound columns
@@ -130,22 +143,30 @@ should be read as "the region is real with probability X."
 
 ## 2. Reference tail estimator
 
-Within one length stratum, `s = observed_edges / null_edges` (`null_edges` is the total
-summed over replicates; `null_area_sets` are pooled over replicates the same way, so
-the two already correspond — this scaling is unchanged from v2.0.0).
+Within length stratum `s`, let `O_s` and `N_s` be the observed and pooled-null
+opportunities defined by the same minimum-length run convention as the adequacy guard.
+The publication member-step path uses `scale_s = O_s/N_s`. This matters once fallback
+chromosomes contribute short-region opportunity without equal long-region opportunity.
+An unstratified caller without measured opportunities retains the historical
+`observed_edges/null_edges` scale and records it as a fallback. A true joint
+length×support-bin stratum also retains a prominently labelled global-edge fallback:
+joint opportunity is not currently measured, so it is not claimed to be
+opportunity-scaled.
 
 For the `j`-th **distinct** observed area cutoff `a_j`, ordered strongest to weakest:
 
 - `R_j` = count of observed regions with area >= `a_j` (the complete tie group at that
   cutoff is included — see "The tie-aware denominator" below).
 - `K_j` = count of pooled null regions with area >= `a_j`.
-- Point tail FDR: `FDR_j = min(1, s * K_j / R_j)`.
-- Resolution: `Δ_j = min(1, s / R_j)` — the FDR's own step size at that denominator.
-- Garwood bounds, with `α* = α / m_bonf` (see "The Bonferroni-for-simultaneity
-  argument" below):
-  - `L_j = ½ · χ²_{2K_j, α*/2}` (defined as `0` when `K_j = 0`)
-  - `U_j = ½ · χ²_{2(K_j+1), 1−α*/2}`
-  - `FDR^lo_j = min(1, s·L_j/R_j)`, `FDR^hi_j = min(1, s·U_j/R_j)`
+- Point tail FDR: `FDR_j = min(1, scale_s * K_j / R_j)`.
+- Resolution: `Δ_j = min(1, scale_s / R_j)` — the FDR's own step size at that denominator.
+- replicate-cluster quasi-Poisson bounds, with stratum dispersion `phi`, effective
+  count `Keff_j = K_j/phi`, and `α* = α / m_bonf` (see "The
+  Bonferroni-for-simultaneity argument" below):
+  - `L_j = phi/2 · χ²_{2Keff_j, α*/2}` (defined as `0` when `K_j = 0`)
+  - `U_j = phi/2 · χ²_{2(Keff_j+1), 1−α*/2}`
+  - `FDR^lo_j = min(1, scale_s·L_j/R_j)`,
+    `FDR^hi_j = min(1, scale_s·U_j/R_j)`
 - q-values, the reverse cumulative minimum over `j` (see next section):
   - `q_i = min_{j>=i} FDR_j`
   - `q^lo_i = min_{j>=i} FDR^lo_j`
@@ -237,39 +258,56 @@ finite number of permutations. It is a well-known and appropriate correction for
 specific quantity.
 
 EIGER's `region_qvalue` is not a p-value. It is a **scaled expected-null count**:
-`s * K_j / R_j`, where `K_j` is a count of null region exceedances and `s` rescales the
-null's edge count to the observed genome's edge count. Adding one to `K_j` (the
+`scale_s * K_j / R_j`, where `K_j` is a count of null region exceedances and
+`scale_s` maps the null opportunity to observed opportunity. Adding one to `K_j` (the
 Phipson–Smyth-style correction) would not correct a small-sample p-value bias here; it
 would silently distort the actual estimated count. Instead, the estimation uncertainty
-in a small `K_j` is handled honestly and separately, via the Garwood interval (below)
+in a small `K_j` is handled honestly and separately, via the cluster interval (below)
 — which quantifies the finite-null uncertainty explicitly, as a confidence interval
 around the count, rather than folding an ad hoc correction into the point estimate
 itself.
 
-## 6. The Garwood interval and its Poisson assumption
+## 6. Replicate-cluster quasi-Poisson interval
 
-`region_qvalue_lower_95` / `region_qvalue_upper_95` are Garwood exact confidence
-bounds for a Poisson count `K_j`, mapped through the same scale-and-normalise
-transform as the point estimate:
+For cutoff `j` in ordinary length stratum `s`, the point estimate is
 
 ```
-L_j = ½ · χ²_{2K_j, α*/2}          (0 when K_j = 0)
-U_j = ½ · χ²_{2(K_j+1), 1−α*/2}
+scale_s     = O_s / N_s
+FDR_hat_j   = scale_s * sum_b K_bj / R_j
 ```
 
-This is the standard exact (Clopper–Pearson-style) confidence interval for a Poisson
-rate given an observed count, expressed via the chi-squared distribution. **It assumes
-the null exceedance count `K_j` is Poisson-distributed** — i.e. that
-replicate-to-replicate variance in the exceedance count equals its mean. This is the reason a
-zero point estimate (`K_j = 0`) still has a strictly positive upper bound: a Poisson
-process with rate zero would never produce any variability, but a Poisson process with
-a small positive rate can easily produce zero counts in a finite sample, and the
-Garwood upper bound reflects that possibility rather than treating an observed zero as
-certainty.
+Here `N_s=sum_b E_sb`, and `E_sb` is replicate `b`'s actual opportunity for length
+stratum `s`. For an explicitly diagnosed unstratified or joint-support fallback, the
+historical global edge scale is used instead. This distinction matters for
+short-subtrack fallback chromosomes, which may offer short-region opportunity but no
+long-region opportunity. Dispersion is estimated from one count per cluster at the
+weakest reported cutoff in the stratum, where count information is greatest. With
+`mu_b = E_sb * sum(K_b)/sum(E_sb)`, the exposure-adjusted Pearson estimate is
 
-This Poisson assumption is exactly what the overdispersion diagnostic (below) checks,
-and it is exactly what can fail — see the top-of-document limitation section for what
-happens to calibration in that case.
+```
+phi_hat = max(1, sum_b (K_b - mu_b)^2 / mu_b / (B - 1)).
+```
+
+The same `phi_hat` is used across that stratum's nested cutoff curve. For a completely
+empty curve, where dispersion cannot be estimated, the method borrows the largest
+estimable dispersion from another reported stratum in the same run; if none is
+estimable it records and uses the quasi-Poisson floor `phi=1`. This is a finite-null
+safeguard, not a claim that an unseen long-region process is known to be Poisson.
+
+For pooled count `K_j`, the scaled-count endpoints are
+
+```
+K_eff = K_j / phi
+L_j = phi/2 * chi2_(2*K_eff, alpha*/2)            (0 when K_j=0)
+U_j = phi/2 * chi2_(2*(K_eff+1), 1-alpha*/2).
+```
+
+They reduce to Garwood at `phi=1` and widen under measured cluster overdispersion.
+At `K=0`, `U_j` is finite and strictly positive, so geometric opportunity plus zero
+events never becomes zero-uncertainty significance. These are approximate,
+model-based bounds: validity depends on independent genome-wide null draws and a
+quasi-Poisson mean-variance relationship. They quantify conditional finite-null
+uncertainty, not systematic null misspecification.
 
 ## 7. The Bonferroni-for-simultaneity argument
 
@@ -280,11 +318,12 @@ every `j` at once, not merely for each `j` individually at its own confidence le
 Only under that joint event does `min_j U_j >= min_j FDR_j` hold, which is what
 licenses reporting `q^hi_i` as a bound on `q_i`.
 
-A single per-cutoff Garwood interval at level `1 − α` only guarantees marginal
-coverage for that one cutoff; it says nothing about simultaneous coverage across all
+A single per-cutoff cluster interval at level `1 − α` targets marginal
+coverage for that one cutoff under the quasi-Poisson model; it does not by itself
+address simultaneous coverage across all
 `m` cutoffs a stratum considers. The Bonferroni correction — testing each interval at
-`α* = α / m_bonferroni` instead of `α` — is what converts `m` marginal `1 − α`
-guarantees into one joint `1 − α` guarantee across all of them, via the union bound.
+`α* = α / m_bonferroni` instead of `α` — is what converts the `m` model-based
+marginal statements into one model-based simultaneous statement via the union bound.
 
 **This correction must not be removed as an "optimisation."** Doing so would make the
 reverse-scan step over the bounds statistically invalid: `q^hi_i` would no longer be a
@@ -295,47 +334,43 @@ valid upper bound on `q_i`, even though it would still look like one in the outp
 `m_bonferroni` is computed as the **maximum** number of distinct observed cutoffs
 across all length strata (`m_bonferroni = max_s G_s`, where `G_s` is the distinct-cutoff
 count within stratum `s`), and the same `m_bonferroni` is then used for every stratum's
-Garwood calculation. This is what makes `region_qvalue_upper_95` comparable in
+cluster-interval calculation. This is what makes `region_qvalue_upper_95` comparable in
 magnitude across strata.
 
-State this explicitly: **coverage is >= 1 − α within each stratum; joint coverage
-across `S` strata is only >= 1 − S·α.** The bounds reported here are **not** described
-as genome-wide simultaneous across strata — only within-stratum simultaneity across
-that stratum's own cutoffs is guaranteed by construction. If genome-wide (all-strata)
+State this explicitly: **the nominal family is one complete cutoff curve within a
+stratum.** Under the stated quasi-Poisson approximation its target coverage is
+`1 − α`; the corresponding nominal lower bound across `S` strata is `1 − S·α`.
+The bounds are **not** described as genome-wide simultaneous across strata. If
+genome-wide (all-strata)
 simultaneity were required, `α*` would need to be divided by `S` again on top of the
 per-stratum Bonferroni correction; this release does not do that, and the diagnostics
 recorded (`fdr_interval_bonferroni_m`, `fdr_interval_cutoffs_by_stratum`,
 `fdr_interval_family = "per_stratum"`) exist specifically so a reader can see which
 scope of simultaneity was actually used.
 
-## 9. The overdispersion caveat
+## 9. Dispersion diagnostics and limitations
 
-**Under overdispersion, the Garwood interval understates uncertainty.** Plainly: the
-Garwood interval's entire validity rests on the Poisson assumption stated in section 6.
-If the null exceedance count varies replicate-to-replicate by more than a Poisson
-process would predict (`variance > mean`), the true sampling uncertainty is wider than
-what the Garwood formula reports, and `region_qvalue_upper_95` becomes an
-**underestimate** of the real upper bound — not a conservative one.
+The old `null_count_overdispersion_warning` is superseded once the cluster method is
+used: measured overdispersion now widens the interval. The manifest records
+`fdr_uncertainty_method`, cluster count, minimum cluster count, simultaneity scope,
+exposure source, assumptions, zero-count safeguard, and, for each stratum, raw Pearson
+dispersion, dispersion used, and whether it came from that stratum, another estimable
+stratum, or the `phi=1` floor.
 
-`region_fdr_result` checks this directly: for each length stratum, at each distinct
-cutoff with positive mean exceedance count across replicates, it computes
-`ratio_j = var(K_{.,j}, ddof=1) / mean(K_{.,j})` and takes `median_ratio` across usable
-cutoffs (`_overdispersion_diagnostic` in `core.py`, requiring >= 5 replicates and >= 1
-usable cutoff; otherwise it reports `"unavailable"` rather than guessing). If the
-**largest** `median_ratio` across strata exceeds `1.5`,
-`null_count_overdispersion_warning` is appended to
-`manifest["warnings"]` and printed to stderr by `eiger2 call`:
+At least five positive-exposure independent genome-wide null realisations are required
+for reported dispersion/upper inference. Two are algebraically estimable, but one
+residual degree of freedom is not defensible for an upper claim. Below five, the affected stratum is refused through
+the normal nullable-inference path and named in
+`insufficient_cluster_replicates_strata`. The default member-step construction uses
+75 clusters.
 
-```
-[eiger2] WARNING: pooled null region counts are overdispersed
-         (variance/mean = {ratio:.2f}, Poisson assumes 1.0).
-         region_qvalue_upper_95 is a LOWER BOUND on the true uncertainty.
-```
-
-**This release does not attempt to widen or narrow the interval using an uncalibrated
-dispersion correction.** The diagnostic is reported, not silently corrected for, so
-that a user with an overdispersed null knows to treat `region_qvalue_upper_95` as
-optimistic rather than trust it as-is.
+The interval does **not** prove the locality-breaking null is biologically
+exchangeable. ACF and observed/null region-rate comparisons remain diagnostics; on a
+signal-rich cohort they are expected to differ and cannot be hard gates. Calibration
+must be established on DMR-free controls and simulations. The permanent tests include
+deterministic Poisson-like, negative-binomial/overdispersed and all-zero count cases,
+a nested-cutoff negative-binomial simultaneous-coverage check, and both count-level
+and end-to-end DMR-free/strong-signal decision regressions.
 
 ## 10. Schema: v2.0.0 to v2.0.1
 
@@ -354,8 +389,8 @@ column -- see §14).
 |---|---|---|
 | `region_qvalue` | `region_qvalue` | value changes; corrected direction + tie-aware denominator |
 | — | `region_tail_fdr` | new: point FDR at the region's own area cutoff |
-| — | `region_qvalue_lower_95` | new: simultaneous Garwood lower bound |
-| — | `region_qvalue_upper_95` | new: simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| — | `region_qvalue_lower_95` | simultaneous replicate-cluster lower bound |
+| — | `region_qvalue_upper_95` | simultaneous replicate-cluster upper bound; nonzero whenever the point estimate is zero |
 | — | `region_qvalue_resolution` | new: one scaled null exceedance's worth of change at the q-achieving cutoff |
 | — | `null_exceedances_at_cutoff` | new: pooled exceedance count `K` at the q-achieving cutoff (`-1` if unavailable) |
 | — | `region_qvalue_cutoff_rank` | new: `R` at the q-achieving cutoff (`-1` if unavailable) |
@@ -529,21 +564,18 @@ Stage 1c-bis's original reasoning conflated two different situations:
 - **Empty because the null cannot produce them** — not missing information. Decisive
   information, given the run as a whole is adequately backed by null volume.
 
-The finite-null uncertainty layer this document builds in §1–§7 already handles the
-second case correctly and was never the problem: `K=0` at a cutoff gives a point
-estimate `q = s·0/R = 0` and a **finite** Garwood upper bound `s·U(K=0)/R` (§6). Neither
-depends on how many null regions happened to land in that particular stratum — the
-Garwood interval is a function of `K`, `m_bonferroni`, and `scale` (itself a function of
-`observed_edges`/`null_edges`, run-level quantities), not of a per-stratum pool size. A
-stratum backed by an empty pool and a stratum backed by a huge pool that also happens to
-have zero exceedances at the same cutoff get *identical* `qvalue_upper_95` — as they
-should, since both report the same `K=0`. The Stage 1c-bis floor short-circuited this
+The finite-null uncertainty layer handles the second case explicitly: `K=0` at a
+cutoff gives a point estimate `q = scale_s·0/R = 0` and a **finite positive**
+replicate-cluster upper bound (§6). Its width depends on `m_bonferroni`, `scale`, `R`
+and replicate dispersion. A wholly empty curve borrows the largest estimable
+dispersion in the run, or records the `phi=1` floor when none is estimable; it is never
+reported as zero uncertainty. The Stage 1c-bis floor short-circuited this
 machinery before it could run, discarding a correct, already-implemented answer in favor
 of `NaN`.
 
-**The fix moves the adequacy floor off per-stratum realised region counts and onto
-aggregate adequacy.** `min_null_regions_for_fdr` (`Eiger2Config`, `region_fdr_result`) is
-now checked **once, globally**: pooled null regions summed across every stratum and
+**Historical Stage 1e fix.** This moved the adequacy floor off per-stratum realised
+region counts and onto aggregate adequacy. `min_null_regions_for_fdr`
+(`Eiger2Config`, `region_fdr_result`) was checked **once, globally**: pooled null regions summed across every stratum and
 every replicate. If the run as a whole fails this, everything is refused exactly as
 before — that Stage 1c-bis behaviour is unchanged. If the run passes, **every** stratum
 is let through the tail-area estimator, including ones whose own pool is exactly empty.
@@ -569,9 +601,9 @@ pattern is worth naming plainly: **every defect in this sequence came from valid
 null on one moment and not the one the estimator actually depends on.** §3–§4's fix
 validated the q-value's monotonicity assumption, not just its point value. §11's fix
 validated the region-level null's autocorrelation, not just its marginal distribution.
-This fix validated the adequacy guard's unit of analysis — the run as a whole, which is
-what `scale` and the Garwood interval are actually computed against — not a per-stratum
-count that the estimator never needed subdivided that finely to begin with.
+Stage 2c subsequently added the per-length opportunity guard, and Stage 2d uses that
+same opportunity at the estimator's scale. The historical global-only account above
+does not describe the current member-step publication path.
 
 ## 13. Calibrated, or conservative? Quantifying the realised-FDR claim (Stage 1f Task 2,
 master spec pre-release)
@@ -764,11 +796,14 @@ threshold, its share of the run's own eligible observed edges is measured
 `config.max_missing_null_exposure` (default `0.05`).
 
 This edge-null measurement remains in `structural.chromosome_exposure`. When the resolved
-region null is `member_step`, the manifest additionally records and gates
-`structural.region_null_chromosome_exposure` using that construction's stricter
-`L_max_c = n_c // (min_subtrack_length + window - 1)` rule. A chromosome can therefore be
-represented in the edge-threshold null but correctly reported as absent from the
-region-FDR null; either material exclusion fails the run closed.
+region null is `member_step`, the manifest separately records and gates
+`structural.region_null_chromosome_exposure`. `min_subtrack_length` is a preferred
+construction: if its ceiling is below `null_min_lag`, the chromosome may use a short
+fallback ceiling derived from `min_cpgs`. Only a chromosome below
+`null_min_lag * (min_cpgs + window - 1)` is absent from the region null. This exact
+`+ window - 1` convention includes the forced ineligible seam at the end of every
+subtrack: `min_cpgs` statistic positions leave `min_cpgs - 1` usable passing edges,
+which span exactly `min_cpgs` CpGs under `segment()`.
 
 **Explicit and independently tunable, not derived from `min_null_coverage`.** An earlier
 version of this gate tied its floor to `1 - min_null_coverage` (0.75 at the default
@@ -797,16 +832,18 @@ per-chromosome quantile leave for future work, not something either claims to be
 
 ### 15.4 `member_step_lag_null_ensemble`
 
-The same audit and the same fix, with `min_subtrack_length`-based feasibility
-(`L_max_c = n_c // (min_subtrack_length + window - 1)`) instead of `null_tracks()`'s
-`max(window, 2)`-based one. Raises only when NO chromosome individually clears the floor,
-naming the largest chromosome's own `n_cpg`/`L_max` rather than the genome-wide total.
+The same audit and the same fix, with a preferred
+`L_max_c = n_c // (min_subtrack_length + window - 1)` and fallback
+`L_max_c = n_c // (min_cpgs + window - 1)`. Raises only when NO chromosome
+individually clears even the fallback floor, naming the largest chromosome's own
+`n_cpg`/fallback `L_max` rather than the genome-wide total.
 `member_step_min_n_cpg()` stays genome-wide -- a cheap, approximate, conservative
 pre-check for `region_null_mode="auto"`'s fallback decision, run before any per-chromosome
 breakdown is available; the authoritative check is `member_step_lag_null_ensemble`'s own.
-Its missing eligible-edge share and excluded chromosome names are recorded by
-`structural.region_null_chromosome_exposure` and compared with
-`max_missing_null_exposure`, independently of the edge-null exposure gate.
+Its preferred/fallback/infeasible chromosome lists, missing eligible-edge share,
+realised per-chromosome subtrack-length range, and forced-boundary fraction are recorded
+by `structural.region_null_chromosome_exposure`; only truly infeasible exposure is
+compared with `max_missing_null_exposure`, independently of the edge-null exposure gate.
 
 **The ACF failure at every lag in the audited run is not yet explained by this stage.**
 Diagnosing whether the concatenated sub-tracks' eligibility mask (false at every piece
@@ -871,14 +908,15 @@ per spec §2c.2, not yet validated -- sweep it in the §2f grid) gives
 N_s >= m_opportunity * O_s / R_s
 ```
 
-Two things this deliberately does NOT do: it is assessed once per length stratum, not at
-every area cutoff (opportunity does not depend on the cutoff, only `K` does), and it never
-touches the estimator's exposure scale `s = observed_edges / null_edges` -- that stays
-global, unchanged by this stage, so as not to confound it with a future §2d rescaling.
+It is assessed once per length stratum, not at every area cutoff (opportunity does not
+depend on the cutoff, only `K` does). Stage 2d now uses the same `O_s/N_s` ratio to
+scale the point estimate and bounds for ordinary length strata; the earlier
+global-edge-only statement is historical.
 
 ### 16.3 Outcomes, and the two lists
 
-- **Adequate, `K_s = 0`** -- unchanged from §14: reported at the finite Garwood upper
+- **Adequate, `K_s = 0`** -- reported with a zero empirical point estimate and finite,
+  positive replicate-cluster upper
   bound, named in `manifest["fdr"]["zero_exceedance_strata"]`.
 - **Inadequate** -- that length stratum's rows are refused (`region_qvalue` etc. `NaN`,
   count fields `-1`, `significant` `pd.NA`), named in

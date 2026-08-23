@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 
 from eiger2.core import (  # noqa: E402
     Eiger2Config,
+    _member_step_lag_limits,
     call_dmrs,
     chromosome_lag_feasibility,
     member_step_chromosome_feasibility,
@@ -123,18 +124,22 @@ def test_max_missing_null_exposure_defaults_to_a_strict_explicit_five_percent():
     assert Eiger2Config().max_missing_null_exposure == 0.05
 
 
-def test_member_step_feasibility_is_stricter_than_edge_null_feasibility():
-    _matrix, locations = _build({"chrBig": 200, "chrSmall": 30})
+def test_member_step_feasibility_reports_preferred_fallback_and_infeasible():
+    _matrix, locations = _build({"chrBig": 200, "chrFallback": 60, "chrTiny": 30})
     config = Eiger2Config(
         window=4, null_min_lag=5, min_subtrack_length=10,
     )
     edge = chromosome_lag_feasibility(locations, config)
     member = member_step_chromosome_feasibility(locations, config)
 
-    assert edge["chrSmall"]["feasible"] is True
-    assert member["chrSmall"]["feasible"] is False
-    assert member["chrSmall"]["l_max"] == 30 // (10 + 4 - 1)
-    assert member["chrSmall"]["eligible_observed_edges"] == 29
+    assert member["chrBig"]["construction"] == "preferred"
+    assert member["chrFallback"]["construction"] == "fallback"
+    assert member["chrFallback"]["feasible"] is True
+    assert member["chrFallback"]["preferred_l_max"] == 60 // (10 + 4 - 1)
+    assert member["chrFallback"]["fallback_l_max"] == 60 // (4 + 4 - 1)
+    assert edge["chrTiny"]["feasible"] is True
+    assert member["chrTiny"]["construction"] == "infeasible"
+    assert member["chrTiny"]["eligible_observed_edges"] == 29
 
 
 def test_member_step_region_exposure_gate_passes_when_missing_share_is_small():
@@ -158,7 +163,13 @@ def test_member_step_region_exposure_gate_passes_when_missing_share_is_small():
 
 
 def test_member_step_region_exposure_gate_fails_when_missing_share_is_material():
-    matrix, locations = _build({"chrBig": 100, "chrSmall1": 60, "chrSmall2": 60})
+    matrix, locations = _build({
+        "chrBig": 100,
+        "chrSmall1": 30,
+        "chrSmall2": 30,
+        "chrSmall3": 30,
+        "chrSmall4": 30,
+    })
     config = Eiger2Config(
         window=4, null_min_lag=5, min_subtrack_length=10,
         null_replicates=4, n_lag_draws=2, region_null_mode="member_step",
@@ -173,15 +184,58 @@ def test_member_step_region_exposure_gate_fails_when_missing_share_is_material()
     assert edge_gate["passed"] is True
     assert edge_gate["infeasible_chromosomes"] == []
     assert set(region_gate["infeasible_chromosomes"]) == {
-        "chrSmall1", "chrSmall2",
+        "chrSmall1", "chrSmall2", "chrSmall3", "chrSmall4",
     }
     assert region_gate["missing_exposure"] == pytest.approx(
-        (59 + 59) / (99 + 59 + 59)
+        (29 * 4) / (99 + 29 * 4)
     )
     assert region_gate["passed"] is False
     assert manifest["status"] == "inference_unreliable"
     if len(regions):
         assert (regions["fdr_status"] == "unavailable_run").all()
+
+
+def test_icgc_shaped_counts_leave_only_chry_and_chrm_truly_infeasible():
+    """Regression against the chromosome counts recorded by the Stage 2c run.
+
+    This is count-only: it exercises the exact feasibility algebra without
+    allocating the 12 GB cohort matrix or a 2.3-million-row locations frame.
+    """
+
+    n_cpg = {
+        "chr1": 210482, "chr2": 167359, "chr3": 121833, "chr4": 96032,
+        "chr5": 114058, "chr6": 109008, "chr7": 128230, "chr8": 91353,
+        "chr9": 98145, "chr10": 113083, "chr11": 122088, "chr12": 110939,
+        "chr13": 54509, "chr14": 73097, "chr15": 71175, "chr16": 106795,
+        "chr17": 124620, "chr18": 45754, "chr19": 143622, "chr20": 73129,
+        "chr21": 29563, "chr22": 59262, "chrX": 29759, "chrY": 1874,
+        "chrM": 222,
+    }
+    eligible_edges = {
+        "chr1": 179322, "chr2": 140941, "chr3": 101150, "chr4": 80995,
+        "chr5": 95957, "chr6": 91527, "chr7": 110681, "chr8": 76539,
+        "chr9": 84264, "chr10": 96403, "chr11": 104918, "chr12": 94263,
+        "chr13": 46065, "chr14": 62333, "chr15": 60585, "chr16": 94595,
+        "chr17": 110542, "chr18": 38363, "chr19": 131011, "chr20": 63179,
+        "chr21": 25468, "chr22": 52087, "chrX": 22034, "chrY": 1596,
+        "chrM": 212,
+    }
+    config = Eiger2Config(window=4, min_cpgs=4, null_min_lag=1000)
+    construction = {
+        chrom: _member_step_lag_limits(count, config)["construction"]
+        for chrom, count in n_cpg.items()
+    }
+    assert {c for c, mode in construction.items() if mode == "infeasible"} == {
+        "chrY", "chrM"
+    }
+    assert construction["chr1"] == "preferred"
+    assert construction["chr4"] == "fallback"
+    missing = sum(
+        eligible_edges[c] for c, mode in construction.items()
+        if mode == "infeasible"
+    ) / sum(eligible_edges.values())
+    assert missing == pytest.approx(0.00092009, abs=1e-7)
+    assert missing < config.max_missing_null_exposure
 
 
 def test_threshold_by_chromosome_reports_the_sensitivity_half_of_2b3():

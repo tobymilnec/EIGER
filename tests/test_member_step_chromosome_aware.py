@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 
 from eiger2.core import (  # noqa: E402
     Eiger2Config,
+    _member_step_lag_limits,
     member_step_lag_null_ensemble,
     member_step_lag_null_tracks,
     segment,
@@ -111,8 +112,66 @@ def test_raise_message_names_the_largest_chromosomes_own_n_cpg_and_l_max():
         window=4, null_min_lag=30, min_subtrack_length=20, n_lag_draws=5,
         random_seed=3,
     )
-    with pytest.raises(ValueError, match=r"n_cpg=100 \(L_max=4\)"):
+    with pytest.raises(ValueError, match=r"n_cpg=100 \(fallback L_max=14\)"):
         member_step_lag_null_ensemble(residuals, config, locations)
+
+
+def test_short_subtrack_fallback_exact_boundary_matches_segment_convention():
+    """The forced seam consumes one statistic position per subtrack.
+
+    For w=4/min_cpgs=4/lag=10 the exact floor is
+    10 * (4 + 4 - 1) = 70 rows. At 69 rows the fallback is infeasible; at 70
+    every four-position subtrack retains three passing edges after its final
+    boundary is broken, exactly enough to segment a four-CpG region.
+    """
+
+    config = Eiger2Config(
+        window=4, min_cpgs=4, null_min_lag=10,
+        min_subtrack_length=20, n_lag_draws=1, random_seed=8,
+    )
+    assert _member_step_lag_limits(69, config)["construction"] == "infeasible"
+    limits = _member_step_lag_limits(70, config)
+    assert limits["construction"] == "fallback"
+    assert limits["l_max"] == 10
+
+    rng = np.random.default_rng(8)
+    residuals = rng.normal(size=(70, 15))
+    frame = _locations({"chr1": 70})
+    replicates, lags = member_step_lag_null_ensemble(
+        residuals, config, frame
+    )
+    assert lags == [[("chr1", 10, 10)]]
+    track, eligible, _segments = replicates[0]
+    regions = segment(track, eligible, -np.inf, min_cpgs=4, max_gap_edges=0)
+    assert len(regions) == 10
+    assert np.all((regions[:, 1] - regions[:, 0] + 1) == 4)
+
+
+def test_fallback_chromosome_preserves_gap_mask_and_offset_boundaries():
+    rng = np.random.default_rng(19)
+    n_cpg = 90
+    starts = np.arange(n_cpg) * 20
+    starts[45:] += 10_000
+    frame = pd.DataFrame({
+        "chr": ["chr1"] * n_cpg,
+        "start": starts,
+        "end": starts + 1,
+    })
+    config = Eiger2Config(
+        window=4, min_cpgs=4, null_min_lag=10,
+        min_subtrack_length=20, n_lag_draws=1,
+        max_cpg_gap_bp=300, random_seed=19,
+    )
+    assert _member_step_lag_limits(n_cpg, config)["construction"] == "fallback"
+    replicates, _lags = member_step_lag_null_ensemble(
+        rng.normal(size=(n_cpg, 15)), config, frame
+    )
+    _track, eligibility, _segments = replicates[0]
+    assert np.any(~eligibility)
+    # Every usable run is bounded by a seam or genomic-gap break; none can
+    # silently cross the concatenated offset boundary.
+    transitions = np.flatnonzero(~eligibility)
+    assert transitions.size >= 10
 
 
 def test_chromosome_ensemble_preserves_large_gap_eligibility():

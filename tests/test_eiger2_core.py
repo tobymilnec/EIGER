@@ -45,6 +45,7 @@ from eiger2.core import (  # noqa: E402
     _overdispersion_diagnostic,
     _pair_statistic,
     _pair_statistic_numpy,
+    _replicate_cluster_dispersion,
     _stratum_opportunity,
     _support_bin_edges,
     _window_support,
@@ -642,13 +643,15 @@ def test_call_dmrs_manifest_records_member_step_gate_fields():
 def test_region_null_mode_auto_falls_back_to_lag_on_undersized_input():
     # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
     # left at its default ("auto") on input below member_step's genome-scale
-    # minimum floor (~103,000 CpGs at defaults) must fall back to "lag"
+    # absolute minimum floor (derived from min_cpgs, not the preferred
+    # min_subtrack_length) must fall back to "lag"
     # automatically, warn (via the manifest key -- cli.py turns it into stderr
     # output), and complete -- not raise, which was STOP 1e's flagged gap (a
     # CLI user got a hard, uncatchable error with no command-line way out).
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
     config = Eiger2Config(
-        window=4, null_min_lag=20, null_replicates=6, min_null_regions_for_fdr=0,
+        window=4, null_min_lag=300, null_replicates=6,
+        min_null_regions_for_fdr=0,
         random_seed=5,
     )
     assert config.region_null_mode == "auto"  # sanity: the literal field default
@@ -671,7 +674,8 @@ def test_region_null_mode_explicit_member_step_still_raises_on_undersized_input(
     # exactly as before this stage (Stage 1d-D Task 2's deliberate guard).
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
     config = Eiger2Config(
-        window=4, null_min_lag=20, null_replicates=6, min_null_regions_for_fdr=0,
+        window=4, null_min_lag=300, null_replicates=6,
+        min_null_regions_for_fdr=0,
         region_null_mode="member_step", random_seed=5,
     )
     with pytest.raises(ValueError, match="region_null_mode='member_step'"):
@@ -716,7 +720,7 @@ def test_well_separated_region_gets_q_zero_not_refused_by_its_length_stratum():
     # millions of opportunities and never producing a region that long IS the
     # evidence, not an absence of it. The floor is now a single AGGREGATE check
     # (region_fdr_result's docstring); a stratum whose own pool is empty gets
-    # K=0 -- a finite point estimate (q=0) and a finite Garwood upper bound --
+    # K=0 -- a finite point estimate (q=0) and a finite cluster upper bound --
     # and is named in `zero_exceedance_strata`, reported rather than refused.
     # This test was renamed from
     # `..._can_be_refused_by_its_own_length_stratum` and now asserts the
@@ -757,7 +761,10 @@ def test_region_fdr_is_monotone_and_bounded():
     # Isolates the tail-area formula's own monotonicity/bounds property from
     # null adequacy.
     observed = np.array([10.0, 8.0, 6.0, 4.0, 2.0])
-    nulls = [np.array([5.0, 3.0]), np.array([7.0, 1.0])]
+    nulls = [
+        np.array([5.0, 3.0]), np.array([7.0, 1.0]), np.array([6.0]),
+        np.array([4.5]), np.array([2.5]),
+    ]
     q = region_fdr_result(
         observed, nulls, observed_edges=1000, null_edges=1000,
     ).qvalue
@@ -770,11 +777,11 @@ def test_region_fdr_rises_when_the_null_produces_comparable_regions():
     # is skipped, isolating the tail-area formula's response to null density.
     observed = np.array([5.0, 4.0])
     quiet = region_fdr_result(
-        observed, [np.array([])] * 4, observed_edges=1000, null_edges=1000,
+        observed, [np.array([])] * 5, observed_edges=1000, null_edges=1000,
     ).qvalue
     noisy = region_fdr_result(
         observed,
-        [np.array([9.0, 8.0, 7.0])] * 4,
+        [np.array([9.0, 8.0, 7.0])] * 5,
         observed_edges=1000,
         null_edges=1000,
     ).qvalue
@@ -1147,7 +1154,7 @@ def test_fdr_from_areas_result_zero_exceedances_has_nonzero_upper_bound():
 def test_fdr_from_areas_result_more_null_exposure_narrows_the_interval():
     # spec §1.10 item 8: increasing null exposure at a fixed rate (same scale,
     # more pooled null observations at the same relative density) must narrow
-    # [lower, upper] because larger K gives a tighter Garwood interval.
+    # [lower, upper] because larger K gives a tighter scaled-count interval.
     observed = np.array([9.0, 7.0, 5.0, 3.0])
     rng = np.random.default_rng(15)
     sparse_null = rng.exponential(2.0, size=40)
@@ -1329,10 +1336,10 @@ def test_region_fdr_result_multiple_strata_report_independently_when_adequate():
     observed_areas = np.array([5.0, 4.0, 6.0, 3.0])
     null_area_sets = [
         np.concatenate([rng.exponential(2.0, size=5), rng.exponential(2.0, size=200)])
-        for _ in range(4)
+            for _ in range(5)
     ]
     null_length_sets = [
-        np.concatenate([np.full(5, 8), np.full(200, 50)]) for _ in range(4)
+            np.concatenate([np.full(5, 8), np.full(200, 50)]) for _ in range(5)
     ]
     result = region_fdr_result(
         observed_areas, null_area_sets,
@@ -1402,9 +1409,9 @@ def test_region_fdr_result_length_stratified_maps_back_to_original_rows():
     rng = np.random.default_rng(25)
     observed_lengths = np.array([4, 30, 4, 30])
     observed_areas = np.array([1.0, 100.0, 2.0, 50.0])
-    null_area_sets = [rng.exponential(2.0, size=60) for _ in range(4)]
+    null_area_sets = [rng.exponential(2.0, size=60) for _ in range(5)]
     null_length_sets = [
-        np.concatenate([np.full(30, 4), np.full(30, 30)]) for _ in range(4)
+        np.concatenate([np.full(30, 4), np.full(30, 30)]) for _ in range(5)
     ]
     result = region_fdr_result(
         observed_areas, null_area_sets, observed_edges=100, null_edges=240,
@@ -1453,14 +1460,14 @@ def test_region_fdr_result_support_stratification_diagnostics():
     observed_lengths = np.array([6, 6])
     observed_support_bins = np.array([0, 1])
 
-    # 3 null replicates. Support bin 0 gets 20 null regions per replicate (60
+    # 5 null replicates. Support bin 0 gets 20 null regions per replicate (100
     # pooled, >= _MIN_NULL_REGIONS_PER_JOINT_STRATUM -> joint stratum "6-9|sbin0"
-    # stays joint). Support bin 1 gets 1 null region per replicate (3 pooled,
+    # stays joint). Support bin 1 gets 1 null region per replicate (5 pooled,
     # < 50 -> falls back to length-only pooling for that region).
     null_area_sets = []
     null_length_sets = []
     null_support_bin_sets = []
-    for _ in range(3):
+    for _ in range(5):
         bin0_areas = rng.uniform(1.0, 8.0, size=20)
         bin1_areas = rng.uniform(1.0, 8.0, size=1)
         null_area_sets.append(np.concatenate([bin0_areas, bin1_areas]))
@@ -1484,6 +1491,11 @@ def test_region_fdr_result_support_stratification_diagnostics():
     assert "6-9|sbin0" in cutoffs  # well-populated joint stratum stayed joint
     assert "6-9" in cutoffs        # region 1 fell back to the length-only label
     assert "6-9|sbin1" not in cutoffs  # never appears as a final stratum itself
+    scales = result.diagnostics["fdr_scale_by_stratum"]
+    assert scales["6-9|sbin0"]["source"] == (
+        "global_edge_fallback_joint_support_no_joint_opportunity"
+    )
+    assert "6-9|sbin0" in result.diagnostics["fdr_scale_fallback_strata"]
     assert np.all(np.isfinite(result.qvalue))
     assert result.qvalue.shape == (2,)
 
@@ -1505,16 +1517,16 @@ def test_region_fdr_result_fallback_stratum_pools_every_support_bin_numerically(
     # tail_fdr == qvalue == min(1, scale * K / 1) with K exactly the number of
     # pooled null areas >= that region's own area (see _fdr_from_areas_result).
     #
-    #   bin 0: 20 null regions per replicate, areas 1.0 .. 20.0  (60 pooled >= 50
+    #   bin 0: 20 null regions per replicate, areas 1.0 .. 20.0 (100 pooled >= 50
     #          -> "6-9|sbin0" stays joint)
-    #   bin 1:  1 null region  per replicate, area 50.0          (3 pooled < 50
+    #   bin 1:  1 null region  per replicate, area 50.0          (5 pooled < 50
     #          -> region 1 falls back to the length-only pool "6-9")
     bin0 = np.arange(1.0, 21.0)
-    null_area_sets = [np.concatenate([bin0, np.array([50.0])]) for _ in range(3)]
-    null_length_sets = [np.full(21, 6) for _ in range(3)]
+    null_area_sets = [np.concatenate([bin0, np.array([50.0])]) for _ in range(5)]
+    null_length_sets = [np.full(21, 6) for _ in range(5)]
     null_support_bin_sets = [
         np.concatenate([np.zeros(20, dtype=int), np.ones(1, dtype=int)])
-        for _ in range(3)
+        for _ in range(5)
     ]
     observed_areas = np.array([12.0, 9.0])
     observed_lengths = np.array([6, 6])
@@ -1532,33 +1544,33 @@ def test_region_fdr_result_fallback_stratum_pools_every_support_bin_numerically(
     assert result.diagnostics["scale"] == pytest.approx(0.01)
     assert result.diagnostics["support_stratification_fallback_strata"] == ["6-9|sbin1"]
 
-    # Region 0 ("6-9|sbin0"): only bin-0 nulls, 9 per replicate >= 12.0 -> 27.
-    # The length-only pool would have added the three 50.0 bin-1 nulls (30), so
+    # Region 0 ("6-9|sbin0"): only bin-0 nulls, 9 per replicate >= 12.0 -> 45.
+    # The length-only pool would have added the five 50.0 bin-1 nulls (50), so
     # this value also proves the joint stratum EXCLUDED the other bin.
-    bin0_ge_12 = 3 * int(np.sum(bin0 >= 12.0))
-    assert bin0_ge_12 == 27
-    assert int(result.null_exceedances[0]) == 27
-    assert result.tail_fdr[0] == pytest.approx(0.27)
-    assert result.qvalue[0] == pytest.approx(0.27)
+    bin0_ge_12 = 5 * int(np.sum(bin0 >= 12.0))
+    assert bin0_ge_12 == 45
+    assert int(result.null_exceedances[0]) == 45
+    assert result.tail_fdr[0] == pytest.approx(0.45)
+    assert result.qvalue[0] == pytest.approx(0.45)
 
     # Region 1 fell back: its pooled null set must literally be the UNION of
     # both support bins' null areas for length stratum "6-9".
     pooled_all = np.concatenate(null_area_sets)
     expected_fallback_k = int(np.sum(pooled_all >= 9.0))
-    assert expected_fallback_k == 3 * int(np.sum(bin0 >= 9.0)) + 3  # 36 + 3
-    assert int(result.null_exceedances[1]) == expected_fallback_k == 39
-    assert result.tail_fdr[1] == pytest.approx(0.39)
-    # Had the thin joint stratum NOT fallen back, K would have been the three
-    # bin-1 nulls only -> 0.03. Had it fallen back to the WRONG (bin-0-only)
-    # pool, K would have been 36 -> 0.36. Both are excluded.
-    assert result.tail_fdr[1] != pytest.approx(0.03)
-    assert result.tail_fdr[1] != pytest.approx(0.36)
+    assert expected_fallback_k == 5 * int(np.sum(bin0 >= 9.0)) + 5  # 60 + 5
+    assert int(result.null_exceedances[1]) == expected_fallback_k == 65
+    assert result.tail_fdr[1] == pytest.approx(0.65)
+    # Had the thin joint stratum NOT fallen back, K would have been the five
+    # bin-1 nulls only -> 0.05. Had it fallen back to the WRONG (bin-0-only)
+    # pool, K would have been 60 -> 0.60. Both are excluded.
+    assert result.tail_fdr[1] != pytest.approx(0.05)
+    assert result.tail_fdr[1] != pytest.approx(0.60)
 
     # The length-only-stratified run must reach region 1 through the SAME pooled
-    # null set (K == 39 either way) -- that is what "fell back to length-only
+    # null set (K == 65 either way) -- that is what "fell back to length-only
     # pooling" means. Its tail_fdr differs only through the DENOMINATOR: there
     # both regions share one stratum, so R = 2 observed areas >= 9.0 and
-    # raw = 0.01 * 39 / 2 = 0.195, whereas under joint stratification region 1
+    # raw = 0.01 * 65 / 2 = 0.325, whereas under joint stratification region 1
     # is alone in "6-9" and R = 1. This is exactly the stratum-membership
     # dependence that makes a naive qvalue-equality assertion wrong; the pooled
     # NULL SET is the invariant that must hold, and it does.
@@ -1567,29 +1579,29 @@ def test_region_fdr_result_fallback_stratum_pools_every_support_bin_numerically(
         observed_edges=1, null_edges=100,
         observed_lengths=observed_lengths, null_length_sets=null_length_sets,
     )
-    assert int(length_only.null_exceedances[1]) == 39
-    assert length_only.tail_fdr[1] == pytest.approx(0.01 * 39 / 2)
-    # ...and region 0's null pool DOES change: length-only pools the three 50.0
+    assert int(length_only.null_exceedances[1]) == 65
+    assert length_only.tail_fdr[1] == pytest.approx(0.01 * 65 / 2)
+    # ...and region 0's null pool DOES change: length-only pools the five 50.0
     # bin-1 nulls in with the bin-0 ones, so at region 0's OWN cutoff (which is
-    # what tail_fdr reports) K = 30, not the 27 the joint stratum gave.
-    assert length_only.tail_fdr[0] == pytest.approx(0.30)
+    # what tail_fdr reports) K = 50, not the 45 the joint stratum gave.
+    assert length_only.tail_fdr[0] == pytest.approx(0.50)
     # null_exceedances reports K at the Q-ACHIEVING cutoff, which for region 0
-    # here is region 1's cutoff (0.195 < 0.30), hence 39 rather than 30.
-    assert int(length_only.null_exceedances[0]) == 39
-    assert length_only.qvalue[0] == pytest.approx(0.01 * 39 / 2)
+    # here is region 1's cutoff (0.325 < 0.50), hence 65 rather than 50.
+    assert int(length_only.null_exceedances[0]) == 65
+    assert length_only.qvalue[0] == pytest.approx(0.01 * 65 / 2)
 
 
 def test_region_fdr_result_joint_strata_use_only_their_own_bin_nulls():
-    # Both support bins are well populated (60 pooled null regions each), so
+    # Both support bins are well populated (100 pooled null regions each), so
     # NOTHING falls back and each observed region is scored against its own
     # bin's nulls only.
     bin0 = np.arange(1.0, 21.0)    # 1..20
     bin1 = np.arange(21.0, 41.0)   # 21..40
-    null_area_sets = [np.concatenate([bin0, bin1]) for _ in range(3)]
-    null_length_sets = [np.full(40, 6) for _ in range(3)]
+    null_area_sets = [np.concatenate([bin0, bin1]) for _ in range(5)]
+    null_length_sets = [np.full(40, 6) for _ in range(5)]
     null_support_bin_sets = [
         np.concatenate([np.zeros(20, dtype=int), np.ones(20, dtype=int)])
-        for _ in range(3)
+        for _ in range(5)
     ]
     observed_areas = np.array([15.0, 15.0])
     observed_lengths = np.array([6, 6])
@@ -1606,19 +1618,19 @@ def test_region_fdr_result_joint_strata_use_only_their_own_bin_nulls():
     assert set(result.diagnostics["fdr_interval_cutoffs_by_stratum"]) == {
         "6-9|sbin0", "6-9|sbin1",
     }
-    # bin 0: 6 values >= 15 per replicate -> 18.  bin 1: all 20 -> 60.
-    assert int(result.null_exceedances[0]) == 18
-    assert int(result.null_exceedances[1]) == 60
-    assert result.tail_fdr[0] == pytest.approx(0.18)
-    assert result.tail_fdr[1] == pytest.approx(0.60)
-    # The length-only pool would have given BOTH regions 78.
+    # bin 0: 6 values >= 15 per replicate -> 30. bin 1: all 20 -> 100.
+    assert int(result.null_exceedances[0]) == 30
+    assert int(result.null_exceedances[1]) == 100
+    assert result.tail_fdr[0] == pytest.approx(0.30)
+    assert result.tail_fdr[1] == pytest.approx(1.0)
+    # The length-only pool would have given BOTH regions 130.
     length_only = region_fdr_result(
         observed_areas, null_area_sets,
         observed_edges=1, null_edges=100,
         observed_lengths=observed_lengths, null_length_sets=null_length_sets,
     )
-    assert int(length_only.null_exceedances[0]) == 78
-    assert int(length_only.null_exceedances[1]) == 78
+    assert int(length_only.null_exceedances[0]) == 130
+    assert int(length_only.null_exceedances[1]) == 130
 
 
 def test_region_fdr_result_single_support_bin_is_numerically_identical():
@@ -1671,11 +1683,11 @@ def test_region_fdr_result_support_args_ignored_without_length_stratification():
     # scheme (which is not spec'd) -- it must stay the pooled path.
     rng = np.random.default_rng(79)
     observed_areas = rng.exponential(2.0, size=10)
-    null_area_sets = [rng.exponential(2.0, size=80) for _ in range(4)]
+    null_area_sets = [rng.exponential(2.0, size=80) for _ in range(5)]
     result = region_fdr_result(
         observed_areas, null_area_sets, observed_edges=500, null_edges=1000,
         observed_support_bins=np.arange(10) % 2,
-        null_support_bin_sets=[np.arange(80) % 2 for _ in range(4)],
+        null_support_bin_sets=[np.arange(80) % 2 for _ in range(5)],
     )
     assert result.diagnostics["support_stratified"] is False
     assert list(result.diagnostics["fdr_interval_cutoffs_by_stratum"]) == ["_pooled"]
@@ -1753,7 +1765,12 @@ def test_region_fdr_result_overdispersion_warning_end_to_end():
         observed, nulls, observed_edges=500,
         null_edges=sum(len(n) for n in nulls),
     )
-    assert result.diagnostics["null_count_overdispersion_warning"] is not None
+    entry = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
+    assert entry["dispersion_used"] > 1.0
+    assert result.diagnostics["null_count_overdispersion_warning"] is None
+    assert result.diagnostics["null_count_overdispersion_handling"] == (
+        "incorporated_in_cluster_interval"
+    )
 
 
 def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
@@ -1761,13 +1778,368 @@ def test_region_fdr_result_poisson_null_does_not_trigger_overdispersion():
     observed = rng.exponential(2.0, size=20)
     nulls = [rng.exponential(2.0, size=150) for _ in range(8)]  # same density each rep
     result = region_fdr_result(observed, nulls, observed_edges=500, null_edges=1200)
-    status, ratio = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
-    if status == "computed":
-        assert ratio < 1.5
-    # Spec 1.10 item 25: confirm the top-level warning does not fire for a
-    # Poisson null, unconditionally (not gated on whether the per-stratum
-    # diagnostic happened to be "computed" for this particular draw).
+    entry = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
+    if entry["status"] == "computed":
+        assert entry["dispersion_used"] >= 1.0
+    # The old warning is superseded: dispersion is incorporated into the
+    # cluster interval rather than merely warning that the interval is narrow.
     assert result.diagnostics["null_count_overdispersion_warning"] is None
+
+
+def _areas_from_counts(counts, area=2.0):
+    return [np.full(int(count), area, dtype=float) for count in counts]
+
+
+def test_replicate_cluster_dispersion_uses_exposure_offsets():
+    areas = _areas_from_counts([5, 10, 20, 40, 80])
+    exposures = np.array([100, 200, 400, 800, 1600])
+    status, dispersion, detail = _replicate_cluster_dispersion(
+        areas, cutoff=1.0, null_edge_counts=exposures,
+    )
+    assert status == "computed"
+    # Every cluster has the same rate, so unequal exposures are not mistaken
+    # for overdispersion.
+    assert detail["pearson_dispersion_raw"] == pytest.approx(0.0)
+    assert dispersion == 1.0
+
+
+def test_stratified_cluster_dispersion_uses_length_opportunity_offsets():
+    counts = [5, 10, 20, 40, 80]
+    nulls = _areas_from_counts(counts)
+    result = region_fdr_result(
+        np.array([1.0]), nulls,
+        observed_edges=100, null_edges=500,
+        observed_lengths=np.array([4]),
+        null_length_sets=[np.full(count, 4) for count in counts],
+        null_edge_counts=[100] * 5,
+        null_stratum_exposures={"4-5": [100, 200, 400, 800, 1600]},
+    )
+    entry = result.diagnostics["null_count_dispersion_by_stratum"]["4-5"]
+    assert entry["exposure_type"] == "per_length_opportunity"
+    assert entry["pearson_dispersion_raw"] == pytest.approx(0.0)
+    assert entry["dispersion_used"] == 1.0
+
+
+def test_length_opportunity_scale_controls_point_bounds_and_resolution():
+    nulls = _areas_from_counts([1] * 5)
+    kwargs = {
+        "observed_lengths": np.array([4]),
+        "null_length_sets": [np.array([4])] * 5,
+        "stratum_opportunity": {"4-5": (100.0, 1000.0)},
+        "null_stratum_exposures": {"4-5": [200.0] * 5},
+        "null_edges": 500,
+    }
+    ordinary_edges = region_fdr_result(
+        np.array([1.0]), nulls, observed_edges=100, **kwargs,
+    )
+    wildly_different_edges = region_fdr_result(
+        np.array([1.0]), nulls, observed_edges=10_000, **kwargs,
+    )
+    # K=5, R=1, scale_s=O_s/N_s=0.1.
+    assert ordinary_edges.qvalue[0] == pytest.approx(0.5)
+    assert ordinary_edges.tail_fdr[0] == pytest.approx(0.5)
+    assert ordinary_edges.qvalue_resolution[0] == pytest.approx(0.1)
+    for field in (
+        "qvalue", "tail_fdr", "qvalue_lower", "qvalue_upper",
+        "qvalue_resolution",
+    ):
+        assert np.array_equal(
+            getattr(ordinary_edges, field),
+            getattr(wildly_different_edges, field),
+        ), field
+    scale_entry = ordinary_edges.diagnostics["fdr_scale_by_stratum"]["4-5"]
+    assert scale_entry == {
+        "scale": 0.1,
+        "source": "per_length_opportunity",
+        "observed_opportunity": 100.0,
+        "pooled_null_opportunity": 1000.0,
+    }
+
+
+def test_length_opportunity_point_is_invariant_to_doubled_null_volume():
+    base = region_fdr_result(
+        np.array([1.0]), _areas_from_counts([1] * 5),
+        observed_edges=100, null_edges=500,
+        observed_lengths=np.array([4]),
+        null_length_sets=[np.array([4])] * 5,
+        stratum_opportunity={"4-5": (100.0, 1000.0)},
+        null_stratum_exposures={"4-5": [200.0] * 5},
+    )
+    doubled = region_fdr_result(
+        np.array([1.0]), _areas_from_counts([1] * 10),
+        observed_edges=100, null_edges=1000,
+        observed_lengths=np.array([4]),
+        null_length_sets=[np.array([4])] * 10,
+        stratum_opportunity={"4-5": (100.0, 2000.0)},
+        null_stratum_exposures={"4-5": [200.0] * 10},
+    )
+    assert doubled.qvalue[0] == pytest.approx(base.qvalue[0])
+    assert doubled.qvalue_upper[0] <= base.qvalue_upper[0]
+    assert doubled.qvalue_resolution[0] == pytest.approx(
+        base.qvalue_resolution[0] / 2
+    )
+
+
+def test_fallback_length_strata_use_their_own_opportunity_scales():
+    observed = np.array([2.0, 2.0])
+    nulls = [np.array([2.0, 2.0]) for _ in range(5)]
+    result = region_fdr_result(
+        observed, nulls, observed_edges=100, null_edges=500,
+        observed_lengths=np.array([4, 20]),
+        null_length_sets=[np.array([4, 20])] * 5,
+        stratum_opportunity={
+            "4-5": (100.0, 1000.0),
+            "20-49": (100.0, 250.0),
+        },
+        null_stratum_exposures={
+            "4-5": [200.0] * 5,
+            "20-49": [50.0] * 5,
+        },
+        m_opportunity=0,
+    )
+    # The fallback-shaped long stratum has one quarter of the null opportunity,
+    # so the same K=5 maps to four times the expected false-region count.
+    assert result.qvalue[0] == pytest.approx(0.5)
+    assert result.qvalue[1] == pytest.approx(1.0)
+    scales = result.diagnostics["fdr_scale_by_stratum"]
+    assert scales["4-5"]["scale"] == pytest.approx(0.1)
+    assert scales["20-49"]["scale"] == pytest.approx(0.4)
+
+    zero_count = region_fdr_result(
+        observed, [np.array([]) for _ in range(5)],
+        observed_edges=100, null_edges=500,
+        observed_lengths=np.array([4, 20]),
+        null_length_sets=[np.array([], dtype=int) for _ in range(5)],
+        stratum_opportunity={
+            "4-5": (10.0, 1000.0),
+            "20-49": (10.0, 250.0),
+        },
+        null_stratum_exposures={
+            "4-5": [200.0] * 5,
+            "20-49": [50.0] * 5,
+        },
+        m_opportunity=0,
+    )
+    assert np.all(zero_count.qvalue == 0.0)
+    assert zero_count.qvalue_upper[1] == pytest.approx(
+        4 * zero_count.qvalue_upper[0]
+    )
+    assert zero_count.qvalue_resolution[1] == pytest.approx(
+        4 * zero_count.qvalue_resolution[0]
+    )
+
+
+def test_cluster_interval_widens_for_overdispersed_replicates_deterministically():
+    observed = np.array([10.0, 5.0, 1.0])
+    equal_counts = [10] * 20
+    burst_counts = [0, 20] * 10
+    kwargs = {
+        "observed_edges": 1000,
+        "null_edges": 20_000,
+        "null_edge_counts": [1000] * 20,
+    }
+    stable = region_fdr_result(observed, _areas_from_counts(equal_counts), **kwargs)
+    bursty = region_fdr_result(observed, _areas_from_counts(burst_counts), **kwargs)
+    assert np.array_equal(stable.qvalue, bursty.qvalue)
+    assert np.all(bursty.qvalue_upper >= stable.qvalue_upper)
+    assert np.any(bursty.qvalue_upper > stable.qvalue_upper)
+    repeated = region_fdr_result(observed, _areas_from_counts(burst_counts), **kwargs)
+    assert np.array_equal(bursty.qvalue_upper, repeated.qvalue_upper)
+
+
+def test_cluster_interval_all_zero_is_positive_finite_and_monotone():
+    observed = np.array([20.0, 10.0, 5.0, 1.0])
+    result = region_fdr_result(
+        observed, [np.empty(0) for _ in range(20)],
+        observed_edges=1000, null_edges=20_000,
+        null_edge_counts=[1000] * 20,
+    )
+    assert np.all(result.qvalue == 0.0)
+    assert np.all(np.isfinite(result.qvalue_upper))
+    assert np.all(result.qvalue_upper > 0.0)
+    order = np.argsort(-observed, kind="mergesort")
+    assert np.all(np.diff(result.qvalue_upper[order]) >= -1e-12)
+    entry = result.diagnostics["null_count_dispersion_by_stratum"]["_pooled"]
+    assert entry["dispersion_source"] == "quasi_poisson_floor"
+
+
+def test_cluster_interval_refuses_below_fixed_independent_replicate_minimum():
+    result = region_fdr_result(
+        np.array([2.0]), _areas_from_counts([2, 2, 2, 2]),
+        observed_edges=100, null_edges=400,
+        null_edge_counts=[100] * 4,
+    )
+    assert np.isnan(result.qvalue[0])
+    assert result.null_exceedances[0] == -1
+    refused = result.diagnostics["insufficient_cluster_replicates_strata"]
+    assert refused == [{
+        "stratum": "_pooled", "clusters": 4, "minimum_clusters": 5,
+        "reason": (
+            "too few independent genome-wide null realisations to estimate "
+            "replicate-cluster dispersion"
+        ),
+    }]
+
+
+def test_zero_exposure_draws_do_not_count_as_independent_clusters():
+    result = region_fdr_result(
+        np.array([2.0]), _areas_from_counts([2, 0, 0]),
+        observed_edges=100, null_edges=100,
+        null_edge_counts=[100, 0, 0],
+    )
+    assert np.isnan(result.qvalue[0])
+    refused = result.diagnostics["insufficient_cluster_replicates_strata"]
+    assert refused[0]["clusters"] == 1
+
+
+def test_quasi_poisson_cluster_upper_has_empirical_nb_coverage():
+    """Standing model check under overdispersed negative-binomial clusters."""
+
+    covered = 0
+    trials = 300
+    b = 75
+    exposure = 1000
+    mean_count = 5.0
+    true_q = 10 * mean_count / exposure
+    for seed in range(trials):
+        rng = np.random.default_rng(30_000 + seed)
+        # NB mean=5, variance=20 (phi=4).
+        counts = rng.negative_binomial(5 / 3, 0.25, size=b)
+        result = region_fdr_result(
+            np.array([1.0]), _areas_from_counts(counts),
+            observed_edges=10, null_edges=b * exposure,
+            null_edge_counts=[exposure] * b,
+        )
+        covered += bool(result.qvalue_upper[0] >= true_q)
+    assert covered / trials >= 0.93
+
+
+def test_quasi_poisson_cluster_curve_has_simultaneous_nb_coverage():
+    """The selected monotone curve retains nominal coverage under an NB null."""
+
+    covered = 0
+    trials = 300
+    b = 75
+    exposure = 1000
+    mean_count = 20.0
+    observed_edges = 100
+    observed_areas = np.array([3.0, 2.0, 1.0, 0.0])
+    ranks = np.arange(1, observed_areas.size + 1)
+    true_raw = np.minimum(
+        1.0,
+        observed_edges * mean_count * np.exp(-observed_areas) / exposure / ranks,
+    )
+    true_q = np.minimum.accumulate(true_raw[::-1])[::-1]
+
+    for seed in range(trials):
+        rng = np.random.default_rng(50_000 + seed)
+        # Total count has mean 20 and variance 80 (phi=4). Conditional region
+        # areas are exponential, creating four nested exceedance-count curves.
+        counts = rng.negative_binomial(mean_count / 3, 0.25, size=b)
+        null_sets = [rng.exponential(1.0, size=int(count)) for count in counts]
+        result = region_fdr_result(
+            observed_areas, null_sets,
+            observed_edges=observed_edges, null_edges=b * exposure,
+            null_edge_counts=[exposure] * b,
+        )
+        covered += bool(np.all(result.qvalue_upper >= true_q))
+
+    assert covered / trials >= 0.93
+
+
+def test_upper_decision_controls_null_discovery_and_retains_strong_signal():
+    """Count-level standing regression: DMR-free control plus planted signal."""
+
+    false_discovery_runs = 0
+    signal_recall = []
+    b = 40
+    exposure = 1000
+    for seed in range(80):
+        rng = np.random.default_rng(40_000 + seed)
+        null_sets = [
+            rng.exponential(1.0, size=rng.poisson(20)) for _ in range(b)
+        ]
+        null_observed = rng.exponential(1.0, size=rng.poisson(20))
+        if null_observed.size:
+            null_result = region_fdr_result(
+                null_observed, null_sets,
+                observed_edges=exposure, null_edges=b * exposure,
+                null_edge_counts=[exposure] * b,
+            )
+            false_discovery_runs += bool(np.any(null_result.qvalue_upper <= 0.05))
+
+        signal_areas = np.concatenate((np.full(10, 100.0), null_observed))
+        signal_result = region_fdr_result(
+            signal_areas, null_sets,
+            observed_edges=exposure, null_edges=b * exposure,
+            null_edge_counts=[exposure] * b,
+        )
+        signal_recall.append(np.mean(signal_result.qvalue_upper[:10] <= 0.05))
+
+    assert false_discovery_runs / 80 <= 0.05
+    assert np.mean(signal_recall) >= 0.8
+
+
+def test_full_pipeline_upper_rule_controls_null_and_retains_strong_signal():
+    """Standing end-to-end regression for the member-step upper decision rule.
+
+    The null arm is deliberately DMR-free.  The signal arm has ten planted,
+    strongly coordinated regions and evaluates calls by genomic overlap, not by
+    their construction. The shipped ``fdr_decision='upper'`` path is exercised
+    directly, including its valid no-rejection outcome on DMR-free data.
+    """
+
+    config_kwargs = {
+        "window": 4,
+        "null_min_lag": 5,
+        "min_subtrack_length": 10,
+        "n_lag_draws": 100,
+        "null_replicates": 20,
+        "region_null_mode": "member_step",
+        "fdr_decision": "upper",
+        # These fixtures are intentionally small; opportunity and pooled-value
+        # adequacy have separate direct tests at their own inferential scale.
+        "m_opportunity": 0,
+        "min_null_values": 1,
+        "min_null_coverage": 0,
+    }
+    false_calls = 0
+    total_calls = 0
+    recovered = 0
+    planted = 0
+
+    for seed in range(3):
+        matrix, locs, _truth = simulate(
+            n_samples=60, strata=[], replicates=1,
+            spacing=5000, dmr_length=20, seed=seed,
+        )
+        regions, _, _ = call_dmrs(
+            matrix, locs,
+            config=Eiger2Config(random_seed=seed, **config_kwargs),
+        )
+        calls = regions.loc[regions["significant"].fillna(False)]
+        false_calls += len(calls)
+        total_calls += len(calls)
+
+    for seed in range(200, 203):
+        matrix, locs, truth = simulate(
+            n_samples=60, strata=[(0.05, 0.45)], replicates=10,
+            spacing=2000, dmr_length=20, seed=seed,
+        )
+        regions, _, _ = call_dmrs(
+            matrix, locs,
+            config=Eiger2Config(random_seed=seed, **config_kwargs),
+        )
+        calls = regions.loc[regions["significant"].fillna(False)].copy()
+        matched, n_false = evaluate(calls, truth, min_overlap=10)
+        recovered += len(matched)
+        planted += len(truth)
+        false_calls += n_false
+        total_calls += len(calls)
+
+    realised_fdr = false_calls / max(total_calls, 1)
+    assert realised_fdr <= 0.05
+    assert recovered / planted >= 0.8
 
 
 # --------------------------------------------------------------------------
@@ -1805,8 +2177,8 @@ def test_region_fdr_result_insufficient_opportunity_refuses_that_stratum_only():
     # it reports normally in the same call.
     observed_lengths = np.array([4, 50])
     observed_areas = np.array([9.0, 5.0])
-    null_area_sets = [np.array([6.0]), np.array([6.0])]
-    null_length_sets = [np.array([4], dtype=int), np.array([50], dtype=int)]
+    null_area_sets = [np.array([6.0, 6.0]) for _ in range(5)]
+    null_length_sets = [np.array([4, 50], dtype=int) for _ in range(5)]
     result = region_fdr_result(
         observed_areas, null_area_sets,
         observed_edges=400, null_edges=400,
@@ -1835,8 +2207,8 @@ def test_region_fdr_result_insufficient_opportunity_refuses_that_stratum_only():
 def test_region_fdr_result_m_opportunity_boundary_is_strict_less_than():
     observed_lengths = np.array([4])
     observed_areas = np.array([9.0])
-    null_area_sets = [np.array([6.0])]
-    null_length_sets = [np.array([4], dtype=int)]
+    null_area_sets = [np.array([6.0]) for _ in range(5)]
+    null_length_sets = [np.array([4], dtype=int) for _ in range(5)]
     # R_s=1, O_s=10 -> required = m_opportunity * O_s / R_s = 100 at
     # m_opportunity=10. N_s=100 meets it exactly (not strictly below).
     at_floor = region_fdr_result(
@@ -1884,8 +2256,10 @@ def test_region_fdr_result_zero_observed_opportunity_refuses_without_dividing_by
     observed_lengths = np.array([4])
     observed_areas = np.array([9.0])
     result = region_fdr_result(
-        observed_areas, [np.array([6.0])], observed_edges=400, null_edges=400,
-        observed_lengths=observed_lengths, null_length_sets=[np.array([4], dtype=int)],
+        observed_areas, [np.array([6.0]), np.array([6.0])],
+        observed_edges=400, null_edges=400,
+        observed_lengths=observed_lengths,
+        null_length_sets=[np.array([4], dtype=int), np.array([4], dtype=int)],
         stratum_opportunity={"4-5": (0.0, 5.0)},
     )
     assert np.isnan(result.qvalue[0])
@@ -1894,19 +2268,23 @@ def test_region_fdr_result_zero_observed_opportunity_refuses_without_dividing_by
     assert entry["required_null_opportunity"] is None
 
 
-def test_region_fdr_result_m_opportunity_zero_disables_the_floor():
-    # Documented disable value (mirrors min_null_regions_for_fdr=0's
-    # convention): every stratum with any pooled null exceedance data is let
-    # through regardless of how little opportunity it had.
+def test_m_opportunity_zero_does_not_invent_an_undefined_length_scale():
+    # Disabling the adequacy multiplier does not make O_s/N_s defined when
+    # N_s=0. Opportunity-specific FDR is therefore refused, not replaced by
+    # an unlabelled global edge scale.
     observed_lengths = np.array([4])
     observed_areas = np.array([9.0])
     result = region_fdr_result(
-        observed_areas, [np.array([6.0])], observed_edges=400, null_edges=400,
-        observed_lengths=observed_lengths, null_length_sets=[np.array([4], dtype=int)],
+        observed_areas, [np.array([6.0]) for _ in range(5)],
+        observed_edges=400, null_edges=400,
+        observed_lengths=observed_lengths,
+        null_length_sets=[np.array([4], dtype=int) for _ in range(5)],
         stratum_opportunity={"4-5": (1000.0, 0.0)}, m_opportunity=0,
     )
-    assert not np.any(np.isnan(result.qvalue))
+    assert np.all(np.isnan(result.qvalue))
     assert result.diagnostics["insufficient_null_opportunity_strata"] == []
+    scale_refusal = result.diagnostics["insufficient_scale_opportunity_strata"]
+    assert scale_refusal[0]["stratum"] == "4-5"
 
 
 def test_region_fdr_result_empty_own_pool_stratum_reports_not_refuses():
@@ -1922,10 +2300,10 @@ def test_region_fdr_result_empty_own_pool_stratum_reports_not_refuses():
     observed_areas = np.array([3.0, 2.0, 40.0, 30.0])
     null_area_sets = [
         np.concatenate([np.empty(0), rng.exponential(2.0, size=20)])
-        for _ in range(4)
+        for _ in range(5)
     ]
     null_length_sets = [
-        np.concatenate([np.empty(0, dtype=int), np.full(20, 50)]) for _ in range(4)
+        np.concatenate([np.empty(0, dtype=int), np.full(20, 50)]) for _ in range(5)
     ]
     result = region_fdr_result(
         observed_areas, null_area_sets,
@@ -1942,7 +2320,7 @@ def test_region_fdr_result_empty_own_pool_stratum_reports_not_refuses():
     }
     assert zero_exceedance.keys() == {"4-5"}
     assert zero_exceedance["4-5"]["null_regions"] == 0
-    assert zero_exceedance["4-5"]["replicates"] == 4
+    assert zero_exceedance["4-5"]["replicates"] == 5
     # deprecated, schema ("2.2") compatibility only -- never populated now
     assert result.diagnostics["insufficient_null_strata"] == []
 
@@ -1955,8 +2333,14 @@ def test_region_fdr_result_thin_but_nonempty_stratum_also_reports():
     # candidate's own cutoff has exactly 3 null areas at or above it.
     observed_lengths = np.array([4, 50])
     observed_areas = np.array([9.0, 5.0])
-    null_area_sets = [np.array([]), np.array([6.0, 7.0, 8.0])]
-    null_length_sets = [np.array([], dtype=int), np.full(3, 50, dtype=int)]
+    null_area_sets = [
+        np.array([]), np.array([6.0, 7.0, 8.0]),
+        np.array([]), np.array([]), np.array([]),
+    ]
+    null_length_sets = [
+        np.array([], dtype=int), np.full(3, 50, dtype=int),
+        np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int),
+    ]
     result = region_fdr_result(
         observed_areas, null_area_sets,
         observed_edges=400, null_edges=400,
@@ -1976,16 +2360,16 @@ def test_region_fdr_result_empty_pool_is_not_worse_than_a_populated_zero_k_pool(
     # Monotonicity (spec's own Tests requirement): a stratum whose own null
     # pool is EMPTY (K=0 trivially) must not be reported as WORSE evidence
     # than an otherwise-identical stratum backed by a large pool that also
-    # happens to have zero exceedances at the same cutoff -- the Garwood bound
+    # happens to have zero exceedances at the same cutoff -- the cluster bound
     # depends on K and the (shared, run-level) scale, not on per-stratum pool
     # size, so the two must match exactly.
     observed_areas = np.array([9.0])
     empty_pool = region_fdr_result(
-        observed_areas, [np.array([]), np.array([])],
+        observed_areas, [np.array([]) for _ in range(5)],
         observed_edges=100, null_edges=200,
     )
     populated_but_zero_exceedance = region_fdr_result(
-        observed_areas, [np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0])],
+        observed_areas, [np.array([1.0, 2.0, 3.0]) for _ in range(5)],
         observed_edges=100, null_edges=200,
     )
     assert empty_pool.null_exceedances[0] == 0
@@ -2047,13 +2431,8 @@ def test_fdr_decision_rejects_invalid_value():
 
 
 def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
-    # null_replicates=300, not the brief's original 100: at 100 replicates this
-    # simulation's scale/m_bonferroni combination makes the best achievable
-    # region_qvalue_upper_95 (~0.14) exceed the default target_fdr (0.05), so
-    # check_fdr_decision_vacuity correctly refuses "upper" mode outright -- see
-    # test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required for
-    # a dedicated test of exactly that refusal. 300 replicates clears it (verified
-    # empirically) while keeping this test about determinism, not vacuity.
+    # Use enough cluster realisations for this test to remain about deterministic
+    # point-vs-upper behaviour rather than nullable small-null inference.
     matrix, locs, _ = simulate(
         n_samples=60, strata=[(0.15, 0.35)], replicates=4,
         spacing=300, dmr_length=12, seed=51,
@@ -2075,13 +2454,13 @@ def test_point_and_upper_decision_modes_are_deterministic_with_same_seed():
 def test_upper_decision_uses_upper_bound_not_point_estimate():
     # The brief's original parameters (13 vs 12 significant regions) collapse
     # to 13 vs 13 post-Stage-1b-fix: the corrected, better-calibrated null
-    # narrows the Garwood interval enough that "point" and "upper" now call the
+    # narrows the cluster interval enough that "point" and "upper" now call the
     # identical region set here. Re-searched empirically (varying strata,
     # replicates, null_replicates and target_fdr) for a config that still
     # diverges on the corrected code -- found at 31 vs 30 significant regions
     # with a two-strata signal (a weaker (0.10, 0.15) stratum alongside the
     # original (0.15, 0.25)) and more simulated replicates (15, not 12), which
-    # produces enough borderline-area regions for the upper Garwood bound to
+    # produces enough borderline-area regions for the upper cluster bound to
     # push at least one of them across target_fdr=0.05 while the point
     # estimate does not.
     matrix, locs, _ = simulate(
@@ -2109,23 +2488,19 @@ def test_upper_decision_uses_upper_bound_not_point_estimate():
         point_regions["significant"].sum()
     )
     # And directly confirm "upper" mode's significance is derived from the
-    # upper Garwood bound, not the point estimate.
+    # upper replicate-cluster bound, not the point estimate.
     assert (upper_regions["significant"] == (
         (upper_regions["region_qvalue_upper_95"] <= 0.05)
         & upper_regions["passes_prevalence"]
     )).all()
 
 
-def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
-    # null_replicates=4 (not the original 2): Stage 2a's null_construction
-    # structural gate fires at too few pooled null values (below the
-    # min_null_values=1000 floor) and reports inference_unreliable instead of
-    # reaching this guard -- itself the correct new behaviour (see
-    # test_structural_gate_failure_skips_the_vacuity_guard_raise below). A
-    # small null_min_lag=5 (spec §2b.2's per-chromosome lag is otherwise
-    # bounded by this fixture's ~900-CpG single chromosome) plus
-    # null_replicates=4 clears that floor while still tripping the vacuity
-    # guard this test pins.
+def test_cluster_refusal_precedes_upper_decision_usability_guard():
+    # A small null_min_lag=5 lets this deliberately small fixture construct a
+    # region null.  Its length stratum is nevertheless refused by an adequacy
+    # guard, leaving no finite upper curve to inspect.  The narrower upper-mode
+    # usability guard must not replace that explicit nullable inference result
+    # with an exception.  Direct tests below pin the usability guard itself.
     matrix, locs, _ = simulate(
         n_samples=40, strata=[(0.1, 0.2)], replicates=2,
         spacing=250, dmr_length=8, seed=53,
@@ -2134,22 +2509,20 @@ def test_fdr_decision_upper_with_too_few_replicates_raises_naming_b_required():
         window=4, null_min_lag=5, null_replicates=4, random_seed=53,
         fdr_decision="upper", target_fdr=0.01, region_null_mode="lag",
     )
-    with pytest.raises(ValueError, match="B_required|null_replicates|Increase"):
-        call_dmrs(matrix, locs, config=config)
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["status"] == "partial_inference"
+    assert regions["region_qvalue_upper_95"].isna().all()
+    assert not regions["significant"].fillna(False).any()
 
 
-def test_structural_gate_failure_skips_the_vacuity_guard_raise():
-    # Spec §2a: a structural gate failure already means "inference is
-    # unreliable" -- the narrower "--fdr-decision upper can never reach
-    # target_fdr" ValueError is skipped rather than raised on top of it, so
-    # the run fails closed with a manifest (candidates included) instead of
-    # an unhandled exception. null_min_lag=100 (close to this fixture's own
+def test_structural_gate_failure_remains_primary_in_upper_mode():
+    # A structural gate failure already means "inference is unreliable" and
+    # remains the primary status in upper mode. null_min_lag=100 (close to
+    # this fixture's own
     # ~900-CpG single chromosome's feasible ceiling) keeps null_replicates=2
     # tripping null_construction specifically -- too few pooled null values
     # -- rather than the smaller null_min_lag values elsewhere in this file,
-    # which clear that floor easily enough to reach the vacuity guard's own
-    # raise instead (see test_fdr_decision_upper_with_too_few_replicates_
-    # raises_naming_b_required above, which pins that raise deliberately).
+    # which clear that floor easily enough to reach the FDR inference path.
     matrix, locs, _ = simulate(
         n_samples=40, strata=[(0.1, 0.2)], replicates=2,
         spacing=250, dmr_length=8, seed=53,
@@ -2163,12 +2536,9 @@ def test_structural_gate_failure_skips_the_vacuity_guard_raise():
     assert manifest["gates"]["structural"]["null_construction"]["passed"] is False
 
 
-def test_vacuity_guard_advice_names_the_knob_that_actually_controls_the_count():
-    # Spec §2a.6/§2e.7: the guard used to hardcode "null_replicates" in its
-    # advice regardless of caller, which is wrong under region_null_mode=
-    # "member_step" (the operative knob there is n_lag_draws) and for the
-    # legacy caller (--fdr-replicates). check_fdr_decision_vacuity now takes
-    # an explicit replicate_knob so each call site can name its own setting.
+def test_upper_no_rejection_diagnostic_names_cluster_setting_without_raising():
+    # A no-rejection result is valid, but the manifest still names the setting
+    # that supplied the independent cluster count.
     result = RegionFdrResult(
         qvalue=np.array([0.0]), tail_fdr=np.array([0.0]),
         qvalue_lower=np.array([0.0]), qvalue_upper=np.array([1.0]),
@@ -2176,24 +2546,15 @@ def test_vacuity_guard_advice_names_the_knob_that_actually_controls_the_count():
         qvalue_cutoff_rank=np.array([1]), confidence_level=0.95,
         diagnostics={"fdr_interval_bonferroni_m": 1},
     )
-    with pytest.raises(ValueError, match="n_lag_draws") as excinfo:
-        check_fdr_decision_vacuity(
-            result, scale=1.0, current_replicates=2, target_fdr=0.01,
-            replicate_knob="n_lag_draws",
-        )
-    assert "null_replicates" not in str(excinfo.value)
-
-    with pytest.raises(ValueError, match=r"--fdr-replicates") as excinfo:
-        check_fdr_decision_vacuity(
-            result, scale=1.0, current_replicates=2, target_fdr=0.01,
-            replicate_knob="--fdr-replicates",
-        )
-    assert "null_replicates" not in str(excinfo.value)
-
-    with pytest.raises(ValueError, match="null_replicates"):
-        check_fdr_decision_vacuity(
-            result, scale=1.0, current_replicates=2, target_fdr=0.01,
-        )
+    diagnostic = check_fdr_decision_vacuity(
+        result, scale=1.0, current_replicates=75, target_fdr=0.01,
+        replicate_knob="n_lag_draws",
+    )
+    assert diagnostic["replicate_setting"] == "n_lag_draws"
+    assert diagnostic["independent_clusters"] == 75
+    assert diagnostic["has_finite_upper_curve"] is True
+    assert diagnostic["any_upper_rejection"] is False
+    assert diagnostic["best_region_qvalue_upper_95"] == 1.0
 
 
 def test_run_legacy_fdr_replicates_fails_cleanly_not_a_traceback(capsys):
@@ -2265,8 +2626,10 @@ def test_schema_round_trip_has_documented_columns_in_documented_order():
 
 def test_confidence_level_other_than_95_returns_arrays_but_is_not_csv_exportable():
     result = region_fdr_result(
-        np.array([5.0, 3.0]), [np.array([1.0, 2.0])],
-        observed_edges=10, null_edges=5, confidence_level=0.90,
+        np.array([5.0, 3.0]),
+        [np.array([1.0, 2.0]), np.array([1.5]), np.array([]),
+         np.array([]), np.array([])],
+        observed_edges=10, null_edges=10, confidence_level=0.90,
     )
     assert not np.all(np.isnan(result.qvalue))  # Python API still returns arrays
 
@@ -3221,10 +3584,10 @@ def test_significant_columns_three_states_survive_a_csv_round_trip(tmp_path):
     assert round_tripped["significant"].isna().tolist() == [False, False, True]
 
 
-def test_partial_inference_fdr_status_survives_call_and_csv_round_trip(
+def test_scale_refusal_status_survives_call_and_csv_round_trip(
     monkeypatch, tmp_path,
 ):
-    """Stage 2c stratum refusal is distinct from global run suppression all
+    """A scale refusal is distinct from global run suppression all
     the way through call_dmrs and the public CSV representation."""
 
     matrix, locs, _truth = simulate(
@@ -3250,10 +3613,10 @@ def test_partial_inference_fdr_status_survives_call_and_csv_round_trip(
 
         diagnostics = {
             **result.diagnostics,
-            "insufficient_null_opportunity_strata": [{
-                "stratum": "4-5", "observed_regions": int(refused.sum()),
-                "observed_opportunity": 10.0, "null_opportunity": 1.0,
-                "required_null_opportunity": 100.0, "m_opportunity": 10.0,
+            "insufficient_scale_opportunity_strata": [{
+                "stratum": "4-5", "observed_opportunity": 10.0,
+                "null_opportunity": 0.0,
+                "reason": "unavailable_nonpositive_length_opportunity",
             }],
         }
         return RegionFdrResult(
@@ -3760,10 +4123,10 @@ def test_member_step_lag_null_ensemble_lags_span_null_min_lag_to_l_max():
 
 
 def test_member_step_lag_null_ensemble_raises_when_input_too_small():
-    # Task 2: a clear error, not Stage 1d-C's silent 17-position-sub-track
-    # degradation on `dense` at its normal (20,400 CpG) scale.
+    # A clear error only below the absolute min_cpgs-derived construction
+    # floor; 20,000 rows now legitimately use the measured fallback.
     rng = np.random.default_rng(26)
-    residuals = rng.normal(size=(20_000, 15))
+    residuals = rng.normal(size=(3_000, 15))
     config = Eiger2Config(
         window=4, null_min_lag=500, min_subtrack_length=100, random_seed=1,
     )
@@ -4340,7 +4703,7 @@ def test_support_stratified_fdr_reports_zero_exceedance_when_opportunity_is_real
     # had real OPPORTUNITY to form a region this long, and on this input it
     # did (ample eligible edge volume, just never enough consecutive
     # exceedances to segment one) -- so every stratum is ADEQUATE, K=0 is
-    # reported as the decisive evidence it is (a finite Garwood upper bound,
+    # reported as the decisive evidence it is (a finite cluster upper bound,
     # not NaN), and nothing is refused. The Stage 1e aggregate floor this test
     # used to pin checked the wrong quantity (region COUNT, not OPPORTUNITY)
     # and is retired; this is the corrected outcome on the identical input.

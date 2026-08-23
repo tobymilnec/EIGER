@@ -30,7 +30,7 @@ from eiger2.probability import (  # noqa: E402
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("replicates", [1, 5, 20, 50])
+@pytest.mark.parametrize("replicates", [5, 10, 20, 50])
 def test_region_fdr_scale_is_not_double_discounted(replicates):
     """``null_edges`` is the total over replicates, so the expectation must use
     only the edge ratio.
