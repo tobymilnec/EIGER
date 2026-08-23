@@ -23,6 +23,8 @@ eiger2 call \
     --out results/
 ```
 
+The generated example is 50,000 CpGs on one chromosome -- below `region_null_mode="member_step"`'s ~103,000-CpG floor (see "Minimum input size" below), so this command demonstrates the automatic `"lag"` fallback, not the member-step construction. `region_qvalue` is not calibrated in that mode, so the run reports `status: ok_with_warnings` even though every length stratum's own pooled null happens to be genuinely empty (`K=0`, backed by real null opportunity, reported rather than refused -- see `examples/make_example_data.py`'s docstring) -- read the output as candidates-only, exactly as the run's own warnings say.
+
 Full installation instructions, input formats, and command-line options are provided in **[QUICKSTART.md](QUICKSTART.md)**.
 
 ---
@@ -61,12 +63,46 @@ Any null used to calibrate *runs* of elevated edges must reproduce that autocorr
 
 EIGER2 v2.1.0 uses a **member-step lag null** (`region_null_mode="member_step"`, the default). Consecutive null positions share *w*−1 of their *w* member CpGs, exactly as consecutive observed windows do, so the autocorrelation is reproduced by construction; the members themselves are thousands of CpGs apart, so genuine regional coordination is broken.
 
+### Chromosome-aware null construction
+
+Both the edge-level ("lag") and region-level ("member_step") nulls draw their locality-breaking lag **independently per chromosome**, not once genome-wide. A single genome-wide lag draw is far more likely to survive on the largest chromosome(s) than a smaller one -- a lag long enough to break locality genome-wide rarely also fits inside a short chromosome -- so the null ends up drawn almost entirely from the largest chromosomes even when the observed data spans every one of them. Each replicate now iterates every chromosome, draws that chromosome's own feasible lag (`U[null_min_lag, n_c // (span - 1)]`, where `n_c` is that chromosome's own CpG count), and concatenates every chromosome's own segment into one genome-wide realisation, with the eligibility mask broken at every chromosome boundary. This preserves chromosome composition in every replicate, and makes each replicate a clean cluster unit.
+
+A chromosome too small to admit a feasible lag (`n_c // (span - 1) < null_min_lag`) contributes nothing to the null in any replicate. It is not silently excluded: its share of the run's own eligible observed edges is measured (`manifest["gates"]["structural"]["chromosome_exposure"]`) and escalates to a structural gate -- see below -- when material.
+
 Two gates run automatically on every call and are recorded in `run_manifest.json`:
 
 - **autocorrelation match** — the null's autocorrelation function must lie within ±0.05 of the observed track's at lags 1…*w*;
 - **region-level exchangeability** — observed and null region-formation rates per unit exposure must be comparable.
 
-Both are reported in `manifest["gates"]` whether they pass or fail. Full derivation is in **[docs/FDR.md](docs/FDR.md)**.
+Both are reported in `manifest["gates"]` whether they pass or fail. **These are calibration
+diagnostics, not gates**: they are confounded with genuine signal on real data (a cohort
+containing real coordinated regions is *expected* to show elevated observed/null ratios --
+that is what detection means), so they change only which status label a run reports
+(`ok` vs. `ok_with_warnings`), never whether `region_qvalue`/`significant` are suppressed.
+Full derivation is in **[docs/FDR.md](docs/FDR.md)**.
+
+### Structural gates and run status
+
+A separate set of **structural gates** -- signal-independent conditions on the null's
+construction, checked regardless of whether the observed data contains any signal at all --
+can fail closed. `manifest["status"]` is one of four values:
+
+| status | meaning |
+|---|---|
+| `ok` | no structural failure, no calibration-diagnostic concern |
+| `ok_with_warnings` | a calibration diagnostic above is out of its expected range; `region_qvalue`/`significant` unaffected |
+| `partial_inference` | one or more length strata lacked enough null OPPORTUNITY to report `region_qvalue` (below `m_opportunity`, spec §2c); those strata's rows are refused (`NaN`/`pd.NA`), every other stratum reports normally -- the null is otherwise sound |
+| `inference_unreliable` | a structural gate failed -- `region_qvalue`, its bounds, and `significant` are refused (`NaN`/`pd.NA`) for the whole run; candidates and descriptive columns are still written |
+
+The structural gates, recorded in `manifest["gates"]["structural"]` with their measured
+values: surviving null-track fraction (below 50% of `null_replicates`), null coverage
+(below `min_null_coverage`), pooled null volume (below `min_null_values`), chromosome
+exposure with no feasible null lag (above `max_missing_null_exposure`, default 5%), and numerical
+failure in the null pipeline. `eiger2 call` exits non-zero, with a summary naming every
+failed gate on stderr, exactly when `status == "inference_unreliable"`. A per-stratum
+`partial_inference` refusal is reported (`manifest["fdr"]["insufficient_null_opportunity_strata"]`,
+each entry naming its observed/null opportunity and the opportunity required) but does not
+affect the exit code -- every other stratum's `region_qvalue` is unaffected and real.
 
 ### Minimum input size, and automatic fallback
 
@@ -202,7 +238,10 @@ Six columns sit immediately after `region_qvalue`. Full derivation and worked ex
 
 A `region_qvalue` of exactly zero means the null produced no region at least as extreme, not that the region is certain. Read it together with `region_qvalue_upper_95` and `region_qvalue_resolution`, which say how finely the available null can resolve that statement.
 
-`schema_version` in the run manifest is `"2.2"`.
+`schema_version` in the run manifest is `"2.3"`. `significant` is a nullable boolean
+(pandas `BooleanDtype`): `pd.NA` means inference was unavailable for that row, a
+different statement from `False` ("tested, not significant") -- see `fdr_status` and
+`docs/FDR.md` §14.
 
 ### `--fdr-decision {point,upper}`
 
@@ -224,7 +263,7 @@ A stratum in which the null produced *no* region, while the run as a whole is ad
 | Setting | Default | Effect |
 |---|---|---|
 | `--null-replicates` | 100 | Edge-threshold null replicates. |
-| `n_lag_draws` (Python API) | 75 | Member-step region-null draws. Runtime scales roughly linearly; resolution improves as it rises. At 75, `s ≈ 0.019`; at 150, `s ≈ 0.010`. Every region gate passes across 40–150 in benchmarking, so 75 is the runtime/resolution default rather than the finest available. |
+| `--n-lag-draws` / `n_lag_draws` | 75 | Member-step region-null draws. Runtime scales roughly linearly; resolution and per-stratum opportunity improve as it rises. At 75, `s ≈ 0.019`; at 150, `s ≈ 0.010`. Every region gate passes across 40–150 in benchmarking, so 75 is the runtime/resolution default rather than the finest available. |
 | `EIGER2_USE_NUMBA=1` | unset | Opt-in fused numba kernel for the pair statistic, available with `pip install eiger[fast]`. Off by default because it changes results in the last floating-point digits. |
 
 Each run also produces `run_manifest.json`, which records:
@@ -236,6 +275,11 @@ Each run also produces `run_manifest.json`, which records:
 - null-model diagnostics and both region-level gate results
 - layout diagnostics, including the longest detectable region on the given CpG layout
 - the parameters used for segmentation and FDR estimation
+- `chromosome_order`: the canonical order (`chr1`...`chr22`, `chrX`, `chrY`, `chrM`, then
+  any other contig, lexicographically) the run's chromosomes were grouped and sorted
+  into internally -- input rows are accepted in any order (natural, lexicographic, or
+  shuffled) and always canonicalise to this same order, so a run is reproducible
+  regardless of how the input happened to be presented
 
 This allows each result to be traced back to the code, inputs, and settings that generated it.
 

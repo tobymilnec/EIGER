@@ -273,7 +273,7 @@ def test_exchangeability_reports_all_three_gates():
     assert "region_exchangeability_null_count_adequate" in frame.columns
 
 
-def test_exchangeability_gate_2_reports_inf_not_nan_when_null_rate_zero_and_observed_positive():
+def test_exchangeability_gate2_inf_when_null_rate_zero_and_observed_positive():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarking"))
     from benchmark_suite import exchangeability
 

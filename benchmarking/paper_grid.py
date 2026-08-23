@@ -21,10 +21,17 @@ Usage (out-of-band, per stage):
     python paper_grid.py signal_grid   --seeds 20  --jobs 16 --resume
     python paper_grid.py power_curve   --seeds 10  --jobs 16 --resume
     python paper_grid.py gap_sweep     --seeds 20  --jobs 16 --resume
+    python paper_grid.py multichrom    --seeds 20  --jobs 16 --resume
 
 At the measured 225s/cell median (STAGE1F_STOP_REPORT.md §3), serial totals are
 ~62.5h/17.5h/11.3h/6.7h; `--jobs 16` on a 16-core machine brings each to roughly
 1/16th of that, since every cell is independent.
+
+``multichrom`` (spec §2b.5) is DEFINED, not yet run or timed even provisionally --
+added alongside Stage 2b's chromosome-aware null construction fix, per-cell cost is
+unmeasured (likely higher than the single-chromosome cells above: `layout_chrom=None`
+spans all three fixture chromosomes at once). Execution belongs here, with the rest
+of this grid, at §2f.
 
 ``--jobs N`` (default 1, serial, no new dependency) parallelises across cells with
 ``concurrent.futures.ProcessPoolExecutor``. One cell per task; each cell's result is
@@ -58,10 +65,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "layouts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 
-from eiger2.benchmark import simulate, evaluate  # noqa: E402
-from eiger2.core import Eiger2Config, call_dmrs  # noqa: E402
 from benchmark_suite import (  # noqa: E402
-    DEFAULT_STRATA, SCENARIOS, _classify, _v2_called, GAP_SWEEP_VALUES, gap_sweep,
+    DEFAULT_STRATA,
+    GAP_SWEEP_VALUES,
+    SCENARIOS,
+    _classify,
+    _v2_called,
+    gap_sweep,
+)
+
+from eiger2.benchmark import evaluate, simulate  # noqa: E402
+from eiger2.core import (  # noqa: E402
+    Eiger2Config,
+    call_dmrs,
+    centre_cpgs,
+    chromosome_lag_feasibility,
+    null_tracks,
 )
 
 OUT = Path(__file__).resolve().parent / "results_v210"
@@ -266,6 +285,94 @@ def dmr_free_calibration(
 
 
 # --------------------------------------------------------------------------
+# 1b. Multi-chromosome cell (spec §2b.5) -- DEFINED, NOT RUN as part of
+# Stage 2b. Execution belongs to §2f, alongside the rest of this grid.
+# --------------------------------------------------------------------------
+
+#: Real hg38, EVERY chromosome present at once (layout_chrom=None -- spec
+#: §2b.5), not sliced to one as every cell above and every benchmark ever
+#: run before Stage 2b always was (that is precisely why the genome-wide
+#: lag defect survived seven review stages). Spacing chosen so `n_cpg`
+#: comfortably clears member_step's ~103,000-CpG floor at defaults, so this
+#: cell exercises the actual production null_replicates=100.
+MULTICHROM_SPACING = 60_000  # n_cpg = spacing*1 + 400, strata=[] (DMR-free)
+
+
+def _multichrom_cell(scenario: str, seed: int) -> dict:
+    """The pytest-scale checks ``tests/test_chromosome_aware_null.py``
+    (spec §2b.5) pins, at full production scale and crossed with every
+    nuisance scenario, not just one seed at one scale: surviving null
+    tracks (>= 90% of null_replicates), null coverage, chromosome-exposure
+    (spec §2b.3), the composition check (each chromosome's own share of
+    pooled null positions vs. its share of eligible observed edges, within
+    a factor of 1.2 -- the check a cap-only fix would fail), and whether
+    every structural gate (spec §2a.2) passes.
+    """
+    kwargs = dict(
+        seed=seed, strata=[], replicates=0, spacing=MULTICHROM_SPACING,
+        layout="wgbs_real", layout_chrom=None, **SCENARIOS[scenario],
+    )
+    matrix, locations, _ = simulate(**kwargs)
+    config = Eiger2Config(
+        window=4, null_min_lag=1000, random_seed=seed, max_cpg_gap_bp=300,
+    )
+    t0 = time.time()
+    _, _, manifest = call_dmrs(matrix, locations, config=config)
+    elapsed = time.time() - t0
+    structural = manifest["gates"]["structural"]
+
+    # Composition check: not exposed by call_dmrs's own manifest (which
+    # reports the pooled null, not a per-chromosome breakdown of it), so
+    # recomputed directly here from null_tracks() -- the same construction
+    # call_dmrs itself makes internally, not a second null.
+    residuals = centre_cpgs(matrix)
+    tracks = null_tracks(residuals, config, locations)
+    null_positions_by_chromosome: dict[str, int] = {}
+    for _track, eligible, segments in tracks:
+        position = 0
+        for name, _lag, _start, length in segments:
+            segment_eligible = eligible[position : position + length]
+            null_positions_by_chromosome[name] = (
+                null_positions_by_chromosome.get(name, 0)
+                + int(segment_eligible.sum())
+            )
+            position += length
+    feasibility = chromosome_lag_feasibility(locations, config)
+    total_edges = sum(v["eligible_observed_edges"] for v in feasibility.values())
+    total_null = sum(null_positions_by_chromosome.values())
+    composition_ratio_by_chromosome = {
+        name: (
+            (null_positions_by_chromosome.get(name, 0) / total_null)
+            / (v["eligible_observed_edges"] / total_edges)
+        ) if total_null and total_edges and v["eligible_observed_edges"] else None
+        for name, v in feasibility.items()
+    }
+    composition_within_factor_1_2 = all(
+        ratio is not None and 1 / 1.2 <= ratio <= 1.2
+        for ratio in composition_ratio_by_chromosome.values()
+    )
+
+    return dict(
+        scenario=scenario, seed=seed, n_cpg=len(locations),
+        chromosome_order=manifest.get("chromosome_order"),
+        runtime_seconds=elapsed,
+        surviving_null_tracks_fraction=structural["surviving_null_tracks"]["fraction"],
+        null_coverage=structural["null_coverage"]["value"],
+        chromosome_exposure_missing=structural["chromosome_exposure"]["missing_exposure"],
+        composition_ratio_by_chromosome=composition_ratio_by_chromosome,
+        composition_within_factor_1_2=composition_within_factor_1_2,
+        structural_gates_all_passed=all(g["passed"] for g in structural.values()),
+    )
+
+
+def multichrom(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.DataFrame:
+    cells = [(scenario, seed) for scenario in SCENARIO_NAMES for seed in seeds]
+    return _run_grid_parallel(
+        "multichrom", cells, _multichrom_cell, jobs=jobs, resume=resume,
+    )
+
+
+# --------------------------------------------------------------------------
 # 2. Extended planted-signal grid
 # --------------------------------------------------------------------------
 
@@ -390,7 +497,10 @@ def power_curve(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.Data
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "subcommand", choices=["calibration", "signal_grid", "power_curve", "gap_sweep"]
+        "subcommand",
+        choices=[
+            "calibration", "signal_grid", "power_curve", "gap_sweep", "multichrom",
+        ],
     )
     parser.add_argument("--seeds", type=int, default=100)
     parser.add_argument(
@@ -434,6 +544,9 @@ if __name__ == "__main__":
     elif args.subcommand == "power_curve":
         frame = power_curve(range(args.seeds), jobs=args.jobs, resume=args.resume)
         frame.to_csv(OUT / "power_curve.csv", index=False)
+    elif args.subcommand == "multichrom":
+        frame = multichrom(range(args.seeds), jobs=args.jobs, resume=args.resume)
+        frame.to_csv(OUT / "multichrom.csv", index=False)
     else:
         frame = gap_sweep(list(range(args.seeds)))
         frame.to_csv(OUT / "gap_sweep_full.csv", index=False)

@@ -345,7 +345,8 @@ implicit v2.0.0 output format — it was never written to any manifest at the ti
 v2.0.0-era `regions.csv`/`run_manifest.json` is identified by the **absence** of a
 `schema_version` key, not by that key being present with value `"2.0"`. From this
 release onward, `manifest["schema_version"]` is written explicitly by every run
-(currently `"2.2"`, bumped from `"2.1"` in Stage 1c).
+(currently `"2.3"`, bumped from `"2.2"` in Stage 2a for the nullable `significant`
+column -- see §14).
 
 `regions.csv` gains six columns, inserted immediately after `region_qvalue`:
 
@@ -616,6 +617,303 @@ careful record — this section exists so the claim actually matches the evidenc
 behind it. Quantifying exactly how conservative (a power curve against a
 "realised FDR near nominal" boundary, not the comfortably-detectable signal grid
 `DEFAULT_STRATA` provides) is Stage 1f Task 3's paper-grid work, not resolved here.
+
+---
+
+## 14. Structural gates, run status, and the nullable `significant` (Stage 2a, spec §2a)
+
+### 14.1 Structural gates are signal-independent; calibration diagnostics are not
+
+An earlier draft of this stage would have made the ACF-match and region-exchangeability
+gates (§11, and the top of this document's "Two gates" description in `README.md`) into
+hard gates that suppress inference. That is wrong: both ratios were defined and validated
+on DMR-free data, where observed and null rates should agree. On a cohort containing
+genuine coordinated regions, the observed elevated-edge and region-formation rates are
+*supposed* to exceed the null's -- that is what detection means. A hard gate on either
+ratio would have declared a strongly positive dataset `inference_unreliable` **because it
+contained signal**, which is worse than the miscalibration problem it would have been
+written to fix.
+
+The gates therefore split into two kinds:
+
+- **Structural gates** (`manifest["gates"]["structural"]`) -- conditions broken regardless
+  of whether signal exists, checked purely on how much of the null actually survived
+  construction. These hard-fail the run.
+- **Calibration diagnostics** (ACF match, region exchangeability, edge exchangeability
+  `null_exchangeability_ratio`, and the overdispersion ratio) -- confounded with signal on
+  real data. Every one is reported prominently, in the manifest and on `eiger2 call`'s
+  stderr, with the label:
+
+  > Calibration diagnostic. Valid as a hard criterion only on data known to be null. On a
+  > cohort containing genuine coordinated regions these ratios are expected to exceed 1,
+  > and a high value is not by itself evidence of a broken null.
+
+  They change only which status label a run reports (`ok` vs. `ok_with_warnings`); they do
+  not suppress `region_qvalue` or `significant`. They may become hard gates once a future
+  release establishes a false-rejection rate for a proposed tolerance -- not before.
+
+### 14.2 The four run states
+
+`manifest["status"]` is one of:
+
+| status | when | effect |
+|---|---|---|
+| `ok` | no structural failure, no calibration-diagnostic concern | unchanged |
+| `ok_with_warnings` | a calibration diagnostic (§14.1) is out of its expected range | `region_qvalue`/`significant` reported; diagnostics prominent |
+| `partial_inference` | one or more length strata refused for insufficient null opportunity (§16) | those strata's rows suppressed; every other stratum reports normally |
+| `inference_unreliable` | a structural gate failed | all inferential columns suppressed; candidates and descriptive columns still written |
+
+At the time this section was written, `inference_unreliable` also fired when
+`region_fdr_result`'s own aggregate null-adequacy check refused the run
+(`fdr.status == "aggregate null inadequate"`, §8/§12) -- a second, independent way for
+inference to become unavailable, orthogonal to the structural gates below. §16 (spec §2c)
+retired that aggregate check in favour of the per-stratum opportunity mechanism behind the
+`partial_inference` row above; it is no longer a way `inference_unreliable` can fire.
+
+### 14.3 The structural gates
+
+Recorded with their measured values in `manifest["gates"]["structural"]`:
+
+- **`surviving_null_tracks`** -- fewer than half of `null_replicates` produced a usable
+  track (every position ineligible, or the track empty). This is exactly what the audited
+  ICGC run showed: 7 of 100 tracks surviving.
+- **`null_coverage`** -- the fraction of offered null positions that survived eligibility
+  filtering is below `min_null_coverage` (default 0.25). The audited run measured 21.3%.
+- **`null_construction`** -- fewer than `min_null_values` (default 1,000) pooled null
+  values in total. Promoted from `null_threshold`'s pre-existing non-fatal warning to a
+  hard gate. The spec also names "no feasible lag on a chromosome carrying a material
+  share of eligible edges" under this heading; that check needs the per-chromosome null
+  construction a future release adds and is not measurable before it -- the only pre-that
+  proxy, zero surviving tracks, is unreachable here because `null_threshold` already
+  raises in that case (caught separately, below) before this gate is ever evaluated.
+- **`numerical_failure`** -- the null pipeline raised (e.g. `null_threshold`'s "no usable
+  pairs" `ValueError`, previously an unhandled exception with no manifest and no output at
+  all). Caught and reported the same way as the other three.
+
+Each failed individually still produces `inference_unreliable`; a clean run's status is
+unaffected. The most important test of this stage is the opposite case: a high-signal run
+with large observed/null ratios but sound structure returns `ok` or `ok_with_warnings`,
+never `inference_unreliable` -- the regression test for §14.1
+(`tests/test_eiger2_core.py::test_high_signal_sound_structure_run_is_never_inference_unreliable`).
+
+### 14.4 The nullable `significant`, and `fdr_status`
+
+`False` in `regions.csv`'s `significant` column means "tested, not significant" -- a
+different statement from "not tested because inference was unavailable for this row".
+Encoding the second as the first (`NaN <= target_fdr` evaluates `False`) is the same
+category error as reporting `q = 0` from an empty null. `significant` is now a pandas
+`BooleanDtype` column:
+
+| value | meaning |
+|---|---|
+| `True` | tested, significant |
+| `False` | tested, not significant |
+| `pd.NA` | inference unavailable |
+
+`regions.csv` also carries `fdr_status`: `available` when this row was tested,
+`unavailable_stratum` when §16 refused only its length stratum for insufficient null
+opportunity, and `unavailable_run` when a global structural failure suppressed every row.
+The reason is therefore explicit rather than inferred from a blank.
+
+`pd.NA` serialises to an empty CSV field -- a consumer reading `significant` back with a
+plain `pd.read_csv` gets `object` dtype (`True`/`False`/`NaN` as Python objects), losing
+the nullable-boolean distinction. Read it back with `dtype={"significant": "boolean"}` to
+recover the three states exactly, as
+`tests/test_eiger2_core.py::test_significant_columns_three_states_survive_a_csv_round_trip`
+does. This is a schema change: `schema_version` is `"2.3"` from this release.
+
+## 15. Chromosome-aware null construction (Stage 2b, spec §2b)
+
+### 15.1 The defect
+
+`null_tracks()` and `member_step_lag_null_ensemble()` each drew ONE lag per replicate from
+a range computed on the genome-wide row count, then filtered out window members that
+crossed a chromosome boundary after the fact. A lag long enough to be locality-breaking
+genome-wide is rarely also small enough to fit inside a shorter chromosome, so almost every
+draw survived only on the largest chromosome(s) -- on the audited ICGC run, 7 of 100 edge
+tracks survived, drawn almost entirely from the largest chromosomes, even though the
+observed track spanned all of them. This also inflated the overdispersion ratio that
+motivated §2d's interval work, since that measurement was taken on this same defective
+ensemble -- §2d re-measures after this stage, not before it.
+
+### 15.2 The fix
+
+Both constructions now iterate every chromosome per replicate, drawing an INDEPENDENT
+feasible lag for each (`lag_c ~ U[null_min_lag, n_c // (span - 1)]`, `n_c` that
+chromosome's own row count), building that chromosome's segment from its own rows, and
+concatenating every feasible chromosome's segment into one genome-wide realisation with
+the eligibility mask broken at every concatenation seam. This preserves chromosome
+composition in every replicate and makes the replicate a clean cluster unit (relevant to
+any future interval construction over replicates).
+
+`null_tracks()` returns `(track, eligible, segments)` triples, `segments` =
+`[(chromosome, lag, start, length), ...]` in concatenation order -- a single scalar lag can
+no longer describe a whole replicate now that one replicate spans multiple chromosomes'
+own lags. The support-conditioned threshold (`docs/FDR.md`, Stage 1c) reconstructs each
+segment's own window-member set from its own lag and genome-wide start offset, not a single
+lag applied to the whole track.
+
+### 15.3 Infeasible chromosomes: measured, not silently excluded
+
+A chromosome with `n_c // (span - 1) < null_min_lag` admits no feasible lag and
+contributes nothing to the null in any replicate. Rather than a fixed, arbitrary exclusion
+threshold, its share of the run's own eligible observed edges is measured
+(`chromosome_lag_feasibility()`) and reported as `missing_exposure` in
+`manifest["gates"]["structural"]["chromosome_exposure"]`, escalating to a structural gate
+(§14.3) -- `inference_unreliable` -- when `missing_exposure` exceeds
+`config.max_missing_null_exposure` (default `0.05`).
+
+This edge-null measurement remains in `structural.chromosome_exposure`. When the resolved
+region null is `member_step`, the manifest additionally records and gates
+`structural.region_null_chromosome_exposure` using that construction's stricter
+`L_max_c = n_c // (min_subtrack_length + window - 1)` rule. A chromosome can therefore be
+represented in the edge-threshold null but correctly reported as absent from the
+region-FDR null; either material exclusion fails the run closed.
+
+**Explicit and independently tunable, not derived from `min_null_coverage`.** An earlier
+version of this gate tied its floor to `1 - min_null_coverage` (0.75 at the default
+`min_null_coverage=0.25`) -- permitting three-quarters of observed exposure to sit outside
+the null entirely, and relating two different quantities: `min_null_coverage` is about how
+much of the OFFERED null was usable, `max_missing_null_exposure` about how much of the
+OBSERVED genome has no null representation at all. "Explicit and tunable" is the honest
+form of "not an arbitrary percentage" (the spec's own phrase) -- sweep it in the §2f grid
+the same as any other floor here, rather than trusting the shipped default.
+
+**The cheap half of the literal "recompute and compare" ask.** The spec text also asks to
+"report the sensitivity of the threshold and the resulting FDR to that exclusion, by
+recomputing both on the retained chromosomes only and comparing" -- a full second run
+restricted to feasible chromosomes only, compared against the actual one. That remains
+undone (expensive, near-doubling runtime, and its exact comparison methodology is still
+underspecified -- compare which summary statistics, at what tolerance?). What IS
+implemented is a genuinely free-riding half-measure: `manifest["null"]
+["threshold_by_chromosome"]` reports the same `null_quantile` computed separately on each
+feasible chromosome's own pooled null values (grouped via the `segments` metadata
+`null_tracks()` already records), alongside the pooled `threshold` it is a comparison for
+-- one extra quantile per feasible chromosome, not a second run, since both come from the
+null `null_tracks()` already built. A wide spread across chromosomes is a signal the pooled
+threshold may not represent every contributing chromosome well; a full FDR-level
+sensitivity comparison is still the place `chromosome_lag_feasibility()` and this
+per-chromosome quantile leave for future work, not something either claims to be.
+
+### 15.4 `member_step_lag_null_ensemble`
+
+The same audit and the same fix, with `min_subtrack_length`-based feasibility
+(`L_max_c = n_c // (min_subtrack_length + window - 1)`) instead of `null_tracks()`'s
+`max(window, 2)`-based one. Raises only when NO chromosome individually clears the floor,
+naming the largest chromosome's own `n_cpg`/`L_max` rather than the genome-wide total.
+`member_step_min_n_cpg()` stays genome-wide -- a cheap, approximate, conservative
+pre-check for `region_null_mode="auto"`'s fallback decision, run before any per-chromosome
+breakdown is available; the authoritative check is `member_step_lag_null_ensemble`'s own.
+Its missing eligible-edge share and excluded chromosome names are recorded by
+`structural.region_null_chromosome_exposure` and compared with
+`max_missing_null_exposure`, independently of the edge-null exposure gate.
+
+**The ACF failure at every lag in the audited run is not yet explained by this stage.**
+Diagnosing whether the concatenated sub-tracks' eligibility mask (false at every piece
+boundary and every chromosome transition) independently depresses the ACF measurement,
+separately from the sampling bias this stage fixes, is unresolved -- flagged per the
+spec's own instruction not to fold this in silently. Measuring the region-null track's
+autocorrelation directly on the audited cohort, with and against this fix, is follow-up
+work this stage does not include.
+
+### 15.5 Canonical chromosome ordering (prerequisite)
+
+Both constructions depend on rows being grouped by chromosome and sorted ascending
+within each chromosome -- guaranteed by `chromosome_sort_permutation()`, applied by both
+`call_dmrs` and the legacy caller before any other processing, regardless of input order
+(natural, lexicographic, or shuffled). See `tests/test_chromosome_order.py`.
+
+---
+
+## 16. Per-stratum null opportunity (Stage 2c, spec §2c)
+
+### 16.1 The defect
+
+§14 moved `region_qvalue`'s null-adequacy floor from a per-stratum region-COUNT check
+(Stage 1c-bis) to a single AGGREGATE count summed across every stratum and replicate
+(Stage 1e), arguing that once the run as a whole is adequately backed, `K=0` at a
+stratum's own cutoff is decisive evidence, not missing information. That argument stands.
+The implementation, though, checked aggregate *count* -- the wrong quantity. A run could
+hold thousands of null regions in the short strata while the 20-49 and 50+ strata never
+had the *chance* to grow a region that long at all, and every long observed region then
+received `q=0` from a null that could never have contradicted it. That is what the audit
+found, and it is a category error one level down from §14's own fix: "the null pool is
+small" and "the null pool never had the opportunity to be anything else" look identical
+under a count, and only the second one licenses `q=0` as evidence.
+
+### 16.2 Opportunity, not count
+
+For length stratum `s`, with `min_edges(s)` the minimum edge count a region in that
+stratum requires (`s`'s lower bound: 4, 6, 10, 20, 50 for "4-5" through "50+"):
+
+```
+O_s = sum over OBSERVED eligible runs of max(0, run_len - min_edges(s) + 1)   # observed opportunity
+N_s = sum over NULL     eligible runs of max(0, run_len - min_edges(s) + 1)   # null opportunity, pooled
+R_s = observed regions in stratum s
+K_s = pooled null regions in stratum s
+```
+
+An eligible *run* here is a maximal contiguous span of usable edges (`eligible &
+isfinite(statistic)` for the observed track, `null_eligible & isfinite(track)` per null
+replicate) -- a property of coverage/layout structure, independent of whether the
+statistic ever crossed threshold inside it. `max(0, run_len - min_edges(s) + 1)` counts
+the distinct positions a stratum-`s`-length region COULD have started at within that run.
+Because `segment()` spans `E + 1` CpGs with `E` passing edges, the minimum edge counts for
+the CpG strata `4-5`, `6-9`, `10-19`, `20-49`, and `50+` are respectively
+`3`, `5`, `9`, `19`, and `49`.
+
+Adequacy asks: had the observed regions all been false, would the null have been likely to
+show it? At the observed rate `r_s = R_s / O_s`, the null would be expected to produce
+`r_s * N_s` regions. Requiring that to clear `m_opportunity` (default 10, a starting value
+per spec §2c.2, not yet validated -- sweep it in the §2f grid) gives
+
+```
+N_s >= m_opportunity * O_s / R_s
+```
+
+Two things this deliberately does NOT do: it is assessed once per length stratum, not at
+every area cutoff (opportunity does not depend on the cutoff, only `K` does), and it never
+touches the estimator's exposure scale `s = observed_edges / null_edges` -- that stays
+global, unchanged by this stage, so as not to confound it with a future §2d rescaling.
+
+### 16.3 Outcomes, and the two lists
+
+- **Adequate, `K_s = 0`** -- unchanged from §14: reported at the finite Garwood upper
+  bound, named in `manifest["fdr"]["zero_exceedance_strata"]`.
+- **Inadequate** -- that length stratum's rows are refused (`region_qvalue` etc. `NaN`,
+  count fields `-1`, `significant` `pd.NA`), named in
+  `manifest["fdr"]["insufficient_null_opportunity_strata"]` with `O_s`, `N_s`, `R_s`, and
+  the opportunity required. Run status becomes `partial_inference` (§14.2's table), not
+  `inference_unreliable`: the null is otherwise sound, it simply never had the chance to
+  speak to regions this long. Every other stratum reports normally in the same run.
+
+The two lists are mutually exclusive by construction -- a stratum is either adequate (and
+may or may not turn out empty) or refused; never both, never neither when it holds any
+observed regions at all.
+
+Refusal is per LENGTH stratum specifically, not per joint (length x support-bin) stratum:
+opportunity is a property of run-length structure, independent of support-bin membership.
+A refused length stratum's rows are refused regardless of which support bin they fell into
+under §1c.6's joint stratification.
+
+### 16.4 What this retired
+
+`region_fdr_result`'s aggregate pooled-count floor (`min_null_regions_for_fdr`, §14.2's
+"a second, independent way for inference to become unavailable") is gone; that parameter
+no longer exists on `region_fdr_result` (though `Eiger2Config.min_null_regions_for_fdr`
+survives, now backing only `region_exchangeability_gate`, a different, still-aggregate
+structural diagnostic §14.3 doesn't cover). `"aggregate null inadequate"` can no longer
+appear as `manifest["fdr"]["status"]`.
+
+One incidental fix alongside this stage: `Eiger2Config.min_null_values` was, before this
+stage, dual-purposed as both the `null_construction` structural gate's pooled floor (§14.3)
+*and* the per-support-bin collapse trigger inside `_support_bin_edges` -- two different
+quantities (one pooled and run-level, one per-bin), conflated under one name. Forcing bin
+collapse by raising it meant the exact same value then failed the whole run as an
+inadequate pooled null, with no value able to do one without the other. Split into
+`min_null_values` (pooled floor, unchanged default 1,000) and
+`min_null_values_per_support_bin` (per-bin collapse trigger, same default, independently
+tunable) -- unrelated to opportunity, found while exercising this stage's full test suite.
 
 ---
 

@@ -21,7 +21,6 @@ from .core import (
     edge_statistic,
     estimate_latent_basis,
     null_threshold,
-    qvalue_result_from_track,
     region_fdr,
     region_fdr_result,
     segment,
@@ -36,7 +35,6 @@ from .probability import (
 
 __all__ = [
     "__version__",
-    "# probability layer",
     "Eiger2Config",
     "LocalFdrResult",
     "RegionFdrResult",
@@ -50,7 +48,6 @@ __all__ = [
     "estimate_pi0",
     "local_fdr",
     "null_threshold",
-    "qvalue_result_from_track",
     "region_fdr",
     "region_fdr_result",
     "reliability_table",

@@ -51,7 +51,7 @@ def test_eligible_run_lengths_splits_on_chromosome_boundary():
 
 def test_eligible_run_lengths_isolated_cpg_is_a_zero_length_run():
     locs = _locations([0, 2, 5000, 5002, 5004])
-    runs = eligible_run_lengths(locs, max_cpg_gap_bp=300)
+    eligible_run_lengths(locs, max_cpg_gap_bp=300)
     # [0,2] is one eligible edge (run len 1); the far CpG at 5000 is isolated on
     # its left (gap too big) but eligible on its right -> [5000,5002,5004] is a
     # run of length 2. Nothing here is isolated on both sides in this fixture,
@@ -127,7 +127,9 @@ def test_plantability_fraction_increases_with_dmr_length():
 
 
 def test_plantability_fraction_empty_input_is_nan():
-    assert np.isnan(plantability_fraction(_locations([]), max_cpg_gap_bp=300, dmr_length=4))
+    assert np.isnan(
+        plantability_fraction(_locations([]), max_cpg_gap_bp=300, dmr_length=4)
+    )
 
 
 def test_window_eligibility_fraction_hand_derived():
@@ -182,7 +184,9 @@ def test_window_eligibility_fraction_matches_master_spec_7_corrected_numbers():
     # ("shelved") version of this module used a looser "run has enough CpGs
     # somewhere" criterion that overstated eligibility (chr1 w=4: 97.2%); this
     # pins the alignment-aware numbers that superseded it.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarking" / "layouts"))
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1] / "benchmarking" / "layouts")
+    )
     from layouts import load_wgbs_layout
 
     fixture = str(

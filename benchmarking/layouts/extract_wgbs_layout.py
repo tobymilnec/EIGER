@@ -91,7 +91,6 @@ def main() -> int:
     if beta.size % BETA_ROW_BYTES:
         raise SystemExit("beta file length is not a multiple of 2 bytes")
     beta = beta.reshape(-1, BETA_ROW_BYTES)
-    n_index = sum(len(index[c][0]) for c in wanted)
     if beta.shape[0] < max(index[c][1].max() for c in wanted) + 1:
         raise SystemExit(
             f"beta has {beta.shape[0]:,} rows but the index references higher rows; "

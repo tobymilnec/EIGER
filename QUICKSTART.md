@@ -61,10 +61,14 @@ The only thing you lose is the short `eiger2` command.
 python examples/make_example_data.py
 ```
 
-Writes `examples/data/`: a 5,000 CpG × 24 sample matrix across two chromosomes,
+Writes `examples/data/`: a 50,000 CpG × 24 sample matrix on one chromosome,
 with spatially autocorrelated background, two latent nuisance factors, read
 depth 15, 5% missing observations, and 20 planted regions spanning a grid of
-effect sizes and prevalences. `truth.tsv` records what was planted.
+effect sizes and prevalences. `truth.tsv` records what was planted. 50,000
+CpGs is below `region_null_mode="member_step"`'s ~103,000-CpG floor, so
+`eiger2 call` on this data demonstrates the automatic `"lag"` fallback (see
+the README's quick-start note and `examples/make_example_data.py`'s
+docstring for why the run still reports `inference_unreliable`).
 
 ---
 
@@ -90,11 +94,21 @@ eiger2 compare --betas examples/data/betas.tsv \
 Expected output for the first command:
 
 ```
+[eiger2] region null: region_null_mode='auto', input has 50,000 CpGs, member_step needs >= 103,000
 [eiger2] caller     : eiger2
-[eiger2] regions    : 40
-[eiger2] significant: 40 at q <= 0.05
+[eiger2] regions    : 18
+[eiger2] significant: 0 at q <= 0.05
+[eiger2] status      : inference_unreliable
 [eiger2] written to : examples/out_eiger2
 ```
+
+`regions` lists 18 candidates, but `status: inference_unreliable` -- expected on
+this fixture, and explained by the warnings the run also prints (see the
+quick-start note above and `examples/make_example_data.py`'s docstring):
+`"lag"`'s region-null essentially never forms a multi-CpG run on autocorrelated
+data, so `region_qvalue` and `significant` are withheld for the whole run rather
+than a fabricated q-value being reported. `eiger2 call` exits 1 in this
+situation; the exit code is not something to work around for this fixture.
 
 ---
 
@@ -306,7 +320,7 @@ q-values are not calibrated -- when it does not. This is what a CLI user hitting
 small test file, a targeted panel, or a single-chromosome subset now gets instead
 of a hard, uncatchable error (the gap flagged in an earlier release note, now
 fixed). `eiger2 call`'s startup output always reports the computed floor and the
-input's CpG count before the run, e.g. `region_null_mode='auto', input has 5,000
+input's CpG count before the run, e.g. `region_null_mode='auto', input has 50,000
 CpGs, member_step needs >= 103,000`.
 
 `member_step` (the resolved default on large-enough input) is what actually fixed

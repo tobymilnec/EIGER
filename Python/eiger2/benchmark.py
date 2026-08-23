@@ -43,7 +43,7 @@ def _layout_locations(
     n_cpg: int,
     *,
     seed: int,
-    layout_chrom: str,
+    layout_chrom: str | None,
     layout_profile: str,
     layout_offset: int | None,
 ) -> pd.DataFrame:
@@ -54,14 +54,20 @@ def _layout_locations(
     contiguous slice of real hg38 coordinates from the vendored fixture, at a varied
     offset per seed unless ``layout_offset`` is given explicitly -- a fixed offset
     would always sample the same (non-representative) stretch of the chromosome, see
-    ``benchmarking/layouts/README.md``. ``epic_fitted``: a generated targeted-panel
-    layout fitted to ``layout_profile``'s empirical gap/run-length/depth structure.
+    ``benchmarking/layouts/README.md``. ``layout_chrom=None`` (``wgbs_real`` only,
+    spec §2b.5): every chromosome in the fixture at once, each proportioned to its
+    own real share of ``n_cpg`` (not a single random offset slice of the
+    concatenated array, which would not reliably span more than one chromosome).
+    ``epic_fitted``: a generated targeted-panel layout fitted to ``layout_profile``'s
+    empirical gap/run-length/depth structure.
     """
 
     if layout == "dense":
-        return pd.DataFrame(
-            {"chr": "chr1", "start": np.arange(n_cpg) * 2, "end": np.arange(n_cpg) * 2 + 1}
-        )
+        return pd.DataFrame({
+            "chr": "chr1",
+            "start": np.arange(n_cpg) * 2,
+            "end": np.arange(n_cpg) * 2 + 1,
+        })
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
 
@@ -78,6 +84,29 @@ def _layout_locations(
                 f"{npz} not found -- layout='wgbs_real' needs a full repo checkout "
                 f"with the vendored fixture, not an installed wheel"
             )
+        if layout_chrom is None:
+            from benchmarking.layouts.layouts import wgbs_chromosome_sizes
+
+            sizes = wgbs_chromosome_sizes(npz)
+            total = sum(sizes.values())
+            rng = np.random.default_rng(seed)
+            names = list(sizes)
+            frames = []
+            allocated = 0
+            for i, name in enumerate(names):
+                if i == len(names) - 1:
+                    share = n_cpg - allocated  # remainder: exact total, no rounding gap
+                else:
+                    share = round(n_cpg * sizes[name] / total)
+                    allocated += share
+                share = max(1, min(share, sizes[name]))
+                max_offset = max(0, sizes[name] - share)
+                offset = int(rng.integers(0, max_offset + 1)) if max_offset else 0
+                chrom_locations, _depth = load_wgbs_layout(
+                    npz, chrom=name, n_cpg=share, offset=offset,
+                )
+                frames.append(chrom_locations)
+            return pd.concat(frames, ignore_index=True)
         if layout_offset is None:
             full, _ = load_wgbs_layout(npz, chrom=layout_chrom)
             max_offset = max(0, len(full) - n_cpg)
@@ -178,7 +207,7 @@ def simulate(
     seed: int = 4,
     layout: str = "dense",
     max_cpg_gap_bp: int | None = 300,
-    layout_chrom: str = "chr1",
+    layout_chrom: str | None = "chr1",
     layout_profile: str = "chr1",
     layout_offset: int | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, list[tuple[int, int, float, float, int, int]]]:
