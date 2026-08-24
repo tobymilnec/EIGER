@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eiger"
-version = "2.1.0"
+version = "2.2.0"
 description = "Label-free discovery of regionally coordinated DNA methylation, with a region-level empirical false discovery rate"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,7 +47,15 @@ include = ["eiger2*", "functions*"]
 testpaths = ["tests"]
 # old_code/tests covers the superseded beta and is run explicitly:
 #   pytest old_code/tests
-filterwarnings = ["ignore::RuntimeWarning"]
+filterwarnings = [
+    "error::RuntimeWarning",
+    # scipy's own internal advisory from stats.ttest_ind's variance calculation
+    # on near-identical samples (characterise_region's Welch's t-test on the
+    # minor/major split) -- not an eiger2 numerical bug, and scipy already
+    # states the result may be unreliable rather than silently returning a
+    # wrong one.
+    "ignore:Precision loss occurred in moment calculation:RuntimeWarning",
+]
 
 [tool.ruff]
 line-length = 88

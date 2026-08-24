@@ -19,12 +19,16 @@ def test_build_manifest_envelope_has_every_required_key():
         peak_memory_mb=42.0,
         warnings=[],
         fdr_decision="point",
+        git_worktree_dirty=True,
+        git_worktree_fingerprint_sha256="f" * 64,
     )
     for key in REQUIRED_MANIFEST_KEYS:
         assert key in envelope, key
-    assert envelope["schema_version"] == "2.1"
+    assert envelope["schema_version"] == "2.3"
     assert envelope["fdr_decision"] == "point"
     assert envelope["parent_run_id"] is None
+    assert envelope["git_worktree_dirty"] is True
+    assert envelope["git_worktree_fingerprint_sha256"] == "f" * 64
 
 
 def test_build_manifest_envelope_records_parent_run_when_given():

@@ -7,11 +7,12 @@ is not installed (see ``pyproject.toml``: only ``eiger2*``/``functions*`` ship).
 
 The benchmark-only loaders that need the large committed fixture files
 (``load_wgbs_layout``, ``generate_epic_layout``) stay in
-``benchmarking/layouts/layouts.py``, which re-exports the two functions below so there is
-exactly one implementation -- its own module docstring calls ``describe_layout`` "the
-same function the benchmark and the caller should both use". Eligibility here is computed
-via :func:`eiger2.core.eligible_edges` (not re-derived) so a layout diagnostic can never
-disagree with what the caller itself will use to build regions.
+``benchmarking/layouts/layouts.py``, which re-exports the two functions below so
+there is exactly one implementation -- its own module docstring calls
+``describe_layout`` "the same function the benchmark and the caller should both
+use". Eligibility here is computed via :func:`eiger2.core.eligible_edges` (not
+re-derived) so a layout diagnostic can never disagree with what the caller
+itself will use to build regions.
 """
 
 from __future__ import annotations
@@ -54,7 +55,9 @@ def realised_length_strata(layout_max_detectable_region_cpgs: int) -> tuple[str,
     )
 
 
-def _run_boundaries(locations: pd.DataFrame, max_cpg_gap_bp: int | None) -> tuple[np.ndarray, np.ndarray]:
+def _run_boundaries(
+    locations: pd.DataFrame, max_cpg_gap_bp: int | None
+) -> tuple[np.ndarray, np.ndarray]:
     """Shared scaffolding for both run-length and run-span views (edge-index space)."""
 
     eligible = eligible_edges(locations, Eiger2Config(max_cpg_gap_bp=max_cpg_gap_bp))
@@ -64,7 +67,9 @@ def _run_boundaries(locations: pd.DataFrame, max_cpg_gap_bp: int | None) -> tupl
     return starts, ends
 
 
-def eligible_run_lengths(locations: pd.DataFrame, max_cpg_gap_bp: int | None) -> np.ndarray:
+def eligible_run_lengths(
+    locations: pd.DataFrame, max_cpg_gap_bp: int | None
+) -> np.ndarray:
     """Length in EDGES of every maximal eligible run. Zero means an isolated CpG."""
 
     starts, ends = _run_boundaries(locations, max_cpg_gap_bp)
@@ -183,7 +188,9 @@ def describe_layout(
     out = {
         "layout_n_cpg": int(len(locations)),
         "layout_n_chromosomes": int(pd.unique(chrom).size),
-        "layout_eligible_fraction": float(eligible.mean()) if eligible.size else float("nan"),
+        "layout_eligible_fraction": (
+            float(eligible.mean()) if eligible.size else float("nan")
+        ),
         "layout_gap_quantiles_bp": {
             "q10": q(within, 0.10), "q50": q(within, 0.50),
             "q90": q(within, 0.90), "q99": q(within, 0.99),
@@ -192,7 +199,9 @@ def describe_layout(
             "n_runs": int(runs.size),
             "q10": q(runs, 0.10), "q50": q(runs, 0.50), "q90": q(runs, 0.90),
             "max": int(runs.max()) if runs.size else 0,
-            "fraction_under_3_edges": float(np.mean(runs < 3)) if runs.size else float("nan"),
+            "fraction_under_3_edges": (
+                float(np.mean(runs < 3)) if runs.size else float("nan")
+            ),
         },
         "layout_max_detectable_region_cpgs": int(runs.max()) + 1 if runs.size else 0,
     }

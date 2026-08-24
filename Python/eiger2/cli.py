@@ -62,11 +62,12 @@ import pandas as pd
 
 from . import __version__
 from .core import (
+    CALIBRATION_DIAGNOSTIC_NOTE,
     Eiger2Config,
     call_dmrs,
-    check_fdr_decision_vacuity,
+    chromosome_sort_permutation,
+    main_region_table,
     member_step_min_n_cpg,
-    qvalue_result_from_track,
 )
 from .manifest_utils import build_manifest_envelope
 
@@ -91,27 +92,76 @@ def _read_table(path: Path, **kwargs) -> pd.DataFrame:
     return pd.read_csv(path, sep=separator, **kwargs)
 
 
-def _checksum(path: Path, limit: int = 64 * 1024 * 1024) -> str:
+def _checksum(path: Path) -> str:
+    """SHA-256 of the whole file, truncated to 16 hex digits for display.
+
+    A prior version stopped after the first 64MB, so two inputs sharing that
+    prefix collided; every genome-scale beta matrix exceeds it. Hashing the
+    whole file is the honest option for a tool whose case rests on
+    reproducible manifests -- see spec §2a.6.
+    """
+
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
-        read = 0
         while chunk := handle.read(1 << 20):
             digest.update(chunk)
-            read += len(chunk)
-            if read >= limit:
-                digest.update(b"<truncated>")
-                break
     return digest.hexdigest()[:16]
 
 
 def _git_commit() -> str:
+    """Commit-only helper retained for lightweight benchmark manifests."""
+
     try:
         return subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2],
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
     except Exception:
         return "unknown"
+
+
+def _git_provenance() -> dict[str, str | bool | None]:
+    """Identify both HEAD and the exact dirty worktree used for a run.
+
+    ``git_commit`` alone is misleading when tracked source changes have not
+    been committed. The fingerprint covers Git's porcelain status (including
+    untracked path names) and the binary-safe tracked diff from HEAD. It does
+    not read untracked file contents, avoiding accidentally hashing large
+    generated cohort outputs while still making their presence visible in the
+    dirty state/fingerprint.
+    """
+
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        commit = _git_commit()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=repository, capture_output=True, check=True,
+        ).stdout
+        dirty = bool(status)
+        fingerprint = None
+        if dirty:
+            tracked_diff = subprocess.run(
+                ["git", "diff", "--binary", "HEAD", "--", "."],
+                cwd=repository, capture_output=True, check=True,
+            ).stdout
+            digest = hashlib.sha256()
+            digest.update(status)
+            digest.update(b"\0EIGER_TRACKED_DIFF\0")
+            digest.update(tracked_diff)
+            fingerprint = digest.hexdigest()
+        return {
+            "git_commit": commit,
+            "git_worktree_dirty": dirty,
+            "git_worktree_fingerprint_sha256": fingerprint,
+        }
+    except Exception:
+        return {
+            "git_commit": "unknown",
+            "git_worktree_dirty": None,
+            "git_worktree_fingerprint_sha256": None,
+        }
 
 
 def _peak_memory_mb() -> float:
@@ -201,8 +251,8 @@ def load_matrix_file(
             f"{path} contains only coordinate columns; no sample columns were "
             f"found. Columns: {list(frame.columns)}"
         )
-    matrix = frame[sample_columns].to_numpy(dtype=np.float32)
-    return matrix.astype(np.float64, copy=False), locations, [
+    matrix = frame[sample_columns].to_numpy(dtype=np.float64)
+    return matrix, locations, [
         str(c) for c in sample_columns
     ]
 
@@ -236,7 +286,7 @@ def load_inputs(
             f"{len(locations)}; they must correspond row for row."
         )
 
-    matrix = betas.to_numpy(dtype=np.float32).astype(np.float64, copy=False)
+    matrix = betas.to_numpy(dtype=np.float64)
     return _validate(matrix, locations, [str(c) for c in betas.columns])
 
 
@@ -249,15 +299,13 @@ def _validate(
             f"range from {np.nanmin(matrix):.3f} to {np.nanmax(matrix):.3f}. "
             "Percentages should be divided by 100."
         )
-    order = np.lexsort(
-        (locations["start"].to_numpy(), locations["chr"].to_numpy())
-    )
-    if not np.array_equal(order, np.arange(len(locations))):
-        raise SystemExit(
-            "Coordinates must be sorted by chromosome then start position; "
-            "EIGER segments along the row order of the matrix. Sort both the "
-            "matrix and the coordinates together before running."
-        )
+    # No longer rejects input that isn't pre-sorted (spec §2b prerequisite):
+    # the previous check sorted by chromosome as a STRING
+    # (np.lexsort(...chr...)), so natural order (chr1, chr2, ..., chr10)
+    # failed it -- confirmed on the repo's own real hg38 fixture
+    # (chr1, chr7, chr19). Both callers (call_dmrs, run_legacy) now group by
+    # chromosome in canonical order and sort ascending within each
+    # chromosome themselves, so any input order is accepted here.
     return matrix, locations[["chr", "start", "end"]], samples
 
 
@@ -283,11 +331,35 @@ def run_legacy(
 ) -> tuple[pd.DataFrame, dict]:
     """The originally published caller, invoked from ``processing.py``.
 
-    With ``fdr_replicates > 0`` a region-level empirical false discovery rate is
-    attached by permuting the caller's own covariance track. Discovery is
-    untouched: the regions are exactly those the published method reports, and
-    the q-value is an annotation on them.
+    ``fdr_replicates > 0`` is not supported: the permutation null it would
+    annotate with (``qvalue_result_from_track``) always raises, since it
+    depends on ``permutation_null_tracks``, which was retired. Fails fast,
+    before running discovery, rather than letting the run fail partway
+    through on data-dependent timing (whether any block happened to be
+    found). Discovery itself (``fdr_replicates=0``, the default) is
+    untouched: the regions are exactly those the published method reports.
     """
+
+    if fdr_replicates > 0:
+        print(
+            "[eiger2] error: --legacy --fdr-replicates is not supported -- "
+            "the permutation null it depended on was retired (see "
+            "qvalue_result_from_track's docstring for the reason). Drop "
+            "--legacy for a calibrated region_qvalue via the revised "
+            "caller, or omit --fdr-replicates to run --legacy for "
+            "discovery only.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    # Spec §2b prerequisite: group by chromosome in canonical order, sort
+    # ascending within each chromosome, regardless of the order the caller
+    # presented rows in -- the published method (below) infers genomic
+    # proximity from row-index proximity the same way the revised caller's
+    # own null construction does, so it depends on this too.
+    permutation, chromosome_order = chromosome_sort_permutation(locations)
+    matrix = matrix[permutation]
+    locations = locations.iloc[permutation].reset_index(drop=True)
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from functions import processing as original
@@ -306,31 +378,10 @@ def run_legacy(
         statistic, DMR_length_threshold=min_cpgs, cov_threshold=cov_threshold
     )
 
+    # fdr_replicates > 0 already exited above; region_qvalue is always
+    # unavailable through this caller now.
     fdr_result, fdr_diagnostics = None, None
-    if fdr_replicates > 0 and len(blocks):
-        chrom = locations["chr"].to_numpy()[: statistic.size]
-        fdr_result, fdr_diagnostics = qvalue_result_from_track(
-            statistic, np.asarray(blocks, dtype=int), cov_threshold,
-            eligible=np.isfinite(statistic), chromosome=chrom,
-            min_cpgs=min_cpgs, max_gap_edges=0,
-            replicates=fdr_replicates, seed=seed,
-        )
-        if fdr_decision == "upper":
-            # Spec §1.8 frames this guard as running "before computing
-            # regions"; it actually runs here, after qvalue_result_from_track,
-            # because `scale` and `m_bonferroni` (both required by the guard)
-            # aren't known until that call completes. This is intentional:
-            # the guard still fires before any region is reported to the
-            # user as significant, which is the actual intent behind the
-            # spec's wording (never silently return zero significant
-            # regions).
-            check_fdr_decision_vacuity(
-                fdr_result,
-                scale=fdr_diagnostics.get("scale", 0.0),
-                current_replicates=fdr_replicates,
-                target_fdr=target_fdr,
-            )
-    qvalues = fdr_result.qvalue if fdr_result is not None else None
+    qvalues = None
 
     meta = np.full((matrix.shape[1], 5), "NA", dtype=object)
     rows = []
@@ -416,14 +467,9 @@ def run_legacy(
         frame["passes_prevalence"] = (
             frame["minority_size_descriptive"] >= min_prevalence
         )
-        if qvalues is not None:
-            decision_series = (
-                frame["region_qvalue_upper_95"] if fdr_decision == "upper"
-                else frame["region_qvalue"]
-            )
-            frame["significant"] = (
-                (decision_series <= target_fdr) & frame["passes_prevalence"]
-            )
+        # No "significant" column: qvalues is always None through this
+        # caller now (fdr_replicates > 0 already exited above), so there is
+        # never a decision to report one from.
     manifest = {
         "caller": "legacy",
         "source": "Python/functions/processing.py",
@@ -434,7 +480,8 @@ def run_legacy(
         "n_blocks_before_effect_gate": len(blocks),
         "n_regions": len(frame),
         "fdr": fdr_diagnostics,
-        "schema_version": "2.1",
+        "chromosome_order": chromosome_order,
+        "schema_version": "2.3",
         "fdr_decision": fdr_decision,
         "note": (
             "Discovery is exactly the published method. Where --fdr-replicates "
@@ -530,7 +577,47 @@ def _resolve_inputs(args: argparse.Namespace):
     )
 
 
+def _format_structural_gate(name: str, gate: dict) -> str:
+    """One human-readable line per spec §2a.2 structural gate, naming its
+    measured value -- used by both the blocked CLI summary and its tests."""
+
+    if name == "surviving_null_tracks":
+        return (
+            f"surviving_null_tracks: {gate['surviving']}/{gate['null_replicates']} "
+            f"({gate['fraction']:.1%}) below the {gate['floor_fraction']:.0%} floor"
+        )
+    if name == "null_coverage":
+        return (
+            f"null_coverage: {gate['value']:.1%} below the {gate['floor']:.1%} floor"
+        )
+    if name == "null_construction":
+        return (
+            f"null_construction: {gate['value']} pooled null values below the "
+            f"{gate['floor']} floor"
+        )
+    if name == "numerical_failure":
+        return f"numerical_failure: {gate.get('error')}"
+    if name in {"chromosome_exposure", "region_null_chromosome_exposure"}:
+        label = (
+            "member-step region-null chromosome exposure"
+            if name == "region_null_chromosome_exposure"
+            else "edge-null chromosome exposure"
+        )
+        return (
+            f"{label}: {gate['missing_exposure']:.1%} of eligible "
+            f"edges have no feasible null lag (chromosomes: "
+            f"{', '.join(gate['infeasible_chromosomes'])}), above the "
+            f"{gate['floor']:.1%} floor"
+        )
+    return f"{name}: {gate}"
+
+
 def command_call(args: argparse.Namespace) -> int:
+    # Capture provenance before creating/writing the output directory so an
+    # in-repository output path cannot make an otherwise clean implementation
+    # appear dirty, or contaminate the source-diff fingerprint with this run's
+    # own generated files.
+    git_provenance = _git_provenance()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     matrix, locations, samples, input_paths = _resolve_inputs(args)
@@ -593,7 +680,16 @@ def command_call(args: argparse.Namespace) -> int:
                 regions[column] = kept[regions[column].to_numpy(dtype=int)]
 
     _require_default_confidence_level(None if args.legacy else 0.95)
-    regions.to_csv(out / "regions.csv", index=False)
+    if args.legacy:
+        regions_for_output = regions
+    else:
+        support_diagnostics = regions.attrs.get("region_support_diagnostics")
+        regions_for_output = main_region_table(regions)
+        if support_diagnostics is not None:
+            support_diagnostics.to_csv(
+                out / "region_support_diagnostics.csv", index=False
+            )
+    regions_for_output.to_csv(out / "regions.csv", index=False)
     if len(values):
         values.to_csv(out / "region_sample_means.csv", index=False)
 
@@ -617,32 +713,31 @@ def command_call(args: argparse.Namespace) -> int:
             f"back, or --region-null-mode off to skip region_qvalue entirely."
         )
     fdr_diag = caller_manifest.get("fdr") or {}
-    if fdr_diag.get("null_count_overdispersion_warning"):
-        ratio = fdr_diag["null_count_overdispersion_warning"]
-        warnings_list.append(
-            f"pooled null region counts are overdispersed (variance/mean="
-            f"{ratio:.2f})"
+    # Spec §2c: null-opportunity adequacy is a per-LENGTH-stratum check now,
+    # not a single aggregate one -- a refused stratum's rows are suppressed,
+    # every other stratum reports normally (run status `partial_inference`,
+    # not `inference_unreliable`). A per-stratum empty-but-ADEQUATE pool is a
+    # separate, non-refusing case reported in zero_exceedance_strata below.
+    for entry in fdr_diag.get("insufficient_null_opportunity_strata") or []:
+        required = entry.get("required_null_opportunity")
+        region_null_mode = (caller_manifest.get("gates") or {}).get(
+            "region_null_mode"
         )
-    # Stage 1e Task 1 (master spec §8): the null-adequacy floor is now a single
-    # AGGREGATE check on the run as a whole (see region_fdr_result's
-    # docstring); a per-stratum empty pool is reported in
-    # zero_exceedance_strata, not refused, so it is an informational note here,
-    # not a "refused" warning.
-    fdr_status = fdr_diag.get("status")
-    if fdr_status == "aggregate null inadequate":
-        required = fdr_diag.get("replicates_required")
+        replicate_option = (
+            "--n-lag-draws"
+            if region_null_mode == "member_step" else "--null-replicates"
+        )
         required_note = (
-            f"; ~{required} replicates needed to reach the floor at the "
-            f"observed rate"
+            f"required {required:.1f}; increase {replicate_option} to add "
+            f"opportunity without weakening m_opportunity"
             if required is not None
-            else "; observed rate is zero, so no replicate count reaches "
-                 "the floor"
+            else "observed opportunity is zero, so no null volume clears it"
         )
         warnings_list.append(
-            f"region_qvalue refused for the whole run: "
-            f"{fdr_diag.get('pooled_null_regions')} pooled null regions across "
-            f"{fdr_diag.get('replicates')} replicates, below "
-            f"min_null_regions_for_fdr{required_note}"
+            f"stratum {entry['stratum']!r}: region_qvalue refused "
+            f"({entry['observed_regions']} observed regions, null opportunity "
+            f"{entry['null_opportunity']:.1f} vs. {required_note}, "
+            f"m_opportunity={entry['m_opportunity']})"
         )
     zero_exceedance_strata = fdr_diag.get("zero_exceedance_strata")
     if zero_exceedance_strata:
@@ -650,9 +745,27 @@ def command_call(args: argparse.Namespace) -> int:
             warnings_list.append(
                 f"stratum {entry['stratum']!r}: null pool is empty (0 pooled "
                 f"regions across {entry['replicates']} replicates) -- "
-                f"region_qvalue is reported at the finite K=0 Garwood bound, "
+                f"region_qvalue is reported with a finite positive K=0 "
+                f"replicate-cluster upper bound, "
                 f"not refused"
             )
+    for entry in fdr_diag.get("insufficient_cluster_replicates_strata") or []:
+        warnings_list.append(
+            f"stratum {entry['stratum']!r}: region_qvalue refused because "
+            f"{entry['clusters']} independent null clusters are below the "
+            f"fixed method minimum of {entry['minimum_clusters']}"
+        )
+    for entry in fdr_diag.get("insufficient_scale_opportunity_strata") or []:
+        warnings_list.append(
+            f"stratum {entry['stratum']!r}: region_qvalue refused because "
+            f"its observed/null opportunity scale is unavailable"
+        )
+    fallback_scale_strata = fdr_diag.get("fdr_scale_fallback_strata") or []
+    if fallback_scale_strata:
+        warnings_list.append(
+            "global edge scaling retained for FDR stratum/strata without "
+            f"measured matching opportunity: {fallback_scale_strata}"
+        )
     collapsed_strata = caller_manifest.get("layout", {}).get(
         "collapsed_length_strata"
     )
@@ -670,9 +783,10 @@ def command_call(args: argparse.Namespace) -> int:
             if not (np.isfinite(d) and abs(d) <= acf_gate_result["tolerance"])
         ]
         warnings_list.append(
-            f"Gate 1 (ACF match, master spec §6.2) failed at lag(s) {bad_lags} "
+            f"ACF calibration diagnostic differed at lag(s) {bad_lags} "
             f"of {acf_gate_result['lags']}: null autocorrelation does not match "
-            f"observed within {acf_gate_result['tolerance']}"
+            f"observed within {acf_gate_result['tolerance']}; this is not a "
+            f"hard gate on a signal-rich cohort"
         )
     region_exch = caller_manifest.get("gates", {}).get("region_exchangeability")
     if region_exch is not None:
@@ -690,22 +804,34 @@ def command_call(args: argparse.Namespace) -> int:
     # RNGs from `random_seed` via fixed, documented additive offsets rather
     # than by drawing a fresh independent seed per replicate: `null_tracks`
     # (the fixed-window "lag" null, core.py) uses `random_seed + 977`, and
-    # `permutation_null_tracks` (used by both the "permutation" null_mode and
-    # unconditionally by the legacy caller's `qvalue_result_from_track`) uses
-    # `seed + 5209`. What is recorded below is that offset CONSTANT actually
-    # applied on this run -- not an enumerated list of per-replicate seeds,
-    # since replicates share one RNG stream seeded once from the offset
-    # rather than each having their own derived seed.
-    if args.legacy or _config_from_args(args).null_mode == "permutation":
+    # `permutation_null_tracks` uses `seed + 5209`. What is recorded below is
+    # that offset CONSTANT actually applied on this run -- not an enumerated
+    # list of per-replicate seeds, since replicates share one RNG stream
+    # seeded once from the offset rather than each having their own derived
+    # seed. The legacy caller no longer touches any RNG at all:
+    # `fdr_replicates > 0`, the only path that used to reach
+    # `permutation_null_tracks` via `qvalue_result_from_track`, now exits
+    # before discovery runs -- see `run_legacy`'s docstring.
+    if args.legacy:
+        derived_seeds = {}
+    elif _config_from_args(args).null_mode == "permutation":
         derived_seeds = {"permutation_null_track_offset": 5209}
     else:
         derived_seeds = {"lag_null_track_offset": 977}
+        if (caller_manifest.get("gates") or {}).get(
+            "region_null_mode"
+        ) == "member_step":
+            derived_seeds["member_step_lag_draw_offset"] = 61_093
 
     envelope = build_manifest_envelope(
         config_dict=(
             _config_from_args(args).to_dict() if not args.legacy else {}
         ),
-        git_commit=_git_commit(),
+        git_commit=str(git_provenance["git_commit"]),
+        git_worktree_dirty=git_provenance["git_worktree_dirty"],
+        git_worktree_fingerprint_sha256=git_provenance[
+            "git_worktree_fingerprint_sha256"
+        ],
         input_checksums={
             str(p): _checksum(p) for p in input_paths
         },
@@ -756,6 +882,25 @@ def command_call(args: argparse.Namespace) -> int:
         print(f"[eiger2] significant: {significant} at q <= {args.target_fdr}")
     else:
         print("[eiger2] significant: n/a (legacy defines no error rate)")
+    run_status = caller_manifest.get("status")
+    if run_status:
+        print(f"[eiger2] status      : {run_status}")
+    if run_status == "ok_with_warnings":
+        print(
+            f"[eiger2] NOTE: {CALIBRATION_DIAGNOSTIC_NOTE}\n"
+            f"         See the individual gate warnings below for the "
+            f"measured values.",
+            file=sys.stderr,
+        )
+    elif run_status == "partial_inference":
+        print(
+            "[eiger2] NOTE: one or more length strata lacked enough null "
+            "opportunity to report region_qvalue (spec §2c). Those strata's "
+            "rows are refused (NaN / pd.NA); every other stratum reports "
+            "normally -- the null is otherwise sound. See the WARNING(s) "
+            "below for which stratum/strata and why.",
+            file=sys.stderr,
+        )
     # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
     # "auto" fell back to "lag" -- loud and immediate, not buried only in the
     # manifest (STOP 1e §5 flagged the previous behaviour, a hard uncatchable
@@ -774,39 +919,34 @@ def command_call(args: argparse.Namespace) -> int:
             f"region_qvalue entirely.",
             file=sys.stderr,
         )
-    overdispersion_ratio = (caller_manifest.get("fdr") or {}).get(
-        "null_count_overdispersion_warning"
-    )
-    if overdispersion_ratio is not None:
-        print(
-            f"[eiger2] WARNING: pooled null region counts are overdispersed\n"
-            f"         (variance/mean = {overdispersion_ratio:.2f}, Poisson assumes "
-            f"1.0).\n"
-            f"         region_qvalue_upper_95 is a LOWER BOUND on the true "
-            f"uncertainty.",
-            file=sys.stderr,
-        )
-    # Stage 1e Task 1 (master spec §8): a single AGGREGATE null-adequacy
-    # refusal for the whole run, not a per-stratum one -- see
-    # region_fdr_result's docstring.
+    # Spec §2c: per-LENGTH-stratum null-opportunity refusal -- that stratum's
+    # rows only, not the whole run (see region_fdr_result's docstring).
     fdr_diag = caller_manifest.get("fdr") or {}
-    if fdr_diag.get("status") == "aggregate null inadequate":
-        required = fdr_diag.get("replicates_required")
+    for entry in fdr_diag.get("insufficient_null_opportunity_strata") or []:
+        required = entry.get("required_null_opportunity")
+        region_null_mode = (caller_manifest.get("gates") or {}).get(
+            "region_null_mode"
+        )
+        replicate_option = (
+            "--n-lag-draws"
+            if region_null_mode == "member_step" else "--null-replicates"
+        )
         required_note = (
-            f"raise --null-replicates to at least {required} to clear the "
-            f"floor at the observed rate."
+            f"required {required:.1f} at m_opportunity={entry['m_opportunity']}; "
+            f"increase {replicate_option} to add null opportunity without "
+            f"weakening the adequacy criterion."
             if required is not None
-            else "the observed rate is zero, so no replicate count reaches "
-                 "the floor at these parameters."
+            else "observed opportunity for this stratum is zero, so no null "
+                 "volume clears it."
         )
         print(
-            f"[eiger2] WARNING: too few pooled null regions to report "
-            f"region_qvalue\n"
-            f"         ({fdr_diag.get('pooled_null_regions')} across "
-            f"{fdr_diag.get('replicates')} replicates, below "
-            f"min_null_regions_for_fdr).\n"
+            f"[eiger2] WARNING: stratum {entry['stratum']!r} lacked enough null "
+            f"opportunity to report region_qvalue\n"
+            f"         ({entry['observed_regions']} observed regions, null "
+            f"opportunity {entry['null_opportunity']:.1f}).\n"
             f"         region_qvalue, its bounds, and significant are refused "
-            f"(NaN / False) for the whole run, not a fabricated zero.\n"
+            f"(NaN / pd.NA) for this stratum only -- every other stratum "
+            f"reports normally.\n"
             f"         {required_note}",
             file=sys.stderr,
         )
@@ -814,9 +954,35 @@ def command_call(args: argparse.Namespace) -> int:
         print(
             f"[eiger2] NOTE: stratum {entry['stratum']!r} has an empty pooled "
             f"null (0 across {entry['replicates']} replicates)\n"
-            f"         -- region_qvalue is reported at the finite K=0 Garwood "
-            f"bound for this stratum, not refused: the null had real "
-            f"opportunity and never produced a region this long.",
+            f"         -- region_qvalue point estimate is zero, while the "
+            f"replicate-cluster upper bound remains finite and positive.\n"
+            f"         The null had real opportunity and never produced a "
+            f"region this long; zero is not treated as zero uncertainty.",
+            file=sys.stderr,
+        )
+    for entry in fdr_diag.get("insufficient_cluster_replicates_strata") or []:
+        print(
+            f"[eiger2] WARNING: stratum {entry['stratum']!r} has only "
+            f"{entry['clusters']} independent null realisations\n"
+            f"         (minimum {entry['minimum_clusters']}) -- region_qvalue, "
+            f"its bounds, and significant are refused for this stratum.",
+            file=sys.stderr,
+        )
+    for entry in fdr_diag.get("insufficient_scale_opportunity_strata") or []:
+        print(
+            f"[eiger2] WARNING: stratum {entry['stratum']!r} has no valid "
+            f"observed/null opportunity scale\n"
+            f"         -- region_qvalue, its bounds, and significant are "
+            f"refused for this stratum.",
+            file=sys.stderr,
+        )
+    fallback_scale_strata = fdr_diag.get("fdr_scale_fallback_strata") or []
+    if fallback_scale_strata:
+        print(
+            "[eiger2] WARNING: matching opportunity was unavailable for FDR "
+            f"stratum/strata {fallback_scale_strata}\n"
+            "         -- the explicitly recorded global-edge fallback was used; "
+            "joint support-bin strata are not claimed to be opportunity-scaled.",
             file=sys.stderr,
         )
     collapsed_strata = (caller_manifest.get("layout") or {}).get(
@@ -844,11 +1010,12 @@ def command_call(args: argparse.Namespace) -> int:
             )
         ]
         print(
-            f"[eiger2] WARNING: Gate 1 (ACF match, master spec §6.2) failed\n"
+            f"[eiger2] WARNING: ACF calibration diagnostic differs\n"
             f"         null autocorrelation does not match the observed track's "
             f"within {tolerance} at lag(s) {bad_lags} of {acf_gate_result['lags']}.\n"
-            f"         Expected on current code at every layout (master spec §6.3 "
-            f"baseline); see manifest['gates']['acf'].",
+            f"         This is descriptive on a signal-rich cohort, where real "
+            f"coordination raises observed ACF; establish calibration on DMR-free "
+            f"controls/simulations. See manifest['gates']['acf'].",
             file=sys.stderr,
         )
     region_exch = (caller_manifest.get("gates") or {}).get("region_exchangeability")
@@ -888,8 +1055,37 @@ def command_call(args: argparse.Namespace) -> int:
         if isinstance(caller_manifest.get("null"), dict) else None
     if warning:
         print(f"[eiger2] WARNING    : {warning}")
+
+    # Spec §2a.4: fail closed on a global structural gate failure -- named,
+    # with its measured value, not just a status string buried in the
+    # manifest.
+    status = caller_manifest.get("status")
+    if status == "inference_unreliable":
+        structural = (caller_manifest.get("gates") or {}).get("structural") or {}
+        failed = {
+            name: g for name, g in structural.items() if not g.get("passed", True)
+        }
+        print(
+            "[eiger2] BLOCKED    : inference_unreliable -- the null is invalid "
+            "as a whole.\n"
+            "         region_qvalue, its bounds, and significant are refused "
+            "(NaN / pd.NA) for the whole run;\n"
+            "         candidates and descriptive columns are still written.",
+            file=sys.stderr,
+        )
+        for name, gate in failed.items():
+            print(f"         - {_format_structural_gate(name, gate)}", file=sys.stderr)
+        if not failed:
+            # region_fdr_result's own global refusal (e.g. no null replicates
+            # available at all), not one of the named structural gates above.
+            print(
+                f"         - {fdr_diag.get('status', 'null construction invalid')} "
+                f"(region_fdr_result diagnostics; see manifest['fdr'])",
+                file=sys.stderr,
+            )
+
     print(f"[eiger2] written to : {out}")
-    return 0
+    return 1 if status == "inference_unreliable" else 0
 
 
 def _overlap_summary(
@@ -971,10 +1167,25 @@ def command_compare(args: argparse.Namespace) -> int:
             raise SystemExit("supply both --regions-a and --regions-b")
         a = pd.read_csv(args.regions_a)
         b = pd.read_csv(args.regions_b)
-        if "significant" in a.columns and a["significant"].notna().any():
-            a = a[a["significant"].astype(bool)]
-        if "significant" in b.columns and b["significant"].notna().any():
-            b = b[b["significant"].astype(bool)]
+        # Not a `.notna().any()` guard: that only checked whether ANY row
+        # was available, not every row, so a frame mixing available and
+        # unavailable rows (e.g. a partial_inference run refusing one length
+        # stratum while reporting the rest -- see docs/FDR.md §14) passed
+        # the guard and then raised on `.astype(bool)`, which cannot convert
+        # the unavailable rows' `pd.NA`. Latent today (spec §2a's
+        # suppression is always whole-run, never a mix within one CSV) but
+        # reachable as soon as a per-stratum refusal exists.
+        # `.astype("boolean")` first because a plain `pd.read_csv` reads the
+        # nullable-boolean column back as `object` (mixed Python
+        # True/False/NaN, not pandas `BooleanDtype` -- the same round-trip
+        # point docs/FDR.md §14.4 documents), and `.fillna` on `object`
+        # dtype warns about an implicit downcast. Rows with inference
+        # unavailable are excluded from the "significant" subset, the same
+        # as `False` -- neither compared caller ever reported them as a hit.
+        if "significant" in a.columns:
+            a = a[a["significant"].astype("boolean").fillna(False).astype(bool)]
+        if "significant" in b.columns:
+            b = b[b["significant"].astype("boolean").fillna(False).astype(bool)]
         summary = _overlap_summary(a, b, args.label_a, args.label_b)
         summary.to_csv(out / "comparison_summary.csv", index=False)
         print(summary.round(4).to_string(index=False))
@@ -1084,6 +1295,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--null-replicates", dest="null_replicates", type=int,
                        default=None, help="null tracks (default 100; use "
                                           "200-300 with --compute-posterior)")
+        p.add_argument("--n-lag-draws", dest="n_lag_draws", type=int,
+                       default=None,
+                       help="member-step region-null replicates (default 75); "
+                            "increase this when a member-step run reports "
+                            "insufficient per-stratum null opportunity")
         p.add_argument("--null-min-lag", dest="null_min_lag", type=int,
                        default=None)
         p.add_argument("--target-fdr", dest="target_fdr", type=float,
@@ -1102,8 +1318,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="region-level null behind region_qvalue (distinct "
                             "from --null-mode above). Default (unset here) is "
                             "'auto': use 'member_step' when the input clears "
-                            "its genome-scale minimum size (about 103,000 "
-                            "CpGs at defaults), else fall back to 'lag' "
+                            "its min_cpgs-derived absolute floor (7,000 CpGs "
+                            "at defaults; 103,000 is preferred, with measured "
+                            "short-subtrack fallback below it), else fall back "
+                            "to 'lag' "
                             "automatically with a warning. Pass 'member_step' "
                             "explicitly to raise instead of falling back; "
                             "'lag' for small inputs or reproducing historical "
@@ -1124,6 +1342,16 @@ def build_parser() -> argparse.ArgumentParser:
                             "target-fdr. 'upper': significant iff "
                             "region_qvalue_upper_95 <= target-fdr -- the "
                             "conservative decision under finite-null uncertainty.")
+        p.add_argument(
+            "--biological-support-policy",
+            dest="biological_support_policy",
+            choices=["off", "five_class_v1"],
+            default=None,
+            help="optional post-selection five-class biological support layer. "
+                 "Default 'off' preserves discovery runtime; 'five_class_v1' "
+                 "writes one biological_class plus a separate diagnostics "
+                 "CSV and never changes the FDR.",
+        )
         p.add_argument("--min-prevalence-samples", dest="min_prevalence_samples",
                        type=int, default=None,
                        help="require at least this many samples to carry the "
@@ -1131,9 +1359,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "produces real coordination but is not a DMR; try 3.")
         p.add_argument("--fdr-replicates", dest="fdr_replicates", type=int,
                        default=0,
-                       help="legacy only: attach a permutation q-value using "
-                            "this many null replicates (e.g. 50). Discovery is "
-                            "unchanged.")
+                       help="legacy only: NOT CURRENTLY SUPPORTED (any value "
+                            "> 0 exits with an error naming the reason). Was "
+                            "meant to attach a permutation q-value; the "
+                            "permutation null it depended on was retired.")
         p.add_argument("--random-seed", dest="random_seed", type=int, default=1)
         p.add_argument("--compute-posterior", dest="compute_posterior",
                        action="store_true",

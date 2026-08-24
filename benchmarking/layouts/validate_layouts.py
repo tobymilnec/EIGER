@@ -5,10 +5,13 @@ Run after ``fit_epic_layout.py``. Writes VALIDATION.md and exits non-zero if any
 metric misses the 10% tolerance the Stage 1d spec sets.
 """
 from __future__ import annotations
-import json, sys
+
+import json
+import sys
 from pathlib import Path
-import numpy as np
+
 import layouts
+import numpy as np
 
 TOL = 0.10
 params = json.loads(Path("epic_layout_params.json").read_text())

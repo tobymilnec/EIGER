@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -40,18 +40,25 @@ import pandas as pd
 from scipy.stats import chi2
 
 __all__ = [
+    "CANONICAL_CHROMOSOMES",
     "Eiger2Config",
     "call_dmrs",
+    "canonical_chromosome_order",
     "centre_cpgs",
     "characterise_region",
+    "chromosome_lag_feasibility",
+    "chromosome_sort_permutation",
     "deflate",
     "edge_statistic",
     "estimate_latent_basis",
+    "member_step_chromosome_feasibility",
     "null_threshold",
     "permutation_null_tracks",
-    "qvalues_from_track",
     "region_fdr",
     "region_minority_size",
+    "biological_support_diagnostics",
+    "classify_biological_support",
+    "main_region_table",
     "segment",
 ]
 
@@ -60,6 +67,17 @@ __all__ = [
 # configuration
 # --------------------------------------------------------------------------
 
+
+# Spec §2a.3: the label attached to every calibration diagnostic (ACF match,
+# region/edge exchangeability, overdispersion) -- confounded with genuine
+# signal on real data, so none of them suppress inference; see docs/FDR.md
+# §14.1. Shared with cli.py so the wording has one source.
+CALIBRATION_DIAGNOSTIC_NOTE = (
+    "Calibration diagnostic. Valid as a hard criterion only on data known to "
+    "be null. On a cohort containing genuine coordinated regions these "
+    "ratios are expected to exceed 1, and a high value is not by itself "
+    "evidence of a broken null."
+)
 
 _DEFAULT_SUPPORT_DISPERSION_CUT = 0.5
 # Measured across standard benchmark scenarios: with no missingness, support
@@ -150,10 +168,14 @@ class Eiger2Config:
 
     # --- null calibration
     null_replicates: int = 100
-    """Null tracks pooled for the region FDR. At B=20 the strongest region's
-    q-value is either exactly 0 or >= 0.05 (resolution = s/1, and s ~ 0.05 at this
-    replicate count) -- no resolution at a 0.05 decision boundary. B=100 gives
-    resolution ~0.01 and an R=1 upper_95 bound around 0.078; see docs/FDR.md."""
+    """Independent genome-wide null realisations pooled for the region FDR.
+
+    They are also the cluster units for the quasi-Poisson uncertainty band, so
+    increasing this value improves both empirical resolution and precision.
+    Whether an upper-bound decision can reach a target depends on the complete
+    observed cutoff curve (including its number of discoveries), not on an
+    artificial one-region denominator; see docs/FDR.md.
+    """
     null_quantile: float = 0.995
     null_min_lag: int = 1000
     """Minimum genomic separation, in retained CpG rows, between the CpGs paired
@@ -250,16 +272,17 @@ class Eiger2Config:
     """
 
     min_subtrack_length: int = 100
-    """``region_null_mode="member_step"`` only: the shortest sub-track length a
-    drawn lag is allowed to produce. Bounds the maximum lag drawable:
-    ``L_max = n_cpg // (min_subtrack_length + window - 1)``; lags are drawn
-    uniformly from ``[null_min_lag, L_max]``. Raises (naming ``n_cpg``,
-    ``null_min_lag``, and the implied minimum input size) rather than silently
-    degrading when ``L_max < null_min_lag`` -- a too-small floor produces
-    short sub-tracks and an inadequate null silently. Use
-    ``region_null_mode="lag"`` on inputs too small for ``"member_step"``, not
-    a smaller ``min_subtrack_length``: a shorter floor reintroduces the
-    segmentation edge effects it exists to prevent.
+    """``region_null_mode="member_step"`` only: the PREFERRED shortest
+    sub-track length. Chromosomes able to meet it draw lags from
+    ``[null_min_lag, n_cpg // (min_subtrack_length + window - 1)]``.
+
+    A chromosome that cannot meet this preferred floor is no longer discarded
+    wholesale. If it can still form the configured minimum detectable region,
+    it uses a measured short-subtrack fallback whose lower length is derived
+    from ``min_cpgs``. The existing per-length opportunity guard then decides
+    which strata received enough null exposure. Chromosomes unable to support
+    even ``min_cpgs`` positions at ``null_min_lag`` remain structurally
+    infeasible and are reported in the region-null exposure gate.
     """
 
     # --- segmentation
@@ -337,29 +360,61 @@ class Eiger2Config:
     fdr_decision: str = "point"
     """``"point"``: significant = region_qvalue <= target_fdr (unchanged from
     v2.0.0). ``"upper"``: significant = region_qvalue_upper_95 <= target_fdr, the
-    conservative decision under finite-null uncertainty. Never switches silently --
-    always read from the manifest's ``fdr_decision`` field.
+    conservative decision under the documented replicate-cluster quasi-Poisson
+    model for finite-null uncertainty. Never switches silently -- always read
+    from the manifest's ``fdr_decision`` field.
 
     Depends on ``min_null_regions_for_fdr`` being an aggregate (not
     per-stratum) check: a stratum whose own null pool is empty still gets a
-    finite ``K=0`` Garwood upper bound rather than being refused, which is
+    finite positive ``K=0`` cluster upper bound rather than being refused, which is
     what makes this mode usable rather than rejecting almost everything -- see
     ``docs/FDR.md``.
     """
 
+    biological_support_policy: str = "off"
+    """``off`` or the post-selection descriptive ``five_class_v1`` policy."""
+
     min_null_values: int = 1_000
-    """Warn below this many usable null positions.
+    """Warn below this many usable null positions, POOLED across the whole
+    run -- also the ``null_construction`` structural gate's hard floor on
+    that same pooled count (spec §2a.2: "too few pooled null values to
+    constitute a valid construction").
 
     The threshold is an upper quantile and needs a populated tail. At the
     default ``null_quantile`` of 0.995 this floor leaves at least five null
     values above the threshold, which is the minimum for it to mean anything.
     Genome-scale runs will exceed it by orders of magnitude; the floor exists to
-    catch small or heavily fragmented inputs, not to set a target."""
+    catch small or heavily fragmented inputs, not to set a target.
+
+    **Not** the support-bin collapse trigger -- see
+    ``min_null_values_per_support_bin``, a different (per-bin, not pooled)
+    quantity."""
+
+    min_null_values_per_support_bin: int = 1_000
+    """Merge support bins upward until every bin has at least this many
+    pooled null values (``_support_bin_edges``). Deliberately separate from
+    ``min_null_values`` above: that is a POOLED, run-level floor now also
+    backing a hard structural gate; this is a PER-BIN threshold purely about
+    when support stratification is too fragmented to estimate per bin.
+    Conflating the two meant a caller couldn't force bin collapse (by
+    raising the per-bin floor above what any bin could reach) without the
+    exact same value then failing the run outright as an inadequate pooled
+    null -- two different questions with two different honest floors."""
 
     min_null_coverage: float = 0.25
     """Warn when the chromosome-aware mask discards more than this fraction of
     offered null positions, which happens when ``null_min_lag`` approaches the
     length of a chromosome."""
+
+    max_missing_null_exposure: float = 0.05
+    """Structural gate floor (spec §2b.3) on ``missing_exposure`` -- the share
+    of this run's own eligible observed edges that sit on a chromosome with no
+    feasible locality-breaking lag (``chromosome_lag_feasibility``), and so
+    contribute no null volume in any replicate. Explicit and independently
+    tunable (not derived from ``min_null_coverage``, a different quantity: one
+    is about how much of the OFFERED null was usable, the other about how much
+    of the OBSERVED genome has no null representation at all) -- sweep this
+    value in the §2f grid to validate it, the same as any other floor here."""
 
     compute_posterior: bool = False
     """Attach the per-region two-groups evidence score, ``1 - fdr(area)``.
@@ -385,27 +440,38 @@ class Eiger2Config:
     """Refuse the posterior below this many pooled null regions."""
 
     min_null_regions_for_fdr: int = 50
-    """Refuse ``region_qvalue`` for the WHOLE run when the pooled null-region
-    count, summed across every stratum and every replicate, falls below this
-    floor. Below the floor, every inferential column (``region_qvalue`` and
-    friends) becomes ``NaN``, every count column becomes ``-1``,
-    ``significant`` is forced ``False``, and
-    ``manifest["fdr"]["pooled_null_regions"]`` records the total against the
-    floor.
+    """Refuse ``region_qvalue`` in :func:`region_exchangeability_gate` (a
+    structural gate) when the pooled null-region count falls below this
+    floor. **No longer used by** :func:`region_fdr_result` -- spec §2c
+    replaced that function's own AGGREGATE pooled-count floor with a
+    per-length-stratum null-OPPORTUNITY floor; see ``m_opportunity`` below.
+    The aggregate check this field used to drive there checked the wrong
+    quantity: a run could hold thousands of null regions in the short strata
+    while a long stratum's null never had the CHANCE to grow a region that
+    long, and every long observed region then received ``q=0`` from a null
+    that could never have contradicted it. That is what the audit found.
+    """
 
-    **This is an AGGREGATE, run-level guard, not a per-stratum one.** A
-    stratum whose OWN pooled null count is thin, or even exactly zero, is not
-    refused once the run as a whole is adequate -- it is let through the
-    estimator like any other stratum, and the Garwood interval it already
-    computes is what represents that thinness (a narrow pool gives a wide
-    ``region_qvalue_upper_95``, not an outright ``NaN``). A stratum whose OWN
-    pool is exactly empty gets ``K=0`` at every cutoff, which is
-    arithmetically well-defined (point estimate ``q=0``, a finite Garwood
-    upper bound) and is recorded, not refused, in
-    ``manifest["fdr"]["zero_exceedance_strata"]`` -- the null having millions
-    of opportunities and never producing a region that long is decisive
-    evidence, not missing information; see ``docs/FDR.md`` and
-    ``region_fdr_result``'s docstring for the arithmetic that justifies it.
+    m_opportunity: float = 10.0
+    """Per-length-stratum null-opportunity floor for :func:`region_fdr_result`
+    (spec §2c). For length stratum ``s`` with observed opportunity ``O_s``,
+    null opportunity ``N_s`` (both: sum over maximal eligible runs of
+    ``max(0, run_len - min_edges(s) + 1)``, observed and pooled-null
+    respectively) and ``R_s`` observed regions in that stratum, the stratum is
+    adequate iff ``N_s >= m_opportunity * O_s / R_s`` -- equivalently, the
+    null would have been expected to produce at least ``m_opportunity``
+    regions had the observed rate applied to it. Below the floor, that
+    stratum's rows (only that stratum's -- see
+    ``manifest["fdr"]["insufficient_null_opportunity_strata"]``) are refused
+    (``NaN`` / ``-1`` / ``significant = pd.NA``) and the run status becomes
+    ``partial_inference``, not ``inference_unreliable``: the null is sound,
+    it simply never had the chance to speak to regions this long.
+
+    ``0`` disables this adequacy multiplier, but does not invent an FDR scale:
+    ordinary length strata still require positive ``O_s`` and ``N_s`` for
+    ``scale_s=O_s/N_s``. Adequate ``K=0`` strata are reported via
+    ``zero_exceedance_strata``. ``10`` is a starting value -- sweep it in
+    the §2f grid and record the value that attains nominal coverage.
     """
 
     support_binned_threshold: str = "auto"
@@ -418,9 +484,9 @@ class Eiger2Config:
 
     support_bins: int = 4
     """Quantile bins for support-conditioned thresholding. Adjacent bins merge
-    upward if the pooled null has fewer than ``min_null_values`` values in a
-    bin; collapses to the unconditioned single threshold if merging cannot
-    satisfy every bin."""
+    upward if the pooled null has fewer than ``min_null_values_per_support_bin``
+    values in a bin; collapses to the unconditioned single threshold if
+    merging cannot satisfy every bin."""
 
     support_dispersion_cut: float | None = None
     """Auto-enable threshold for ``support_binned_threshold="auto"``. ``None``
@@ -450,6 +516,8 @@ class Eiger2Config:
             raise ValueError("min_paired_samples must be at least 3")
         if self.min_null_regions_for_fdr < 0:
             raise ValueError("min_null_regions_for_fdr cannot be negative")
+        if self.m_opportunity < 0:
+            raise ValueError("m_opportunity cannot be negative")
         if self.null_mode not in {"lag", "permutation"}:
             raise ValueError("null_mode must be 'lag' or 'permutation'")
         if self.null_mode == "permutation":
@@ -478,6 +546,10 @@ class Eiger2Config:
             raise ValueError("target_fdr must lie in (0, 1)")
         if self.fdr_decision not in {"point", "upper"}:
             raise ValueError("fdr_decision must be 'point' or 'upper'")
+        if self.biological_support_policy not in {"off", "five_class_v1"}:
+            raise ValueError(
+                "biological_support_policy must be 'off' or 'five_class_v1'"
+            )
         if self.support_binned_threshold not in {"auto", "on", "off"}:
             raise ValueError("support_binned_threshold must be 'auto', 'on', or 'off'")
         if self.support_bins < 2:
@@ -1137,49 +1209,252 @@ def _null_eligibility(
     return eligible
 
 
+def _chromosome_blocks(chromosome: np.ndarray) -> list[tuple[str, int, int]]:
+    """``(name, start, end)`` for each contiguous chromosome block in
+    ``chromosome`` (``end`` exclusive), in the order the blocks appear.
+
+    Assumes rows are already grouped by chromosome -- true after
+    :func:`chromosome_sort_permutation` (spec §2b prerequisite), which every
+    caller of this function runs first. A chromosome appearing twice,
+    non-contiguously, would silently split into two blocks here; nothing
+    re-validates that upstream guarantee at this point.
+    """
+
+    if chromosome.size == 0:
+        return []
+    boundaries = np.flatnonzero(chromosome[1:] != chromosome[:-1]) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [chromosome.size]))
+    return [
+        (str(chromosome[s]), int(s), int(e))
+        for s, e in zip(starts, ends, strict=True)
+    ]
+
+
+def chromosome_lag_feasibility(
+    locations: pd.DataFrame,
+    config: Eiger2Config,
+    *,
+    observed_eligible: np.ndarray | None = None,
+) -> dict[str, dict]:
+    """Per chromosome: whether a feasible locality-breaking lag exists, and
+    that chromosome's own share of eligible observed edges (spec §2b.1/§2b.3).
+
+    A chromosome admits a feasible lag only if ``l_max >= config.null_min_lag``,
+    where ``l_max = (n_c - 2) // (span - 1)`` -- the largest lag at which
+    :func:`_lag_null_track` still has at least 2 usable positions
+    (``usable = n_c - lag * (span - 1) >= 2``; matching the pre-§2b
+    genome-wide code's own ``largest = (n_rows - 2) // (span - 1)``
+    convention, not just ``n_c // (span - 1)``, which overestimates ``l_max``
+    by enough that a lag drawn at the reported boundary can still leave
+    ``usable < 2`` and silently produce an empty piece). The largest
+    chromosome(s) dominate a single genome-wide lag draw (spec §2b.1); this
+    measures feasibility PER chromosome instead, the basis both for
+    :func:`null_tracks`'s per-chromosome construction (§2b.2) and for the
+    missing-exposure diagnostic an infeasible chromosome is reported under
+    (§2b.3), rather than excluding it behind a fixed, arbitrary threshold.
+
+    ``observed_eligible`` lets a caller that already computed
+    ``eligible_edges(locations, config)`` pass it straight through instead
+    of this function recomputing it.
+    """
+
+    chromosome = locations["chr"].to_numpy()
+    if observed_eligible is None:
+        observed_eligible = eligible_edges(locations, config)
+    span = max(config.window, 2)
+    result: dict[str, dict] = {}
+    for name, start, end in _chromosome_blocks(chromosome):
+        n_c = end - start
+        l_max = max(n_c - 2, 0) // max(span - 1, 1)
+        # observed_eligible is edge-indexed (one shorter than CpG-indexed):
+        # this chromosome's OWN internal edges are entries start..end-2; the
+        # boundary edge at end-1 (into the NEXT chromosome, if any) belongs
+        # to neither block and is correctly excluded by the end-1 stop.
+        edges = int(observed_eligible[start : max(end - 1, start)].sum())
+        result[name] = {
+            "n_cpg": int(n_c),
+            "l_max": int(l_max),
+            "feasible": bool(l_max >= config.null_min_lag),
+            "eligible_observed_edges": edges,
+        }
+    return result
+
+
+def member_step_chromosome_feasibility(
+    locations: pd.DataFrame,
+    config: Eiger2Config,
+    *,
+    observed_eligible: np.ndarray | None = None,
+) -> dict[str, dict]:
+    """Per-chromosome feasibility and observed-edge exposure for the
+    member-step region null.
+
+    ``min_subtrack_length`` is preferred, not an all-or-nothing chromosome
+    floor.  When it cannot be met, a chromosome may still contribute through
+    a short-subtrack fallback down to ``min_cpgs`` positions -- exactly the
+    shortest track capable of carrying ``min_cpgs - 1`` passing edges after
+    the forced boundary break.  The per-length opportunity guard, rather than
+    this constructor, decides whether those shorter tracks provide enough
+    information for each reported length stratum.
+    """
+
+    chromosome = locations["chr"].to_numpy()
+    if observed_eligible is None:
+        observed_eligible = eligible_edges(locations, config)
+    result: dict[str, dict] = {}
+    for name, start, end in _chromosome_blocks(chromosome):
+        n_c = end - start
+        limits = _member_step_lag_limits(n_c, config)
+        edges = int(observed_eligible[start : max(end - 1, start)].sum())
+        result[name] = {
+            "n_cpg": int(n_c),
+            **limits,
+            "eligible_observed_edges": edges,
+        }
+    return result
+
+
+def _member_step_lag_limits(n_cpg: int, config: Eiger2Config) -> dict:
+    """Return the preferred/fallback member-step lag limits for one block.
+
+    A sub-track of ``t`` statistic positions needs ``lag * (t + window - 1)``
+    CpG rows under the member-step slicing convention.  ``t=min_cpgs`` is the
+    absolute construction floor: the last statistic position is made
+    ineligible to prevent cross-offset merging, leaving ``min_cpgs - 1``
+    consecutive passing edges, exactly enough for a ``min_cpgs`` region.
+    """
+
+    w = max(config.window, 1)
+    preferred_span = config.min_subtrack_length + w - 1
+    minimum_span = config.min_cpgs + w - 1
+    preferred_l_max = int(n_cpg // preferred_span)
+    fallback_l_max = int(n_cpg // minimum_span)
+    if preferred_l_max >= config.null_min_lag:
+        construction = "preferred"
+        l_max = preferred_l_max
+    elif fallback_l_max >= config.null_min_lag:
+        construction = "fallback"
+        l_max = fallback_l_max
+    else:
+        construction = "infeasible"
+        l_max = fallback_l_max
+    return {
+        "l_max": int(l_max),
+        "preferred_l_max": preferred_l_max,
+        "fallback_l_max": fallback_l_max,
+        "preferred_subtrack_length": int(config.min_subtrack_length),
+        "minimum_subtrack_length": int(config.min_cpgs),
+        "construction": construction,
+        "feasible": construction != "infeasible",
+    }
+
+
 def null_tracks(
     residuals: np.ndarray,
     config: Eiger2Config,
     locations: pd.DataFrame | None = None,
-) -> list[tuple[np.ndarray, np.ndarray, int]]:
+) -> list[tuple[np.ndarray, np.ndarray, list[tuple[str, int, int, int]]]]:
     """Statistic tracks under the locality-breaking null, one per replicate.
 
-    Returns ``(track, eligible, lag)`` triples. ``eligible`` restricts the null to
-    positions whose window members (a) share a chromosome and (b) each sit at a
-    locally gap-eligible position -- the same ``eligible_edges()`` rule the
-    observed track is held to, applied to every member except across the
-    intentional long lag itself. ``lag`` is that replicate's own draw, needed
-    by the support-conditioned threshold to reconstruct the replicate's own
-    window-member set (mirroring ``_lag_null_track``'s construction) when
-    computing that replicate's own support. Passing ``locations=None``
-    disables BOTH restrictions and is retained only for single-chromosome use
-    and for tests.
+    Chromosome-aware (spec §2b.2): each replicate draws an INDEPENDENT
+    feasible lag per chromosome -- not one genome-wide lag applied
+    everywhere -- builds that chromosome's null segment from its own rows,
+    and concatenates every feasible chromosome's segment into one
+    genome-wide realisation, with the eligibility mask broken at every
+    concatenation seam so a window can never straddle two chromosomes'
+    segments. This preserves chromosome composition in every replicate:
+    each chromosome contributes null volume roughly in proportion to its own
+    share of eligible observed edges. A single genome-wide lag draw does not
+    -- it survives almost entirely on the largest chromosome(s), since a
+    lag large enough to be locality-breaking on the whole genome is rarely
+    small enough to fit inside a smaller one (spec §2b.1; the audited ICGC
+    run: 7 of 100 tracks survived, drawn almost entirely from the largest
+    chromosomes, though the observed track spans all of them).
+
+    Chromosomes with no feasible lag (``n_c // (span - 1) < null_min_lag``)
+    contribute nothing to the null in any replicate; their exposure is
+    measured separately by :func:`chromosome_lag_feasibility` (spec §2b.3),
+    not this function's concern.
+
+    Returns ``(track, eligible, segments)`` triples. ``segments`` is
+    ``[(chromosome, lag, start, length), ...]`` in concatenation order,
+    describing which slice of ``track``/``eligible`` came from which
+    chromosome, at what lag, and at what genome-wide row offset (``start``)
+    -- needed by the support-conditioned threshold to reconstruct each
+    segment's own window-member set (mirroring ``_lag_null_track``'s
+    construction) against ``deflated``'s genome-wide row indexing when
+    computing that segment's own support; a single scalar lag can no longer
+    describe a whole replicate now that one replicate spans multiple
+    chromosomes' own lags.
+
+    Passing ``locations=None`` treats every row as one chromosome (the
+    single-chromosome / genome-wide construction, unchanged) and is retained
+    for single-chromosome use and for tests that do not exercise chromosome
+    awareness at all.
     """
 
-    n_rows = residuals.shape[0]
     span = max(config.window, 2)
-    largest = max((n_rows - 2) // max(span - 1, 1), 2)
-    low = min(config.null_min_lag, max(2, largest // 4))
-    high = max(low + 1, largest)
-    chromosome = (
-        locations["chr"].to_numpy() if locations is not None else None
-    )
-    observed_eligible = (
-        eligible_edges(locations, config) if locations is not None else None
-    )
-    rng = np.random.default_rng(config.random_seed + 977)
-    tracks: list[tuple[np.ndarray, np.ndarray, int]] = []
-    for _ in range(config.null_replicates):
-        lag = int(rng.integers(low, high))
-        track = _lag_null_track(residuals, lag, config)
-        if not track.size:
-            continue
-        eligible = _null_eligibility(
-            chromosome, lag, config, track.size,
-            observed_eligible=observed_eligible,
+    if locations is None:
+        chromosome = np.full(residuals.shape[0], "", dtype=object)
+        l_max = max(residuals.shape[0] - 2, 0) // max(span - 1, 1)
+        feasibility = {
+            "": {
+                "n_cpg": residuals.shape[0],
+                "l_max": l_max,
+                "feasible": l_max >= config.null_min_lag,
+            }
+        }
+        observed_eligible = None
+    else:
+        chromosome = locations["chr"].to_numpy()
+        observed_eligible = eligible_edges(locations, config)
+        feasibility = chromosome_lag_feasibility(
+            locations, config, observed_eligible=observed_eligible,
         )
-        if eligible.any():
-            tracks.append((track, eligible, lag))
+
+    blocks = [
+        (name, start, end) for name, start, end in _chromosome_blocks(chromosome)
+        if feasibility[name]["feasible"]
+    ]
+    rng = np.random.default_rng(config.random_seed + 977)
+    tracks: list[tuple[np.ndarray, np.ndarray, list[tuple[str, int, int, int]]]] = []
+    for _ in range(config.null_replicates):
+        track_pieces: list[np.ndarray] = []
+        eligible_pieces: list[np.ndarray] = []
+        segments: list[tuple[str, int, int, int]] = []
+        for name, start, end in blocks:
+            l_max = feasibility[name]["l_max"]
+            lag = int(rng.integers(config.null_min_lag, l_max + 1))
+            piece = _lag_null_track(residuals[start:end], lag, config)
+            if not piece.size:
+                continue
+            observed_eligible_c = (
+                observed_eligible[start : max(end - 1, start)]
+                if observed_eligible is not None else None
+            )
+            piece_eligible = _null_eligibility(
+                None, lag, config, piece.size,
+                observed_eligible=observed_eligible_c,
+            )
+            if not piece_eligible.any():
+                continue
+            # Broken at the boundary, not left as `eligible_edges` would
+            # naturally leave it: a run must never cross from one
+            # chromosome's segment into the next's, even though both are
+            # individually eligible right up to their own last position --
+            # exactly `member_step_lag_null_ensemble`'s existing device for
+            # the same reason (concatenated offset sub-tracks).
+            piece_eligible = piece_eligible.copy()
+            piece_eligible[-1] = False
+            track_pieces.append(piece)
+            eligible_pieces.append(piece_eligible)
+            segments.append((name, lag, int(start), int(piece.size)))
+        if not track_pieces:
+            continue
+        tracks.append((
+            np.concatenate(track_pieces), np.concatenate(eligible_pieces), segments,
+        ))
     return tracks
 
 
@@ -1235,14 +1510,24 @@ def member_step_lag_null_tracks(
 
 
 def member_step_min_n_cpg(config: Eiger2Config) -> int:
-    """Minimum ``n_cpg`` for ``region_null_mode="member_step"`` to be buildable
-    at all: the smallest input at which ``L_max = n_cpg //
-    (min_subtrack_length + window - 1)`` still clears ``null_min_lag``. Shared
-    by ``member_step_lag_null_ensemble``'s raise and ``call_dmrs``'s
-    ``region_null_mode="auto"`` fallback check, so the two cannot drift apart.
+    """Minimum TOTAL ``n_cpg`` for ``region_null_mode="member_step"`` to be
+    worth attempting at all: the smallest input able to carry the configured
+    minimum detectable region at ``null_min_lag``. Shared by ``call_dmrs``'s
+    ``region_null_mode="auto"`` fallback check, so a cheap pre-check and the
+    real construction cannot silently drift apart in what "too small" means.
+
+    Deliberately genome-wide, not per-chromosome (spec §2b.4's own
+    construction IS per-chromosome): this is a cheap, approximate,
+    conservative pre-check on whether member_step is worth attempting at
+    all, run before any per-chromosome breakdown is available. The
+    authoritative, per-chromosome check is
+    ``member_step_lag_null_ensemble``'s own -- it raises when NO chromosome
+    individually clears the floor, which this function cannot detect (a
+    genome comfortably above this total could still have every individual
+    chromosome too small, if fragmented across many of them).
     """
 
-    span = config.min_subtrack_length + max(config.window, 1) - 1
+    span = config.min_cpgs + max(config.window, 1) - 1
     return config.null_min_lag * span
 
 
@@ -1250,74 +1535,137 @@ def member_step_lag_null_ensemble(
     residuals: np.ndarray,
     config: Eiger2Config,
     locations: pd.DataFrame | None = None,
-) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], list[int]]:
-    """The region-level null pool: ``config.n_lag_draws`` independent lag draws,
-    one ``(track, eligible, lag)`` triple per draw -- directly interchangeable
-    with ``null_tracks()``'s output everywhere it is consumed (``acf_gate``,
-    ``null_exchangeability``, ``_overdispersion_diagnostic``), with each lag
-    draw standing in for one "replicate" exactly as one ``"lag"``-construction
-    replicate does.
+) -> tuple[
+    list[tuple[np.ndarray, np.ndarray, list[tuple[str, int, int]]]],
+    list[list[tuple[str, int, int]]],
+]:
+    """The region-level null pool: ``config.n_lag_draws`` independent
+    replicates, directly interchangeable with ``null_tracks()``'s output
+    everywhere it is consumed (``acf_gate``, ``null_exchangeability``,
+    ``_overdispersion_diagnostic``), each replicate standing in for one
+    "replicate" exactly as one ``"lag"``-construction replicate does.
 
-    Each draw's members-share-``window - 1`` structure comes from
-    :func:`member_step_lag_null_tracks`, one sub-track per starting offset
-    ``i in [0, lag)``; concatenated into ONE array per lag, breaking the
-    eligible mask at every sub-track boundary so ``segment()`` can never
-    merge two unrelated offsets into one spurious region -- the same device
-    :func:`eligible_edges` uses to stop a region crossing a chromosome
-    boundary.
+    Chromosome-aware (spec §2b.4): the same audit as :func:`null_tracks`
+    (§2b.2) applies here -- ``L_max`` was derived from the genome-wide
+    ``n_cpg``, the same class of error (on hg38, ``L_max`` from the whole
+    genome survives on chr1 so this is not catastrophic there, but on a
+    300,000-row chromosome only lags below 100,000 -- about 35% of the
+    genome-wide draw range -- actually fit inside it). Each replicate now
+    draws an INDEPENDENT lag per feasible chromosome. The preferred ceiling is
+    ``n_c // (min_subtrack_length + window - 1)``. Chromosomes below that
+    preferred floor use a measured fallback ceiling of
+    ``n_c // (min_cpgs + window - 1)`` rather than disappearing entirely;
+    builds that
+    chromosome's own member-step sub-tracks (:func:`member_step_lag_null_tracks`,
+    one sub-track per starting offset ``i in [0, lag_c)``) from its own rows,
+    and concatenates every feasible chromosome's sub-tracks into one
+    genome-wide realisation, with the eligibility mask broken at every
+    sub-track boundary AND every chromosome boundary -- ``segment()`` can
+    then never merge two unrelated offsets, or two different chromosomes,
+    into one spurious region.
 
-    **Lag range**: drawn uniformly from ``[null_min_lag, L_max]`` where
-    ``L_max = n_cpg // (min_subtrack_length + window - 1)``. A narrow jitter
-    band near ``null_min_lag`` correlates nearby draws (lag 1006 and 1008
-    pair CpG ``i`` with ``i+1006`` and ``i+1008``, nearly the same
-    construction) and was rejected for that reason. At genome scale ``L_max``
-    is comfortably above ``null_min_lag``, so this wide range gives genuinely
-    different constructions per draw. Raises when ``L_max < null_min_lag``
-    rather than silently degrading to short sub-tracks.
+    Only a chromosome unable to support even ``min_cpgs`` positions at
+    ``null_min_lag`` contributes nothing. Its eligible observed-edge exposure
+    is measured separately by :func:`member_step_chromosome_feasibility` and
+    gated by :func:`call_dmrs`.
 
-    Returns ``(replicates, lags_used)`` -- ``lags_used`` is recorded in
-    ``manifest["gates"]`` on every run.
+    Raises when NO chromosome clears the floor, rather than silently
+    degrading to short sub-tracks.
+
+    Returns ``(replicates, lags)``. ``replicates`` is ``(track, eligible,
+    segments)`` triples, ``segments`` = ``[(chromosome, lag, n_subtracks),
+    ...]`` in concatenation order. ``lags`` has one entry per replicate,
+    each itself that replicate's own ``segments`` list (mirroring
+    ``null_tracks``'s ``region_lags`` convention for the ``"lag"`` case) --
+    ``len(lags) == config.n_lag_draws`` always, recorded as
+    ``manifest["gates"]["n_lag_draws"]``.
     """
 
-    n_rows = residuals.shape[0]
-    w = max(config.window, 1)
-    span = config.min_subtrack_length + w - 1
-    l_max = n_rows // span
-    if l_max < config.null_min_lag:
+    if locations is None:
+        blocks = [("", 0, residuals.shape[0])]
+    else:
+        blocks = _chromosome_blocks(locations["chr"].to_numpy())
+
+    if locations is None:
+        feasibility = {
+            "": {
+                **_member_step_lag_limits(residuals.shape[0], config),
+                "n_cpg": int(residuals.shape[0]),
+            }
+        }
+        feasible_blocks = [
+            (name, start, end, feasibility[name]["l_max"])
+            for name, start, end in blocks
+            if feasibility[name]["feasible"]
+        ]
+    else:
+        feasibility = member_step_chromosome_feasibility(locations, config)
+        feasible_blocks = [
+            (name, start, end, feasibility[name]["l_max"])
+            for name, start, end in blocks
+            if feasibility[name]["feasible"]
+        ]
+    if not feasible_blocks:
         minimum_n_cpg = member_step_min_n_cpg(config)
+        largest_l_max = max(
+            (_member_step_lag_limits(e - s, config)["l_max"] for _, s, e in blocks),
+            default=0,
+        )
+        largest_n_cpg = max((e - s for _, s, e in blocks), default=0)
         raise ValueError(
-            f"region_null_mode='member_step' needs at least one lag able to "
-            f"produce sub-tracks of min_subtrack_length={config.min_subtrack_length} "
-            f"at null_min_lag={config.null_min_lag}, i.e. n_cpg >= "
-            f"null_min_lag * (min_subtrack_length + window - 1) = {minimum_n_cpg}; "
-            f"got n_cpg={n_rows} (L_max={l_max}). Use region_null_mode='lag' on "
-            f"input this small, or lower min_subtrack_length/null_min_lag "
-            f"knowingly (min_subtrack_length trades off segmentation edge "
-            f"effects; null_min_lag trades off the methylation correlation-"
-            f"length margin)."
+            f"region_null_mode='member_step' needs at least one CHROMOSOME "
+            f"able to produce a minimum detectable sub-track of "
+            f"min_cpgs={config.min_cpgs} at "
+            f"null_min_lag={config.null_min_lag}, i.e. a chromosome with "
+            f"n_cpg >= null_min_lag * (min_cpgs + window - 1) = "
+            f"{minimum_n_cpg}; the largest chromosome here has "
+            f"n_cpg={largest_n_cpg} (fallback L_max={largest_l_max}). Use "
+            f"region_null_mode='lag' on input this small; do not lower "
+            f"null_min_lag merely to force feasibility because it is the "
+            f"locality-breaking floor."
         )
 
     rng = np.random.default_rng(config.random_seed + 61_093)
-    lags = [
-        int(rng.integers(config.null_min_lag, l_max + 1))
-        for _ in range(config.n_lag_draws)
-    ]
-
-    replicates: list[tuple[np.ndarray, np.ndarray, int]] = []
-    for lag in lags:
-        sub_tracks = member_step_lag_null_tracks(residuals, lag, config, locations)
-        if not sub_tracks:
+    replicates: list[tuple[np.ndarray, np.ndarray, list[tuple[str, int, int]]]] = []
+    lags: list[list[tuple[str, int, int]]] = []
+    for _ in range(config.n_lag_draws):
+        track_pieces: list[np.ndarray] = []
+        eligible_pieces: list[np.ndarray] = []
+        segments: list[tuple[str, int, int]] = []
+        for name, start, end, l_max_c in feasible_blocks:
+            lag_c = int(rng.integers(config.null_min_lag, l_max_c + 1))
+            sub_tracks = member_step_lag_null_tracks(
+                residuals[start:end], lag_c, config,
+                (
+                    locations.iloc[start:end].reset_index(drop=True)
+                    if locations is not None else None
+                ),
+            )
+            if not sub_tracks:
+                continue
+            chrom_pieces, chrom_eligible = [], []
+            for sub_track, sub_eligible, _offset in sub_tracks:
+                chrom_pieces.append(sub_track)
+                # Never merge into the next offset's piece.
+                boundary = sub_eligible.copy()
+                if boundary.size:
+                    boundary[-1] = False
+                chrom_eligible.append(boundary)
+            if not chrom_pieces:
+                continue
+            # The last sub-track's own boundary break (above) already makes
+            # this chromosome's concatenated mask end ineligible, which is
+            # exactly the break needed before the NEXT chromosome's segment
+            # -- one device, two purposes, not reapplied redundantly.
+            track_pieces.append(np.concatenate(chrom_pieces))
+            eligible_pieces.append(np.concatenate(chrom_eligible))
+            segments.append((name, lag_c, len(sub_tracks)))
+        if not track_pieces:
             continue
-        track_pieces, eligible_pieces = [], []
-        for track, sub_eligible, _offset in sub_tracks:
-            track_pieces.append(track)
-            boundary = sub_eligible.copy()
-            if boundary.size:
-                boundary[-1] = False  # never merge into the next offset's piece
-            eligible_pieces.append(boundary)
         replicates.append((
-            np.concatenate(track_pieces), np.concatenate(eligible_pieces), lag,
+            np.concatenate(track_pieces), np.concatenate(eligible_pieces), segments,
         ))
+        lags.append(segments)
     return replicates, lags
 
 
@@ -1345,46 +1693,26 @@ def permutation_null_tracks(
     )
 
 
-def region_minority_size(
-    values: np.ndarray, region: Sequence[int], matrix: np.ndarray
-) -> tuple[int, float]:
-    """Size of the deviating sample group for a region, and its effect.
+def _two_means_partition(region_means: np.ndarray) -> dict:
+    """Return a deterministic one-dimensional two-means split."""
 
-    Splits the per-sample region means at their largest gap and returns the size
-    of the *minority* side together with the difference between the two cluster
-    means. The minority side is returned rather than the low side so that a
-    hypermethylated subgroup is not reported as a hypomethylated majority.
-    """
-
-    first, last = int(region[0]), int(region[1])
-    block = matrix[first : last + 1]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        means = np.nanmean(block, axis=0)
+    means = np.asarray(region_means, dtype=float)
     finite = np.isfinite(means)
-    if finite.sum() < 4:
-        return 0, 0.0
     index = np.flatnonzero(finite)
-    order = index[np.argsort(means[index])]
-    values = means[order]
-    n = values.size
-    if n < 4:
-        return 0, 0.0
-
-    # Split by minimising within-cluster sum of squares over every cut point,
-    # not by taking the largest adjacent gap.
-    #
-    # The largest gap is the criterion the original find_separators used and it
-    # fails badly once the cohort is large. With several hundred samples the
-    # sorted region means are near-continuous, so the biggest single gap sits
-    # beside an outlier rather than at a group boundary: measured on 3,000
-    # regions whose tumour and benign group means differed by at least 0.20, the
-    # largest gap returned a minority of one sample in the median case, while
-    # two-means returned 221 -- the correct size for a 267 versus 227 split.
-    # Two-means also still isolates genuinely small subgroups, because four
-    # strongly displaced samples minimise the criterion at a 4-versus-rest cut.
-    cumulative = np.cumsum(values)
-    cumulative_square = np.cumsum(values * values)
+    if index.size < 4:
+        return {
+            "minority_size": 0,
+            "minority_fraction": float("nan"),
+            "minority_delta": 0.0,
+            "minority_samples": np.empty(0, dtype=int),
+            "boundary_gap": float("nan"),
+            "boundary_gap_fraction_delta": float("nan"),
+        }
+    order = index[np.argsort(means[index], kind="mergesort")]
+    ordered = means[order]
+    n = ordered.size
+    cumulative = np.cumsum(ordered)
+    cumulative_square = np.cumsum(ordered * ordered)
     left = np.arange(1, n)
     mean_left = cumulative[:-1] / left
     mean_right = (cumulative[-1] - cumulative[:-1]) / (n - left)
@@ -1394,8 +1722,41 @@ def region_minority_size(
            - (n - left) * mean_right ** 2)
     )
     cut = int(np.argmin(within))
+    lower = order[: cut + 1]
+    upper = order[cut + 1 :]
+    minority = lower if lower.size <= upper.size else upper
     delta = float(abs(mean_left[cut] - mean_right[cut]))
-    return int(min(cut + 1, n - cut - 1)), delta
+    boundary_gap = float(ordered[cut + 1] - ordered[cut])
+    return {
+        "minority_size": int(minority.size),
+        "minority_fraction": float(minority.size / n),
+        "minority_delta": delta,
+        "minority_samples": minority,
+        "boundary_gap": boundary_gap,
+        "boundary_gap_fraction_delta": (
+            float(boundary_gap / delta) if delta > 0 else float("nan")
+        ),
+    }
+
+
+def region_minority_size(
+    values: np.ndarray, region: Sequence[int], matrix: np.ndarray
+) -> tuple[int, float]:
+    """Size of the deviating sample group for a region, and its effect.
+
+    Uses a one-dimensional two-means partition of per-sample region means and
+    returns the smaller group and the difference between cluster means.
+    """
+
+    del values  # historical parameter retained for API compatibility
+    first, last = int(region[0]), int(region[1])
+    block = matrix[first : last + 1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        means = np.nanmean(block, axis=0)
+    # Unlike the largest-gap diagnostic, two-means estimates a group partition.
+    split = _two_means_partition(means)
+    return int(split["minority_size"]), float(split["minority_delta"])
 
 
 def null_exchangeability(
@@ -1522,7 +1883,7 @@ def acf_gate(
     ``null_tracks_`` pools every replicate's usable pairs at each lag BEFORE computing
     the correlation (not an average of per-replicate correlations), matching how the
     null is pooled everywhere else in this codebase. Accepts either
-    ``null_tracks()``'s ``(track, eligible, lag)`` triples or
+    ``null_tracks()``'s ``(track, eligible, segments)`` triples or
     ``permutation_null_tracks()``'s ``(track, eligible)`` pairs -- only the first two
     elements are used, mirroring the ``*_rest`` unpacking ``call_dmrs`` already uses
     for the same reason. Passes only when every lag has a finite, in-tolerance
@@ -1623,6 +1984,34 @@ def region_exchangeability_gate(
     }
 
 
+def _null_quantile_by_chromosome(
+    tracks: list[tuple[np.ndarray, np.ndarray, list[tuple[str, int, int, int]]]],
+    quantile: float,
+) -> dict[str, float]:
+    """The SAME ``null_quantile`` computed separately per chromosome, from
+    the pooled null values :func:`null_tracks` already produced for it
+    (``segments`` metadata) -- no recomputation of anything upstream, just
+    grouping and re-quantiling data already in hand (spec §2b.3's
+    sensitivity report). Shows whether pooling every feasible chromosome's
+    null together masks one whose own null behaves differently, at the cost
+    of one extra quantile per chromosome, not a second run.
+    """
+
+    pools: dict[str, list[np.ndarray]] = {}
+    for track, eligible, segments in tracks:
+        position = 0
+        for name, _lag, _start, length in segments:
+            piece = track[position : position + length]
+            usable = eligible[position : position + length] & np.isfinite(piece)
+            if usable.any():
+                pools.setdefault(name, []).append(piece[usable])
+            position += length
+    return {
+        name: float(np.quantile(np.concatenate(values), quantile))
+        for name, values in pools.items()
+    }
+
+
 def null_threshold(
     residuals: np.ndarray,
     config: Eiger2Config,
@@ -1646,6 +2035,9 @@ def null_threshold(
             "probably too small or too sparse"
         )
     threshold = float(np.quantile(pooled, config.null_quantile))
+    threshold_by_chromosome = _null_quantile_by_chromosome(
+        tracks, config.null_quantile,
+    )
     # A chromosome-aware null discards positions whose window members straddle a
     # chromosome boundary. With many short chromosomes and a large lag this can
     # remove most of the null, leaving the threshold poorly determined, so the
@@ -1660,6 +2052,11 @@ def null_threshold(
         "null_quantile": config.null_quantile,
         "null_median": float(np.median(pooled)),
         "threshold": threshold,
+        # spec §2b.3's sensitivity report: the same quantile recomputed per
+        # feasible chromosome (never a second run -- see
+        # _null_quantile_by_chromosome), alongside the pooled "threshold"
+        # above it is a comparison for.
+        "threshold_by_chromosome": threshold_by_chromosome,
     }
     if statistic is not None and eligible is not None:
         diagnostics.update(
@@ -1797,8 +2194,9 @@ def _fdr_from_areas_result(
     *,
     confidence_level: float,
     m_bonferroni: int,
+    dispersion: float = 1.0,
 ) -> dict:
-    """Tail-area FDR, Garwood bounds and resolution for one length stratum.
+    """Tail-area FDR, scaled-count bounds and resolution for one stratum.
 
     ``raw``/``qvalue`` are the corrected reverse-cumulative-minimum tail estimate:
     the previous ``np.minimum.accumulate`` scanned strongest-to-weakest FORWARD,
@@ -1830,10 +2228,26 @@ def _fdr_from_areas_result(
     raw   = np.minimum(1.0, scale * K / R)
     delta = np.minimum(1.0, scale / R)
 
+    # Replicate-cluster quasi-Poisson interval. `dispersion` is estimated from
+    # one count per independently drawn genome-wide null realisation by
+    # `region_fdr_result`; it is never estimated by pretending the many
+    # regions within a replicate are independent.  Scaling the effective
+    # count K/phi gives the usual exact-Poisson/Garwood interval at phi=1 and
+    # widens it when replicate counts are overdispersed.  The common
+    # Bonferroni alpha makes the complete reported cutoff curve simultaneous
+    # within a stratum.  At K=0 the upper endpoint remains finite and positive.
+    phi = max(float(dispersion), 1.0)
     alpha  = 1.0 - confidence_level
     astar  = alpha / max(int(m_bonferroni), 1)
-    L = np.where(K > 0, 0.5 * chi2.ppf(astar / 2.0, 2.0 * K), 0.0)
-    U = 0.5 * chi2.ppf(1.0 - astar / 2.0, 2.0 * (K + 1.0))
+    effective_k = K / phi
+    L = np.where(
+        K > 0,
+        0.5 * phi * chi2.ppf(astar / 2.0, 2.0 * effective_k),
+        0.0,
+    )
+    U = 0.5 * phi * chi2.ppf(
+        1.0 - astar / 2.0, 2.0 * (effective_k + 1.0)
+    )
     lo = np.minimum(1.0, scale * L / R)
     hi = np.minimum(1.0, scale * U / R)
 
@@ -1895,17 +2309,61 @@ def length_stratum(n_cpg: int) -> str:
 # length-only pooling. Not user-configurable.
 _MIN_NULL_REGIONS_PER_JOINT_STRATUM = 50
 
+# Lower bound in EDGE-run-length units for each CpG-count stratum's shortest
+# member -- `min_edges(s)` in spec §2c.1. A region spanning E passing edges
+# contains E + 1 CpGs, hence the one-less conversion below. Kept next to
+# `length_stratum` so the two cannot silently drift apart.
+_LENGTH_STRATUM_MIN_EDGES = {
+    "4-5": 3, "6-9": 5, "10-19": 9, "20-49": 19, "50+": 49,
+}
+
+
+def _run_lengths_from_mask(usable: np.ndarray) -> np.ndarray:
+    """Maximal contiguous run lengths in a boolean eligibility mask.
+
+    Mask-native counterpart of ``layouts.py``'s ``_run_boundaries``, which
+    takes a locations frame and recomputes eligibility internally; this
+    operates directly on an already-materialised mask (e.g. ``eligible &
+    np.isfinite(statistic)``), needed for spec §2c's per-stratum null
+    opportunity (see ``_stratum_opportunity`` below).
+    """
+
+    usable = np.asarray(usable, dtype=bool)
+    if usable.size == 0:
+        return np.empty(0, dtype=np.int64)
+    breaks = np.flatnonzero(~usable)
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [usable.size]))
+    lengths = ends - starts
+    return lengths[lengths > 0]
+
+
+def _stratum_opportunity(
+    run_lengths: np.ndarray, min_cpgs: int = 4
+) -> dict[str, float]:
+    """Count possible region starts per length stratum.
+
+    The bottom stratum follows ``min_cpgs`` when it is below the default of 4;
+    all higher stratum boundaries are fixed.
+    """
+
+    run_lengths = np.asarray(run_lengths, dtype=np.int64)
+    min_edges = dict(_LENGTH_STRATUM_MIN_EDGES)
+    min_edges["4-5"] = min(min_edges["4-5"], max(int(min_cpgs) - 1, 1))
+    return {
+        stratum: float(np.sum(np.maximum(0, run_lengths - edges + 1)))
+        for stratum, edges in min_edges.items()
+    }
+
 
 def _overdispersion_diagnostic(
     per_replicate_null_areas: list[np.ndarray], cutoffs: np.ndarray
 ) -> tuple[str, float | None]:
-    """Poisson-vs-observed dispersion check on pooled null exceedance counts.
+    """Legacy Poisson-vs-observed dispersion summary.
 
-    ``region_qvalue_upper_95`` assumes a Poisson count model (Garwood). If the
-    replicate-to-replicate exceedance counts are overdispersed relative to Poisson,
-    the Garwood interval understates the true uncertainty -- it becomes a LOWER
-    bound on the real interval, not a correct one. This is reported, never
-    silently corrected: no uncalibrated dispersion correction is applied.
+    Retained for diagnostic/API compatibility. The current interval uses
+    :func:`_replicate_cluster_dispersion` and incorporates its exposure-adjusted
+    dispersion; this helper is no longer the basis of the reported bound.
     """
 
     b = len(per_replicate_null_areas)
@@ -1927,6 +2385,70 @@ def _overdispersion_diagnostic(
     return "computed", float(np.median(ratios))
 
 
+# Five independent genome-wide realisations is the fixed minimum for reporting
+# replicate-dispersion uncertainty. Two clusters are algebraically estimable,
+# but one residual degree of freedom is not defensible for an upper inference
+# claim. This matches the established null-dispersion diagnostic convention and
+# is a method requirement, not a user-adjustable tuning knob.
+_MIN_REGION_NULL_CLUSTERS = 5
+
+
+def _replicate_cluster_dispersion(
+    per_replicate_null_areas: Sequence[np.ndarray],
+    cutoff: float,
+    null_edge_counts: np.ndarray,
+) -> tuple[str, float | None, dict]:
+    """Estimate quasi-Poisson dispersion from independent null replicates.
+
+    Each genome-wide null realisation contributes exactly one exceedance
+    count and one exposure. The Pearson estimate therefore measures
+    replicate-to-replicate variation without treating regions inside a
+    replicate as independent. ``cutoff`` is the weakest reported cutoff in
+    the stratum, where the count is most stable; a single dispersion is then
+    used for the whole nested cutoff curve.
+    """
+
+    b = len(per_replicate_null_areas)
+    exposures = np.asarray(null_edge_counts, dtype=float)
+    if exposures.shape != (b,) or np.any(~np.isfinite(exposures)):
+        raise ValueError("null_edge_counts must contain one finite value per replicate")
+    if np.any(exposures < 0):
+        raise ValueError("null_edge_counts must be non-negative")
+    counts = np.array([
+        np.sum(np.asarray(areas, dtype=float) >= cutoff)
+        for areas in per_replicate_null_areas
+    ], dtype=float)
+    positive = exposures > 0
+    if np.any((~positive) & (counts > 0)):
+        raise ValueError("a zero-exposure null replicate cannot contain regions")
+    exposures = exposures[positive]
+    counts = counts[positive]
+    b = int(positive.sum())
+    if b < _MIN_REGION_NULL_CLUSTERS:
+        return "insufficient_clusters", None, {
+            "clusters": b,
+            "minimum_clusters": _MIN_REGION_NULL_CLUSTERS,
+        }
+
+    total_count = float(counts.sum())
+    if total_count <= 0:
+        return "unavailable_zero_count", None, {
+            "clusters": b,
+            "cutoff": float(cutoff),
+            "total_count": 0,
+        }
+
+    rate = total_count / float(exposures.sum())
+    expected = exposures * rate
+    pearson = float(np.sum((counts - expected) ** 2 / expected) / (b - 1))
+    return "computed", max(1.0, pearson), {
+        "clusters": b,
+        "cutoff": float(cutoff),
+        "total_count": int(total_count),
+        "pearson_dispersion_raw": pearson,
+    }
+
+
 def region_fdr_result(
     observed_areas: np.ndarray,
     null_area_sets: Sequence[np.ndarray],
@@ -1938,11 +2460,14 @@ def region_fdr_result(
     observed_support_bins: np.ndarray | None = None,
     null_support_bin_sets: Sequence[np.ndarray] | None = None,
     confidence_level: float = 0.95,
-    min_null_regions_for_fdr: int = 50,
+    stratum_opportunity: Mapping[str, tuple[float, float]] | None = None,
+    m_opportunity: float = 10.0,
+    null_edge_counts: Sequence[int] | None = None,
+    null_stratum_exposures: Mapping[str, Sequence[float]] | None = None,
 ) -> RegionFdrResult:
-    """Region-level empirical FDR: point estimate, resolution, and simultaneous
-    Garwood Monte Carlo bounds, computed within length strata with a common
-    Bonferroni ``m`` so ``qvalue_upper`` is comparable across strata. See
+    """Region-level empirical FDR: pooled point estimate, resolution, and
+    simultaneous replicate-cluster quasi-Poisson bounds, computed within
+    length strata with a common Bonferroni ``m``. See
     ``docs/FDR.md`` for the full derivation and the three distinct quantities
     this keeps apart (point estimate, empirical resolution, Monte Carlo
     interval).
@@ -1955,7 +2480,11 @@ def region_fdr_result(
     calculation is done **within length strata**: region area grows with
     length, so a pooled FDR silently makes short regions look worse than long
     ones. A 4-CpG DMR should compete against 4-CpG null regions, not 50-CpG
-    ones.
+    ones. When ``stratum_opportunity`` is available, the point estimate and
+    both bounds use ``scale_s = observed_opportunity_s / null_opportunity_s``
+    for that length. This is required when short-subtrack fallback gives
+    different length support. Without measured length opportunity, direct
+    callers retain an explicitly diagnosed global-edge fallback.
 
     When ``observed_support_bins``/``null_support_bin_sets`` are ALSO
     supplied, the null pool is stratified jointly, by
@@ -1965,17 +2494,44 @@ def region_fdr_result(
     ``_MIN_NULL_REGIONS_PER_JOINT_STRATUM`` falls back to the length-only
     pool, listed in ``diagnostics["support_stratification_fallback_strata"]``.
 
-    ``min_null_regions_for_fdr`` guards null adequacy as a single AGGREGATE
-    check summed across every stratum and replicate -- not a per-stratum one.
-    A per-stratum floor conflates "merely small" (arithmetically well-defined,
-    refusing it hides real evidence as certainty) with "genuinely, decisively
-    empty" -- but with the run as a whole adequately backed by null volume,
-    ``K=0`` at a stratum's own cutoff is the strongest evidence the estimator
-    can produce (point estimate ``q=0``, a finite Garwood ``qvalue_upper_95``).
-    Below the aggregate floor, every inferential field is ``NaN``, every count
-    field is ``-1``. At or above it, every stratum is let through, including
-    empty ones, named with their exposure in
-    ``diagnostics["zero_exceedance_strata"]`` -- reported, not refused.
+    ``stratum_opportunity``/``m_opportunity`` guard null adequacy PER LENGTH
+    STRATUM (spec §2c), replacing an earlier AGGREGATE pooled-count floor that
+    checked the wrong quantity: a run could hold thousands of null regions in
+    short strata while a long stratum's null never had the CHANCE to grow a
+    region that long, and every long observed region then received ``q=0``
+    from a null that could never have contradicted it.
+
+    ``stratum_opportunity`` maps each length-stratum name (``length_stratum``'s
+    return values) to that stratum's ``(O_s, N_s)`` -- observed and pooled-null
+    opportunity, both the sum over maximal eligible runs of
+    ``max(0, run_len - min_edges(s) + 1)``. A stratum with ``R_s`` observed
+    regions is adequate iff ``N_s >= m_opportunity * O_s / R_s``: the null
+    would have been expected to produce at least ``m_opportunity`` regions had
+    the observed rate applied to it. Inadequate strata are refused -- every
+    inferential field ``NaN``, every count field ``-1``, for that stratum's
+    rows only -- and named, with ``O_s``/``N_s``/``R_s`` and the opportunity
+    required, in ``diagnostics["insufficient_null_opportunity_strata"]``.
+    Adequate strata are let through, including ones whose own pool is
+    genuinely empty: ``K=0`` at a stratum's own cutoff, with real opportunity
+    behind it, gives point estimate ``q=0`` but a finite positive
+    replicate-cluster ``qvalue_upper_95``, named in
+    ``diagnostics["zero_exceedance_strata"]`` instead -- the two lists are
+    mutually exclusive by construction, never conflated.
+
+    ``stratum_opportunity=None`` (the default) skips the adequacy check
+    entirely, unstratified callers (e.g. the frozen :func:`region_fdr`
+    wrapper) having no length data to key it against.
+    ``null_edge_counts`` supplies the usable exposure in each independent
+    null realisation. If omitted, equal exposure summing to ``null_edges`` is
+    used for compatibility with direct callers. At least five independent
+    realisations are required to estimate replicate-level dispersion; below
+    that, affected inference is explicitly refused.
+    ``null_stratum_exposures``, when length stratification is active, supplies
+    each replicate's actual opportunity for each length stratum. Its pooled
+    sum supplies ``N_s`` for the length-specific point/bound scale, while the
+    individual values are the cluster-dispersion offsets. Joint support strata
+    without joint opportunity retain an explicitly diagnosed global fallback.
+
     ``diagnostics["insufficient_null_strata"]`` is kept for schema
     compatibility and is now always ``[]``.
     """
@@ -1993,6 +2549,9 @@ def region_fdr_result(
             diagnostics={
                 "pooled_fallback_strata": [], "insufficient_null_strata": [],
                 "zero_exceedance_strata": [],
+                "insufficient_null_opportunity_strata": [],
+                "insufficient_cluster_replicates_strata": [],
+                "insufficient_scale_opportunity_strata": [],
             },
         )
 
@@ -2012,6 +2571,9 @@ def region_fdr_result(
                 "status": status, "pooled_fallback_strata": [],
                 "zero_exceedance_strata": [],
                 "insufficient_null_strata": [],
+                "insufficient_null_opportunity_strata": [],
+                "insufficient_cluster_replicates_strata": [],
+                "insufficient_scale_opportunity_strata": [],
             },
         )
 
@@ -2020,6 +2582,27 @@ def region_fdr_result(
     # correspond -- see the identical comment preserved on the old region_fdr.
     scale = observed_edges / null_edges
     null_area_sets = [np.asarray(a, dtype=float) for a in null_area_sets]
+    if null_edge_counts is None:
+        # Direct callers historically supplied only the pooled exposure. Equal
+        # allocation preserves that exact pooled point estimator while still
+        # making the independent-replicate count explicit for uncertainty.
+        per_replicate_edge_counts = np.full(
+            replicates, float(null_edges) / replicates, dtype=float
+        )
+        null_edge_exposure_source = "equal_from_pooled_total"
+    else:
+        per_replicate_edge_counts = np.asarray(null_edge_counts, dtype=float)
+        if per_replicate_edge_counts.shape != (replicates,):
+            raise ValueError(
+                "null_edge_counts must have one entry per null_area_sets replicate"
+            )
+        if np.any(~np.isfinite(per_replicate_edge_counts)) or np.any(
+            per_replicate_edge_counts < 0
+        ):
+            raise ValueError("null_edge_counts must be finite and non-negative")
+        if not np.isclose(per_replicate_edge_counts.sum(), null_edges):
+            raise ValueError("null_edge_counts must sum to null_edges")
+        null_edge_exposure_source = "measured_per_replicate"
 
     stratified = observed_lengths is not None and null_length_sets is not None
     if stratified:
@@ -2037,6 +2620,40 @@ def region_fdr_result(
         null_length_labels_by_replicate = [
             np.full(areas.size, "_pooled", dtype=object) for areas in null_area_sets
         ]
+
+    per_length_cluster_exposures: dict[str, np.ndarray] = {}
+    if null_stratum_exposures is not None:
+        if not stratified:
+            raise ValueError(
+                "null_stratum_exposures requires observed_lengths and "
+                "null_length_sets"
+            )
+        for label, values in null_stratum_exposures.items():
+            exposure = np.asarray(values, dtype=float)
+            if exposure.shape != (replicates,):
+                raise ValueError(
+                    "null_stratum_exposures must contain one value per replicate"
+                )
+            if np.any(~np.isfinite(exposure)) or np.any(exposure < 0):
+                raise ValueError(
+                    "null_stratum_exposures must be finite and non-negative"
+                )
+            if stratum_opportunity is not None and str(label) in stratum_opportunity:
+                pooled_opportunity = float(stratum_opportunity[str(label)][1])
+                if not np.isclose(exposure.sum(), pooled_opportunity):
+                    raise ValueError(
+                        "null_stratum_exposures must sum to the pooled null "
+                        "stratum opportunity"
+                    )
+            per_length_cluster_exposures[str(label)] = exposure
+        missing_labels = set(np.unique(observed_length_labels)) - set(
+            per_length_cluster_exposures
+        )
+        if missing_labels:
+            raise ValueError(
+                "null_stratum_exposures missing observed length strata: "
+                + ", ".join(sorted(missing_labels))
+            )
 
     # Spec §1c.6 escalation: joint (length x support-bin) null pooling, layered on
     # top of the length strata above. Never activates unless BOTH support arrays
@@ -2104,50 +2721,65 @@ def region_fdr_result(
         str(s): _n_distinct(observed_areas[observed_strata == s]) for s in strata
     }
     m_bonferroni = max(cutoffs_by_stratum.values())
-
-    # The null-adequacy floor is a single AGGREGATE check on the run as a
-    # whole, not a per-stratum one -- see this function's docstring. Run AFTER
-    # stratification (and its validation, e.g. the strict support-bin zips
-    # above) and Pass A, so a caller bug still raises regardless of null
-    # adequacy and the diagnostics keys stay present either way; a stratum
-    # whose own pool happens to be thin, or exactly empty, is not refused once
-    # the run clears this bar -- handled in the per-stratum loop below
-    # (``zero_exceedance_strata``), not here.
     pooled_null_regions = int(sum(a.size for a in null_area_sets))
-    if pooled_null_regions < min_null_regions_for_fdr:
-        nan_f = np.full(m, np.nan, dtype=float)
-        neg_i = np.full(m, -1, dtype=np.int64)
-        rate = pooled_null_regions / replicates if replicates else 0.0
-        return RegionFdrResult(
-            qvalue=nan_f, tail_fdr=nan_f, qvalue_lower=nan_f,
-            qvalue_upper=nan_f, qvalue_resolution=nan_f,
-            null_exceedances=neg_i, qvalue_cutoff_rank=neg_i,
-            confidence_level=confidence_level,
-            diagnostics={
-                "status": "aggregate null inadequate",
-                "pooled_null_regions": pooled_null_regions,
-                "replicates": replicates,
-                "null_regions_per_replicate": rate,
-                "min_null_regions_for_fdr": int(min_null_regions_for_fdr),
-                "replicates_required": (
-                    math.ceil(min_null_regions_for_fdr / rate) if rate > 0 else None
-                ),
-                "scale": scale,
-                "fdr_interval_bonferroni_m": m_bonferroni,
-                "fdr_interval_cutoffs_by_stratum": cutoffs_by_stratum,
-                "fdr_interval_family": "per_stratum",
-                "pooled_fallback_strata": [],
-                "insufficient_null_strata": [],
-                "zero_exceedance_strata": [],
-                "support_stratified": support_stratified,
-                "support_stratification_fallback_strata": sorted(
-                    set(support_fallback_joint_strata)
-                ),
-                "min_null_regions_per_joint_stratum": _MIN_NULL_REGIONS_PER_JOINT_STRATUM,
-            },
-        )
 
-    # --- Pass B: run the estimator per stratum with that common m
+    # Spec §2c: null-opportunity adequacy is a per-LENGTH-stratum decision,
+    # not a per-joint-stratum one -- opportunity is a property of run-length
+    # structure, independent of support-bin membership. A length stratum that
+    # fails here is refused in full, even if support stratification split it
+    # into several joint sub-strata (Pass B below refuses every row whose
+    # LENGTH label matches, regardless of which joint stratum it fell into).
+    # Run AFTER stratification's own validation (the strict support-bin zips
+    # above) and Pass A, so a caller bug still raises regardless of null
+    # adequacy and every diagnostics key stays present either way.
+    insufficient_null_opportunity_strata: list[dict] = []
+    refused_length_strata: set[str] = set()
+    if stratum_opportunity is not None and m_opportunity > 0:
+        # Unstratified callers report one "_pooled" stratum spanning every
+        # length, so their opportunity check must be pooled too -- summing
+        # every length stratum's (O_s, N_s) into one bucket, not looking up
+        # a "_pooled" key that `stratum_opportunity` (always keyed by real
+        # length-stratum names) was never given.
+        opportunity_lookup = (
+            stratum_opportunity if stratified
+            else {
+                "_pooled": (
+                    sum(o for o, _ in stratum_opportunity.values()),
+                    sum(n for _, n in stratum_opportunity.values()),
+                )
+            }
+        )
+        for length_label in np.unique(observed_length_labels):
+            length_label = str(length_label)
+            r_s = int(np.sum(observed_length_labels == length_label))
+            if r_s == 0:
+                continue
+            o_s, n_s = opportunity_lookup.get(length_label, (0.0, 0.0))
+            if o_s <= 0:
+                required_n = None
+                inadequate = True
+            else:
+                required_n = m_opportunity * o_s / r_s
+                inadequate = n_s < required_n
+            if inadequate:
+                refused_length_strata.add(length_label)
+                insufficient_null_opportunity_strata.append({
+                    "stratum": length_label,
+                    "observed_opportunity": o_s,
+                    "null_opportunity": n_s,
+                    "observed_regions": r_s,
+                    "required_null_opportunity": required_n,
+                    "m_opportunity": m_opportunity,
+                })
+
+    # --- Pass B: prepare each stratum and estimate replicate-cluster dispersion.
+    # The many regions inside one genome-wide member-step draw are correlated;
+    # one draw is therefore one statistical unit. Dispersion is estimated at
+    # the weakest reported cutoff (the best-populated count on the curve) and
+    # used across the nested curve. Empty strata borrow the largest estimable
+    # dispersion from this run, rather than claiming Poisson certainty; if no
+    # stratum can estimate it, the explicitly recorded quasi-Poisson floor 1 is
+    # used.
     qvalue = np.empty(m, dtype=float)
     tail_fdr = np.empty(m, dtype=float)
     qvalue_lower = np.empty(m, dtype=float)
@@ -2163,14 +2795,14 @@ def region_fdr_result(
     # schema compatibility alongside `pooled_fallback_strata` above.
     insufficient_null_strata: list[dict] = []
     zero_exceedance_strata: list[dict] = []
-    overdispersion_by_stratum: dict[str, dict] = {}
+    insufficient_cluster_replicates_strata: list[dict] = []
+    insufficient_scale_opportunity_strata: list[dict] = []
+    cluster_inputs: dict[str, dict] = {}
+    cluster_dispersion_by_stratum: dict[str, dict] = {}
+    fdr_scale_by_stratum: dict[str, dict] = {}
 
     for stratum in strata:
         rows = np.flatnonzero(observed_strata == stratum)
-        # A joint label selects null regions by the joint key; a length-only
-        # label (either because support stratification is off, or because this
-        # stratum fell back) selects by length alone, i.e. the union over every
-        # support bin of that length stratum.
         is_joint_stratum = support_stratified and "|sbin" in str(stratum)
         labels_by_replicate = (
             null_joint_labels_by_replicate
@@ -2182,24 +2814,157 @@ def region_fdr_result(
             for b in range(replicates)
         ]
         pooled = np.concatenate(per_replicate) if per_replicate else np.empty(0)
-        # A stratum whose own pool is completely empty is not refused -- the
-        # run as a whole already cleared the aggregate floor above, so an
-        # empty own pool means the null, given real opportunity, essentially
-        # never produces a region this long: `K=0` at every cutoff,
-        # arithmetically well-defined below (point estimate `q=0`, a finite
-        # Garwood upper bound), not an absence of information. Recorded, not
-        # refused, so a reader can see the evidence was real.
+        weakest_cutoff = float(np.min(observed_areas[rows]))
+        length_label = str(observed_length_labels[rows[0]])
+        if stratified and not is_joint_stratum:
+            if stratum_opportunity is None:
+                piece_scale = float(scale)
+                scale_source = "global_edge_fallback_missing_length_opportunity"
+                scale_o = None
+                scale_n = None
+            else:
+                opportunity_pair = stratum_opportunity.get(length_label)
+                if opportunity_pair is None:
+                    piece_scale = None
+                    scale_source = "unavailable_missing_length_opportunity"
+                    scale_o = None
+                    scale_n = None
+                else:
+                    scale_o, scale_n = map(float, opportunity_pair)
+                    piece_scale = (
+                        scale_o / scale_n
+                        if scale_o > 0 and scale_n > 0
+                        else None
+                    )
+                    scale_source = (
+                        "per_length_opportunity"
+                        if piece_scale is not None
+                        else "unavailable_nonpositive_length_opportunity"
+                    )
+        elif is_joint_stratum:
+            # No joint length x support-bin opportunity is currently measured.
+            # Retain the historical edge scale, but label it explicitly rather
+            # than presenting it as opportunity-calibrated.
+            piece_scale = float(scale)
+            scale_source = "global_edge_fallback_joint_support_no_joint_opportunity"
+            scale_o = None
+            scale_n = None
+        else:
+            piece_scale = float(scale)
+            scale_source = "global_edge_fallback_unstratified"
+            scale_o = None
+            scale_n = None
+        fdr_scale_by_stratum[str(stratum)] = {
+            "scale": piece_scale,
+            "source": scale_source,
+            "observed_opportunity": scale_o,
+            "pooled_null_opportunity": scale_n,
+        }
+        cluster_exposures = per_length_cluster_exposures.get(
+            length_label, per_replicate_edge_counts
+        )
+        status, dispersion, detail = _replicate_cluster_dispersion(
+            per_replicate, weakest_cutoff, cluster_exposures
+        )
+        cluster_inputs[str(stratum)] = {
+            "rows": rows, "per_replicate": per_replicate, "pooled": pooled,
+            "scale": piece_scale,
+        }
+        cluster_dispersion_by_stratum[str(stratum)] = {
+            "status": status,
+            "estimated_dispersion": dispersion,
+            "exposure_type": (
+                "per_length_opportunity"
+                if length_label in per_length_cluster_exposures
+                else "usable_edges"
+            ),
+            **detail,
+        }
+
+    estimable_dispersions = [
+        entry["estimated_dispersion"]
+        for entry in cluster_dispersion_by_stratum.values()
+        if entry["status"] == "computed"
+        and entry["estimated_dispersion"] is not None
+    ]
+    borrowed_dispersion = max(estimable_dispersions, default=1.0)
+
+    for stratum in strata:
+        stratum_key = str(stratum)
+        rows = cluster_inputs[stratum_key]["rows"]
+        # Every row sharing one `observed_strata` value also shares one
+        # LENGTH label (a joint label embeds its length stratum verbatim; a
+        # length-only label IS its length stratum), so any row is
+        # representative for the refusal check below.
+        length_label = str(observed_length_labels[rows[0]])
+        cluster_entry = cluster_dispersion_by_stratum[stratum_key]
+        cluster_inadequate = cluster_entry["status"] == "insufficient_clusters"
+        scale_inadequate = cluster_inputs[stratum_key]["scale"] is None
+        if cluster_inadequate:
+            insufficient_cluster_replicates_strata.append({
+                "stratum": stratum_key,
+                "clusters": cluster_entry["clusters"],
+                "minimum_clusters": _MIN_REGION_NULL_CLUSTERS,
+                "reason": (
+                    "too few independent genome-wide null realisations to "
+                    "estimate replicate-cluster dispersion"
+                ),
+            })
+        if scale_inadequate:
+            scale_entry = fdr_scale_by_stratum[stratum_key]
+            insufficient_scale_opportunity_strata.append({
+                "stratum": stratum_key,
+                "observed_opportunity": scale_entry["observed_opportunity"],
+                "null_opportunity": scale_entry["pooled_null_opportunity"],
+                "reason": scale_entry["source"],
+            })
+        if (
+            length_label in refused_length_strata
+            or cluster_inadequate
+            or scale_inadequate
+        ):
+            qvalue[rows] = np.nan
+            tail_fdr[rows] = np.nan
+            qvalue_lower[rows] = np.nan
+            qvalue_upper[rows] = np.nan
+            qvalue_resolution[rows] = np.nan
+            null_exceedances[rows] = -1
+            qvalue_cutoff_rank[rows] = -1
+            continue
+        per_replicate = cluster_inputs[stratum_key]["per_replicate"]
+        pooled = cluster_inputs[stratum_key]["pooled"]
+        # A stratum whose own pool is completely empty is not refused -- its
+        # LENGTH stratum already cleared the opportunity floor above (or the
+        # check is off), so an empty own pool means the null, given real
+        # opportunity, essentially never produces a region this long: `K=0`
+        # at every cutoff, arithmetically well-defined below (point estimate
+        # `q=0`, a finite positive cluster-robust upper bound), not an absence of
+        # information. Recorded, not refused, so a reader can see the
+        # evidence was real.
         if pooled.size == 0:
             zero_exceedance_strata.append({
-                "stratum": str(stratum),
+                "stratum": stratum_key,
                 "null_regions": 0,
                 "replicates": replicates,
                 "null_regions_per_replicate": 0.0,
             })
 
+        if cluster_entry["status"] == "computed":
+            dispersion_used = float(cluster_entry["estimated_dispersion"])
+            dispersion_source = "own_stratum"
+        elif estimable_dispersions:
+            dispersion_used = float(borrowed_dispersion)
+            dispersion_source = "maximum_estimable_stratum"
+        else:
+            dispersion_used = 1.0
+            dispersion_source = "quasi_poisson_floor"
+        cluster_entry["dispersion_used"] = dispersion_used
+        cluster_entry["dispersion_source"] = dispersion_source
+
         piece = _fdr_from_areas_result(
-            observed_areas[rows], pooled, scale,
+            observed_areas[rows], pooled, cluster_inputs[stratum_key]["scale"],
             confidence_level=confidence_level, m_bonferroni=m_bonferroni,
+            dispersion=dispersion_used,
         )
         qvalue[rows] = piece["qvalue"]
         tail_fdr[rows] = piece["tail_fdr"]
@@ -2208,18 +2973,6 @@ def region_fdr_result(
         qvalue_resolution[rows] = piece["qvalue_resolution"]
         null_exceedances[rows] = piece["null_exceedances"].astype(np.int64)
         qvalue_cutoff_rank[rows] = piece["qvalue_cutoff_rank"]
-        overdispersion_by_stratum[str(stratum)] = _overdispersion_diagnostic(
-            per_replicate, piece["cutoffs"]
-        )
-
-    dispersion_ratios = [
-        ratio for status, ratio in overdispersion_by_stratum.values()
-        if status == "computed"
-    ]
-    overdispersion_warning = (
-        max(dispersion_ratios) if dispersion_ratios and max(dispersion_ratios) > 1.5
-        else None
-    )
 
     diagnostics = {
         "fdr_interval_bonferroni_m": m_bonferroni,
@@ -2228,10 +2981,52 @@ def region_fdr_result(
         "pooled_fallback_strata": pooled_fallback_strata,
         "insufficient_null_strata": insufficient_null_strata,
         "zero_exceedance_strata": zero_exceedance_strata,
+        "insufficient_null_opportunity_strata": insufficient_null_opportunity_strata,
+        "insufficient_cluster_replicates_strata": (
+            insufficient_cluster_replicates_strata
+        ),
+        "insufficient_scale_opportunity_strata": (
+            insufficient_scale_opportunity_strata
+        ),
+        "m_opportunity": m_opportunity,
         "pooled_null_regions": pooled_null_regions,
-        "null_count_dispersion_by_stratum": overdispersion_by_stratum,
-        "null_count_overdispersion_warning": overdispersion_warning,
+        "fdr_uncertainty_method": "replicate_cluster_quasi_poisson",
+        "fdr_uncertainty_assumptions": (
+            "independent genome-wide null realisations; Var(K_b)=phi*E(K_b); "
+            "one common phi across each nested cutoff curve; empty curves "
+            "borrow the maximum estimable phi across reported strata"
+        ),
+        "fdr_uncertainty_cluster_count": replicates,
+        "fdr_uncertainty_minimum_clusters": _MIN_REGION_NULL_CLUSTERS,
+        "fdr_uncertainty_simultaneous": True,
+        "fdr_uncertainty_multiplicity_correction": "bonferroni_per_stratum_curve",
+        "fdr_uncertainty_zero_count_safeguard": (
+            "scaled-count upper bound with borrowed dispersion or phi=1 floor"
+        ),
+        "null_edge_exposure_source": null_edge_exposure_source,
+        "fdr_cluster_exposure_source": (
+            "measured_per_length_opportunity"
+            if per_length_cluster_exposures
+            else null_edge_exposure_source
+        ),
+        "null_count_dispersion_by_stratum": cluster_dispersion_by_stratum,
+        # Compatibility key: the old warning is superseded because the measured
+        # dispersion now widens the reported interval instead of merely warning
+        # that a Poisson-only interval is too narrow.
+        "null_count_overdispersion_warning": None,
+        "null_count_overdispersion_handling": "incorporated_in_cluster_interval",
+        "fdr_cluster_dispersion_max": float(borrowed_dispersion),
+        # Compatibility key: the global edge scale remains available for old
+        # consumers and explicit fallbacks. Ordinary length strata use the
+        # opportunity-specific values recorded below.
         "scale": scale,
+        "global_edge_scale": scale,
+        "fdr_scale_method": "per_length_opportunity_with_explicit_fallback",
+        "fdr_scale_by_stratum": fdr_scale_by_stratum,
+        "fdr_scale_fallback_strata": sorted(
+            key for key, value in fdr_scale_by_stratum.items()
+            if value["source"].startswith("global_edge_fallback")
+        ),
         "support_stratified": support_stratified,
         "support_stratification_fallback_strata": sorted(
             set(support_fallback_joint_strata)
@@ -2252,32 +3047,49 @@ def check_fdr_decision_vacuity(
     scale: float,
     current_replicates: int,
     target_fdr: float,
-) -> None:
-    """Refuse to silently return zero significant regions under --fdr-decision upper.
+    replicate_knob: str = "null_replicates",
+) -> dict:
+    """Describe upper-decision usability without treating no rejection as failure.
 
-    The best achievable upper_95 bound at the strongest possible cutoff (K=0, R=1)
-    is s * U(K=0). If that already exceeds target_fdr, no region in this run can
-    ever pass the upper-bound decision rule regardless of its area -- report the
-    replicate count that would fix it instead of returning an empty, misleading
-    result.
+    A conservative FDR rule must be allowed to reject nothing, particularly on
+    DMR-free controls. The former guard raised whenever no upper q-value cleared
+    the target and therefore conflated a scientifically valid no-call result
+    with inadequate null replication. Replicate inadequacy is now handled
+    separately by ``insufficient_cluster_replicates_strata``; this helper only
+    records the complete already-computed curve's outcome for transparency.
+
+    ``replicate_knob`` names the setting that actually controls
+    ``current_replicates`` for the caller's advice message: under
+    ``region_null_mode="member_step"`` that is ``n_lag_draws``, not
+    ``null_replicates`` -- see spec §2a.6/§2e.7. Passing the wrong name told the
+    user to change a setting that has no effect on this count.
     """
 
-    if scale <= 0:
-        return
-    alpha = 1.0 - result.confidence_level
-    m_bonferroni = result.diagnostics.get("fdr_interval_bonferroni_m", 1)
-    astar = alpha / max(int(m_bonferroni), 1)
-    u0 = 0.5 * chi2.ppf(1.0 - astar / 2.0, 2.0)
-    best_upper = min(1.0, scale * u0)
-    if best_upper <= target_fdr:
-        return
-    required = math.ceil(current_replicates * scale * u0 / target_fdr)
-    raise ValueError(
-        f"--fdr-decision upper cannot reach target_fdr={target_fdr}: current "
-        f"null_replicates={current_replicates} gives scale={scale:.6f} and the "
-        f"best achievable region_qvalue_upper_95 is {best_upper:.4f} at K=0, R=1. "
-        f"Increase --null-replicates to at least {required} (B_required)."
-    )
+    diagnostic = {
+        "replicate_setting": replicate_knob,
+        "independent_clusters": int(current_replicates),
+        "target_fdr": float(target_fdr),
+        "scale": float(scale),
+        "has_finite_upper_curve": False,
+        "any_upper_rejection": False,
+        "best_region_qvalue_upper_95": None,
+    }
+    if scale <= 0 or result.qvalue_upper.size == 0:
+        return diagnostic
+    finite = np.flatnonzero(np.isfinite(result.qvalue_upper))
+    if finite.size == 0:
+        return diagnostic
+    best_position = int(finite[np.argmin(result.qvalue_upper[finite])])
+    best_upper = float(result.qvalue_upper[best_position])
+    diagnostic.update({
+        "has_finite_upper_curve": True,
+        "any_upper_rejection": bool(best_upper <= target_fdr),
+        "best_region_qvalue_upper_95": best_upper,
+        "null_exceedances_at_best_upper": int(
+            result.null_exceedances[best_position]
+        ),
+    })
+    return diagnostic
 
 
 def region_fdr(
@@ -2289,8 +3101,8 @@ def region_fdr(
     observed_lengths: np.ndarray | None = None,
     null_length_sets: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Monotone region-level empirical FDR. Signature frozen; see region_fdr_result
-    for the resolution and Garwood-bound fields."""
+    """Monotone region-level empirical FDR. Signature frozen; see
+    :func:`region_fdr_result` for resolution and replicate-cluster bounds."""
 
     return region_fdr_result(
         observed_areas, null_area_sets,
@@ -2312,10 +3124,22 @@ def qvalue_result_from_track(
     seed: int = 1,
     length_stratified: bool = True,
 ) -> tuple[RegionFdrResult, dict]:
-    """Region-level FDR (point estimate, resolution, and Garwood bounds) for ANY
-    caller, from its own statistic track. See ``qvalues_from_track`` for the
-    thin-wrapper form used where only the point estimate is needed."""
+    """DEPRECATED: raises for any non-empty ``regions``, because the
+    permutation null it depends on (``permutation_null_tracks``) was retired
+    (measured at zero usable null regions across 400 replicates). Use
+    ``region_fdr_result`` directly with a null built from ``null_tracks()``
+    (``null_mode='lag'``) or ``member_step_lag_null_ensemble()``
+    (``region_null_mode='member_step'``) instead. See ``qvalues_from_track``
+    for the thin-wrapper form used where only the point estimate is needed."""
 
+    warnings.warn(
+        "qvalue_result_from_track is deprecated and raises for any non-empty "
+        "regions: it depends on permutation_null_tracks, which was retired. "
+        "Use region_fdr_result with a null from null_tracks() or "
+        "member_step_lag_null_ensemble() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     statistic = np.asarray(statistic, dtype=float)
     regions = np.asarray(regions, dtype=int).reshape(-1, 2)
     if eligible is None:
@@ -2385,8 +3209,8 @@ def qvalues_from_track(
     seed: int = 1,
     length_stratified: bool = True,
 ) -> tuple[np.ndarray, dict]:
-    """Thin wrapper over qvalue_result_from_track returning only the point estimate.
-
+    """DEPRECATED: thin wrapper over ``qvalue_result_from_track``, which raises
+    for any non-empty ``regions`` (see its docstring for the replacement).
     Kept for existing callers; signature unchanged.
     """
 
@@ -2471,6 +3295,279 @@ def characterise_region(values: np.ndarray) -> dict:
     }
 
 
+_FIVE_CLASS_POLICY = {
+    "name": "five_class_v1",
+    "status": "provisional_descriptive_pending_validation",
+    "rare_max_fraction": 0.01,
+    "rare_minimum_max_samples": 2,
+    "cohort_min_fraction": 0.10,
+    "stable_group_min_delta_beta": 0.10,
+    "stable_group_min_boundary_gap_fraction_delta": 0.10,
+    "direction_coherence_min": 0.80,
+    "outlier_influence_min": 0.50,
+    "bounded_score_retention_min": 0.50,
+    "winsor_tail_fraction": 0.05,
+    "labels": [
+        "cohort_supported",
+        "recurrent_subgroup",
+        "rare_epivariant",
+        "outlier_sensitive",
+        "diffuse_coordination",
+    ],
+    "note": (
+        "Post-selection description only. It does not alter region_qvalue, "
+        "coordination_significant, or the empirical coordination FDR. "
+        "rare_epivariant means candidate rare epivariant; coherent technical "
+        "blocks are not identifiable from the selected region alone. Influence "
+        "screens the furthest-mean one/two samples, not every possible removal."
+    ),
+}
+
+
+# Defaults keep computed and skipped diagnostic rows on the same schema.
+_SUPPORT_DIAGNOSTIC_DEFAULTS: dict[str, float | int] = {
+    "furthest_mean_sample_index": -1,
+    "adjacent_support_score": float("nan"),
+    "adjacent_support_score_without_furthest1": float("nan"),
+    "adjacent_support_score_without_furthest2": float("nan"),
+    "furthest1_adjacent_score_influence_fraction": float("nan"),
+    "furthest2_adjacent_score_influence_fraction": float("nan"),
+    "winsorised_adjacent_support_score": float("nan"),
+    "winsorised_score_retention": float("nan"),
+    "minority_direction_coherence": float("nan"),
+}
+
+
+def _adjacent_support_score(block: np.ndarray, config: Eiger2Config) -> float:
+    """Mean pairwise-complete adjacent statistic within a selected region."""
+
+    values = np.asarray(block, dtype=float)
+    if values.ndim != 2 or values.shape[0] < 2:
+        return float("nan")
+    per_edge = _pair_statistic(
+        values[:-1], values[1:], config.statistic,
+        config.min_paired_samples, config.min_paired_fraction,
+    )
+    finite = np.isfinite(per_edge)
+    return float(np.mean(per_edge[finite])) if finite.any() else float("nan")
+
+
+def _winsorise_rows(values: np.ndarray, tail_fraction: float) -> np.ndarray:
+    """Row-wise deterministic winsorisation preserving missing values."""
+
+    result = np.array(values, dtype=float, copy=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        lower = np.nanquantile(result, tail_fraction, axis=1)
+        upper = np.nanquantile(result, 1.0 - tail_fraction, axis=1)
+    result = np.maximum(result, lower[:, None], where=np.isfinite(result), out=result)
+    result = np.minimum(result, upper[:, None], where=np.isfinite(result), out=result)
+    return result
+
+
+def biological_support_diagnostics(
+    raw_block: np.ndarray,
+    statistic_block: np.ndarray,
+    region_means: np.ndarray,
+    config: Eiger2Config,
+) -> dict:
+    """Compute post-selection prevalence and influence diagnostics.
+
+    Influence is measured on the adjacent support score after removing the
+    one or two furthest-mean samples. Winsorisation is descriptive because the
+    discovery and null tracks are not rebuilt with the same transform.
+    """
+
+    raw = np.asarray(raw_block, dtype=float)
+    score_values = np.asarray(statistic_block, dtype=float)
+    means = np.asarray(region_means, dtype=float)
+    split = _two_means_partition(means)
+    finite_means = np.flatnonzero(np.isfinite(means))
+    top_sample = -1
+    top_samples = np.empty(0, dtype=int)
+    if finite_means.size:
+        centre = float(np.nanmedian(means))
+        ranked = finite_means[
+            np.argsort(-np.abs(means[finite_means] - centre), kind="mergesort")
+        ]
+        top_samples = ranked[:2]
+        top_sample = int(top_samples[0])
+
+    score = _adjacent_support_score(score_values, config)
+    score_without_top1 = float("nan")
+    if top_sample >= 0:
+        without = np.array(score_values, copy=True)
+        without[:, top_sample] = np.nan
+        score_without_top1 = _adjacent_support_score(without, config)
+    score_without_top2 = float("nan")
+    if top_samples.size >= 2:
+        without_two = np.array(score_values, copy=True)
+        without_two[:, top_samples] = np.nan
+        score_without_top2 = _adjacent_support_score(without_two, config)
+    bounded = _winsorise_rows(
+        score_values, _FIVE_CLASS_POLICY["winsor_tail_fraction"]
+    )
+    bounded_score = _adjacent_support_score(bounded, config)
+
+    def retention(candidate: float) -> float:
+        if not (np.isfinite(score) and score > 0 and np.isfinite(candidate)):
+            return float("nan")
+        return float(candidate / score)
+
+    loo_retention = retention(score_without_top1)
+    influence = (
+        float(np.clip(1.0 - loo_retention, 0.0, 1.0))
+        if np.isfinite(loo_retention) else float("nan")
+    )
+    loo2_retention = retention(score_without_top2)
+    top2_influence = (
+        float(np.clip(1.0 - loo2_retention, 0.0, 1.0))
+        if np.isfinite(loo2_retention) else float("nan")
+    )
+    bounded_retention = retention(bounded_score)
+
+    # Measure whether the two-means minority shifts consistently across CpGs.
+    minority_samples = np.asarray(split["minority_samples"], dtype=int)
+    coherence = float("nan")
+    if minority_samples.size and raw.shape[0]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            row_medians = np.nanmedian(raw, axis=1)
+            minority_shift = np.nanmean(
+                raw[:, minority_samples] - row_medians[:, None], axis=1
+            )
+        finite_shift = np.isfinite(minority_shift) & (minority_shift != 0)
+        if finite_shift.any():
+            direction = np.sign(np.nanmedian(minority_shift[finite_shift]))
+            coherence = float(
+                np.mean(np.sign(minority_shift[finite_shift]) == direction)
+            )
+
+    computed = {
+        "furthest_mean_sample_index": top_sample,
+        "adjacent_support_score": score,
+        "adjacent_support_score_without_furthest1": score_without_top1,
+        "adjacent_support_score_without_furthest2": score_without_top2,
+        "furthest1_adjacent_score_influence_fraction": influence,
+        "furthest2_adjacent_score_influence_fraction": top2_influence,
+        "winsorised_adjacent_support_score": bounded_score,
+        "winsorised_score_retention": bounded_retention,
+        "minority_direction_coherence": coherence,
+    }
+    assert computed.keys() == _SUPPORT_DIAGNOSTIC_DEFAULTS.keys(), (
+        "biological_support_diagnostics' return keys drifted from "
+        "_SUPPORT_DIAGNOSTIC_DEFAULTS -- update both together"
+    )
+    return {**split, **computed}
+
+
+def classify_biological_support(
+    diagnostics: Mapping[str, object],
+    *,
+    coordination_significant: bool | None,
+    n_observed: int,
+) -> str | None:
+    """Apply the mutually exclusive provisional five-class hierarchy."""
+
+    if coordination_significant is not True:
+        return None
+    minority = int(diagnostics.get("minority_size", 0))
+    fraction = float(diagnostics.get("minority_fraction", np.nan))
+    delta = float(diagnostics.get("minority_delta", np.nan))
+    gap_fraction = float(
+        diagnostics.get("boundary_gap_fraction_delta", np.nan)
+    )
+    coherence = float(diagnostics.get("minority_direction_coherence", np.nan))
+    influence = float(diagnostics.get(
+        "furthest1_adjacent_score_influence_fraction", np.nan
+    ))
+    influence2 = float(diagnostics.get(
+        "furthest2_adjacent_score_influence_fraction", np.nan
+    ))
+    bounded_retention = float(
+        diagnostics.get("winsorised_score_retention", np.nan)
+    )
+    rare_max = max(
+        int(_FIVE_CLASS_POLICY["rare_minimum_max_samples"]),
+        int(_FIVE_CLASS_POLICY["rare_max_fraction"] * n_observed),
+    )
+    coherent = np.isfinite(coherence) and (
+        coherence >= _FIVE_CLASS_POLICY["direction_coherence_min"]
+    )
+    bounded = np.isfinite(bounded_retention) and (
+        bounded_retention >= _FIVE_CLASS_POLICY["bounded_score_retention_min"]
+    )
+    influential = (
+        (np.isfinite(influence) and
+         influence >= _FIVE_CLASS_POLICY["outlier_influence_min"])
+        or (np.isfinite(influence2) and
+            influence2 >= _FIVE_CLASS_POLICY["outlier_influence_min"])
+    )
+
+    # Coherent private events remain rare candidates if winsorisation attenuates
+    # them.
+    if 0 < minority <= rare_max and coherent:
+        return "rare_epivariant"
+    if influential and not bounded:
+        return "outlier_sensitive"
+    stable_discrete = (
+        minority > 0
+        and np.isfinite(delta)
+        and delta >= _FIVE_CLASS_POLICY["stable_group_min_delta_beta"]
+        and np.isfinite(gap_fraction)
+        and gap_fraction >= _FIVE_CLASS_POLICY[
+            "stable_group_min_boundary_gap_fraction_delta"
+        ]
+        # Coherence without single-sample influence is an alternative when
+        # winsorisation attenuates a small subgroup by construction.
+        and (bounded or (coherent and not influential))
+    )
+    if stable_discrete and np.isfinite(fraction):
+        if fraction >= _FIVE_CLASS_POLICY["cohort_min_fraction"]:
+            return "cohort_supported"
+        if minority > rare_max:
+            return "recurrent_subgroup"
+    return "diffuse_coordination"
+
+
+def _diagnostic_status(coordination_call: bool | None) -> str:
+    if coordination_call is None:
+        return "unavailable"
+    return "computed" if coordination_call else "not_selected"
+
+
+_SUPPORT_OUTPUT_COLUMNS = [
+    "region_id",
+    "biological_support_policy",
+    "biological_class",
+    "coordination_significant",
+    "two_means_minority_size",
+    "two_means_minority_fraction",
+    "two_means_delta_beta",
+    "two_means_boundary_gap",
+    "two_means_boundary_gap_fraction_delta",
+    "largest_gap_tail_size_legacy",
+    "largest_gap_tail_fraction_legacy",
+    "largest_gap_delta_beta_legacy",
+    "largest_adjacent_gap_legacy",
+    "direction_descriptive",
+    "largest_gap_pvalue_descriptive_invalid_for_inference",
+    "n_samples_observed",
+    "missing_rate",
+    "mean_beta",
+    "furthest_mean_sample",
+    "adjacent_support_score",
+    "adjacent_support_score_without_furthest1",
+    "furthest1_adjacent_score_influence_fraction",
+    "adjacent_support_score_without_furthest2",
+    "furthest2_adjacent_score_influence_fraction",
+    "winsorised_adjacent_support_score",
+    "winsorised_score_retention",
+    "minority_direction_coherence",
+    "diagnostic_status",
+]
+
+
 # --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
@@ -2500,6 +3597,74 @@ def _standardise_locations(locations, n_rows: int) -> pd.DataFrame:
             "end": ends.to_numpy(),
         }
     )
+
+
+# Human reference chromosomes in their natural biological order -- not
+# lexicographic ("chr10" < "chr2" as strings, which a prior version's
+# reject-on-mismatch input check enforced, rejecting valid natural-order
+# input over it -- spec §2b prerequisite). Any other chromosome name
+# (unplaced/alt/random contigs) sorts after this set, lexicographically
+# among themselves: deterministic and independent of the order they
+# happened to be presented in, which is what makes the canonical order
+# reproducible regardless of input order.
+CANONICAL_CHROMOSOMES: tuple[str, ...] = tuple(
+    f"chr{i}" for i in range(1, 23)
+) + ("chrX", "chrY", "chrM")
+_CANONICAL_CHROMOSOME_RANK = {
+    name: rank for rank, name in enumerate(CANONICAL_CHROMOSOMES)
+}
+
+
+def canonical_chromosome_order(names: Sequence[str]) -> list[str]:
+    """The canonical presentation order for a SET of chromosome names.
+
+    A pure function of the SET of distinct names present -- not of the order
+    they were given in -- so the same chromosomes always canonicalise to the
+    same order regardless of whether the input happened to be presented in
+    natural order, lexicographic order, or shuffled (spec §2b prerequisite).
+    ``chr1``..``chr22``, ``chrX``, ``chrY``, ``chrM`` sort in that biological
+    order; anything else (unplaced, alt, or random contigs) sorts after them,
+    lexicographically among themselves.
+    """
+
+    unique = set(names)
+    known = sorted(
+        (n for n in unique if n in _CANONICAL_CHROMOSOME_RANK),
+        key=lambda n: _CANONICAL_CHROMOSOME_RANK[n],
+    )
+    unplaced = sorted(n for n in unique if n not in _CANONICAL_CHROMOSOME_RANK)
+    return known + unplaced
+
+
+def chromosome_sort_permutation(
+    locations: pd.DataFrame,
+) -> tuple[np.ndarray, list[str]]:
+    """Permutation that groups ``locations`` by chromosome in canonical
+    order and sorts positions ascending within each chromosome, plus the
+    canonical order of the chromosomes actually present -- recorded in the
+    manifest (``chromosome_order``) so a run is reproducible regardless of
+    input order (spec §2b prerequisite). Apply the SAME permutation to the
+    corresponding matrix rows to keep them aligned with ``locations``.
+
+    Every downstream step that infers genomic proximity from row-index
+    proximity (:func:`eligible_edges`, :func:`_null_eligibility`, and
+    therefore the null construction §2b builds on) depends on this -- a
+    chromosome split across two non-adjacent row blocks, or positions not
+    ascending within a chromosome, corrupts the null it builds without
+    raising, since nothing here currently checks for the CONDITION this
+    permutation guarantees, only relies on it.
+    """
+
+    chrom = locations["chr"].to_numpy()
+    starts = locations["start"].to_numpy()
+    order = canonical_chromosome_order(chrom)
+    rank = {name: index for index, name in enumerate(order)}
+    chrom_rank = np.array([rank[c] for c in chrom], dtype=np.int64)
+    # lexsort's LAST key is primary: chromosome rank first, start ascending
+    # within each chromosome second. Stable, so rows already in canonical
+    # order (including duplicate positions) keep their relative order.
+    permutation = np.lexsort((starts, chrom_rank))
+    return permutation, order
 
 
 def call_dmrs(
@@ -2535,6 +3700,14 @@ def call_dmrs(
         raise ValueError("sample_names must be unique and match the matrix columns")
 
     frame = _standardise_locations(locations, n_cpg)
+    # Spec §2b prerequisite: group by chromosome in canonical order, sort
+    # ascending within each chromosome, regardless of the order the caller
+    # presented rows in. Applied here, before any other indexing, so every
+    # downstream index (`source_index`, `cpg_index_start`/`_end`) is already
+    # relative to this canonical order -- no separate remapping needed.
+    permutation, chromosome_order = chromosome_sort_permutation(frame)
+    frame = frame.iloc[permutation].reset_index(drop=True)
+    matrix = matrix[permutation]
     observed_per_cpg = np.sum(np.isfinite(matrix), axis=1)
     keep = observed_per_cpg >= config.min_observed_samples
     if config.min_sample_fraction > 0:
@@ -2545,6 +3718,19 @@ def call_dmrs(
     frame = frame.loc[keep].reset_index(drop=True)
     source_index = np.flatnonzero(keep)
 
+    support_policy_manifest = (
+        dict(_FIVE_CLASS_POLICY)
+        if config.biological_support_policy == "five_class_v1"
+        else {
+            "name": "off",
+            "status": "disabled",
+            "labels": list(_FIVE_CLASS_POLICY["labels"]),
+            "note": (
+                "Enable biological_support_policy='five_class_v1' for the "
+                "provisional post-selection classification."
+            ),
+        }
+    )
     manifest: dict = {
         "config": config.to_dict(),
         "n_cpg_input": int(n_cpg),
@@ -2558,11 +3744,28 @@ def call_dmrs(
                 np.ceil(config.min_sample_fraction * n_samples))
         ),
         "n_samples": int(n_samples),
-        "schema_version": "2.2",
+        "chromosome_order": chromosome_order,
+        "schema_version": "2.3",
         "fdr_decision": config.fdr_decision,
+        "biological_support": {
+            "policy": support_policy_manifest,
+            "diagnostics_file": (
+                "region_support_diagnostics.csv"
+                if config.biological_support_policy == "five_class_v1"
+                else None
+            ),
+            "classification_counts": {
+                str(label): 0 for label in _FIVE_CLASS_POLICY["labels"]
+            },
+            "not_classified": 0,
+        },
     }
     empty_regions = pd.DataFrame(columns=_REGION_COLUMNS)
     empty_values = pd.DataFrame(columns=["region_id", *sample_names])
+    if config.biological_support_policy == "five_class_v1":
+        empty_regions.attrs["region_support_diagnostics"] = pd.DataFrame(
+            columns=_SUPPORT_OUTPUT_COLUMNS
+        )
     if matrix.shape[0] < config.min_cpgs:
         manifest["status"] = "insufficient_cpgs"
         return empty_regions, empty_values, manifest
@@ -2581,7 +3784,9 @@ def call_dmrs(
     from .layouts import LENGTH_STRATA, describe_layout, realised_length_strata
 
     layout_diagnostics = describe_layout(frame, config.max_cpg_gap_bp)
-    realised = realised_length_strata(layout_diagnostics["layout_max_detectable_region_cpgs"])
+    realised = realised_length_strata(
+        layout_diagnostics["layout_max_detectable_region_cpgs"]
+    )
     layout_diagnostics["realised_length_strata"] = list(realised)
     layout_diagnostics["collapsed_length_strata"] = [
         s for s in LENGTH_STRATA if s not in realised
@@ -2590,15 +3795,114 @@ def call_dmrs(
     # The threshold always comes from the locality-breaking null: it decides
     # which individual edges count as elevated, and that question is unaffected
     # by cohort size in the way the region-level question is.
-    threshold, null_diagnostics = null_threshold(
-        deflated, config, frame, statistic=statistic, eligible=eligible,
-    )
+    try:
+        # Construct the expensive edge-null ensemble once. ``null_threshold``
+        # accepts precomputed tracks specifically so thresholding, diagnostics,
+        # structural gates, and the lag-mode region null all share the exact
+        # same deterministic realisations.
+        tracks = null_tracks(deflated, config, frame)
+        threshold, null_diagnostics = null_threshold(
+            deflated, config, frame, tracks=tracks,
+            statistic=statistic, eligible=eligible,
+        )
+    except ValueError as exc:
+        # Structural gate (spec §2a.2): numerical failure in the null
+        # pipeline -- e.g. the locality-breaking null produced no usable
+        # pairs at all. Fail closed with a manifest naming the failure
+        # rather than an unhandled exception with no output at all; there is
+        # no threshold to segment against, so no candidates are possible.
+        manifest["status"] = "inference_unreliable"
+        manifest["gates"] = {
+            "structural": {
+                "numerical_failure": {"passed": False, "error": str(exc)},
+            },
+        }
+        return empty_regions, empty_values, manifest
     null_diagnostics["mode"] = config.null_mode
     # null_mode="permutation" is rejected at Eiger2Config construction, so
     # this is the only edge-level null reachable here.
-    tracks = null_tracks(deflated, config, frame)
     manifest["null"] = null_diagnostics
 
+    # Spec §2b.3: a chromosome too small to admit a feasible lag
+    # (chromosome_lag_feasibility, computed once here and reused by
+    # null_tracks() above via its own internal call) contributes nothing to
+    # the null in any replicate. It is not silently dropped behind a fixed
+    # warning threshold -- its share of the genome's own eligible observed
+    # edges is measured (`missing_exposure`) and escalated to a structural
+    # gate when material.
+    chromosome_feasibility = chromosome_lag_feasibility(
+        frame, config, observed_eligible=eligible,
+    )
+    infeasible_chromosome_edges = sum(
+        v["eligible_observed_edges"] for v in chromosome_feasibility.values()
+        if not v["feasible"]
+    )
+    total_chromosome_edges = sum(
+        v["eligible_observed_edges"] for v in chromosome_feasibility.values()
+    )
+    missing_exposure = (
+        infeasible_chromosome_edges / total_chromosome_edges
+        if total_chromosome_edges else 0.0
+    )
+
+    # Structural gates (spec §2a.2): signal-independent conditions that are
+    # broken regardless of whether real signal is present, so they can hard-
+    # fail without the false-rejection risk revision 1's calibration-ratio
+    # gates carried (§0.1) -- these do not depend on the observed track at
+    # all, only on how much of the null actually survived construction.
+    surviving_fraction = (
+        len(tracks) / config.null_replicates if config.null_replicates else 0.0
+    )
+    structural_gates = {
+        "surviving_null_tracks": {
+            "surviving": len(tracks),
+            "null_replicates": config.null_replicates,
+            "fraction": surviving_fraction,
+            "floor_fraction": 0.5,
+            "passed": surviving_fraction >= 0.5,
+        },
+        "null_coverage": {
+            "value": null_diagnostics["null_coverage"],
+            "floor": config.min_null_coverage,
+            "passed": null_diagnostics["null_coverage"] >= config.min_null_coverage,
+        },
+        "null_construction": {
+            "value": null_diagnostics["null_values"],
+            "floor": config.min_null_values,
+            "passed": null_diagnostics["null_values"] >= config.min_null_values,
+            "note": (
+                "too few pooled null values to constitute a valid construction "
+                "-- promoted from null_threshold's pre-existing warning "
+                "(config.min_null_values) to a hard gate."
+            ),
+        },
+        "chromosome_exposure": {
+            "missing_exposure": missing_exposure,
+            # Explicit and independently tunable (spec §2b.3's own wording:
+            # "rather than an arbitrary percentage" -- an EXPLICIT, DOCUMENTED,
+            # SWEEPABLE percentage is the honest form of that, not a floor
+            # borrowed from min_null_coverage, a different quantity: that one
+            # is about how much of the OFFERED null was usable, this one
+            # about how much of the OBSERVED genome has no null
+            # representation at all).
+            "floor": config.max_missing_null_exposure,
+            "passed": missing_exposure <= config.max_missing_null_exposure,
+            "infeasible_chromosomes": sorted(
+                name for name, v in chromosome_feasibility.items()
+                if not v["feasible"]
+            ),
+            "note": (
+                "no feasible lag on these chromosomes (spec §2a.2/§2b.3) -- "
+                "excluded from the null in every replicate, not silently, "
+                "since their share of this run's own eligible observed "
+                "edges is measured and gated here explicitly. See "
+                "manifest['null']['threshold_by_chromosome'] for the cheap "
+                "half of the sensitivity report: the same null_quantile "
+                "recomputed per feasible chromosome, alongside the pooled "
+                "threshold it is a comparison for."
+            ),
+        },
+    }
     # The REGION-level null, a separate axis from the edge-level `tracks`
     # above. `"lag"` reuses `tracks` directly; `"member_step"` builds an
     # independent ensemble reproducing the observed track's autocorrelation;
@@ -2627,9 +3931,67 @@ def call_dmrs(
         else:
             resolved_region_null_mode = "member_step"
 
+    # The member-step region null has its own per-chromosome construction
+    # requirement. A preferred 100-position track is not a structural floor:
+    # shorter chromosomes may contribute down to the configured minimum
+    # detectable region, with per-length opportunity checked later. Only
+    # chromosomes unable to support even that absolute minimum count as
+    # missing exposure. The edge-null exposure diagnostic remains separate.
+    if resolved_region_null_mode == "member_step":
+        member_step_feasibility = member_step_chromosome_feasibility(
+            frame, config, observed_eligible=eligible,
+        )
+        member_step_missing_edges = sum(
+            v["eligible_observed_edges"]
+            for v in member_step_feasibility.values()
+            if not v["feasible"]
+        )
+        member_step_total_edges = sum(
+            v["eligible_observed_edges"] for v in member_step_feasibility.values()
+        )
+        member_step_missing_exposure = (
+            member_step_missing_edges / member_step_total_edges
+            if member_step_total_edges else 0.0
+        )
+        structural_gates["region_null_chromosome_exposure"] = {
+            "mode": "member_step",
+            "missing_exposure": member_step_missing_exposure,
+            "floor": config.max_missing_null_exposure,
+            "passed": (
+                member_step_missing_exposure <= config.max_missing_null_exposure
+            ),
+            "infeasible_chromosomes": sorted(
+                name for name, value in member_step_feasibility.items()
+                if not value["feasible"]
+            ),
+            "preferred_chromosomes": sorted(
+                name for name, value in member_step_feasibility.items()
+                if value["construction"] == "preferred"
+            ),
+            "fallback_chromosomes": sorted(
+                name for name, value in member_step_feasibility.items()
+                if value["construction"] == "fallback"
+            ),
+            "chromosomes": member_step_feasibility,
+            "note": (
+                "member-step-specific exposure gate. min_subtrack_length is "
+                "preferred; fallback chromosomes use the largest feasible "
+                "lag that still supports min_cpgs positions. Only chromosomes "
+                "unable to support min_cpgs at null_min_lag are absent."
+            ),
+        }
+
+    structural_gate_failure = not all(
+        gate["passed"] for gate in structural_gates.values()
+    )
+
     if resolved_region_null_mode == "lag":
         region_tracks = tracks
-        region_lags = [lag for _, _, lag in tracks]
+        # One entry per replicate, each itself a list of that replicate's
+        # per-chromosome (chromosome, lag, start, length) segments (spec
+        # §2b.2) -- a single scalar lag no longer describes a whole
+        # replicate now that one replicate spans multiple chromosomes.
+        region_lags = [segments for _, _, segments in tracks]
     elif resolved_region_null_mode == "off":
         region_tracks = []
         region_lags = []
@@ -2641,16 +4003,52 @@ def call_dmrs(
         "region_null_mode": resolved_region_null_mode,
         "n_lag_draws": len(region_lags),
         "lags_used": region_lags,
+        "structural": structural_gates,
+        "calibration_diagnostic_note": CALIBRATION_DIAGNOSTIC_NOTE,
     }
     if region_null_mode_fallback is not None:
         manifest["gates"]["region_null_mode_fallback"] = region_null_mode_fallback
     if resolved_region_null_mode == "member_step" and region_lags:
+        # Per chromosome, not genome-wide (spec §2b.4): each segment's own
+        # implied sub-track length depends on ITS OWN chromosome's row
+        # count, not the genome-wide total -- flattened across every
+        # replicate and chromosome, min/max the range actually realised.
         w_for_subtrack = max(config.window, 1)
-        n_for_subtrack = deflated.shape[0]
-        manifest["gates"]["implied_subtrack_length_range"] = [
-            int(n_for_subtrack / lag - w_for_subtrack + 1)
-            for lag in (max(region_lags), min(region_lags))
-        ]
+        chromosome_sizes = {
+            name: end - start
+            for name, start, end in _chromosome_blocks(frame["chr"].to_numpy())
+        }
+        implied_lengths: list[int] = []
+        implied_by_chromosome: dict[str, list[int]] = {}
+        forced_boundaries = 0
+        offered_positions = 0
+        for replicate_segments in region_lags:
+            for name, lag, n_subtracks in replicate_segments:
+                full_size = chromosome_sizes[name] - lag * (w_for_subtrack - 1)
+                if full_size <= 0:
+                    continue
+                shortest, remainder = divmod(full_size, lag)
+                longest = shortest + int(remainder > 0)
+                implied_lengths.extend((shortest, longest))
+                implied_by_chromosome.setdefault(name, []).extend(
+                    (shortest, longest)
+                )
+                forced_boundaries += int(n_subtracks)
+                offered_positions += int(full_size)
+        if implied_lengths:
+            manifest["gates"]["implied_subtrack_length_range"] = [
+                max(implied_lengths), min(implied_lengths),
+            ]
+            gate = structural_gates["region_null_chromosome_exposure"]
+            gate["realised_subtrack_length_range"] = {
+                name: [min(values), max(values)]
+                for name, values in implied_by_chromosome.items()
+            }
+            gate["forced_boundary_fraction"] = (
+                forced_boundaries / offered_positions if offered_positions else 0.0
+            )
+            gate["forced_boundaries"] = forced_boundaries
+            gate["offered_null_positions"] = offered_positions
 
     # Gate 1 (ACF match): computed unconditionally, here, because it needs
     # only the observed track / eligibility / region null already built above
@@ -2759,14 +4157,29 @@ def call_dmrs(
         # (support_array, value_array) per replicate, usable-filtered
         null_value_by_replicate = []
         null_full_support = []  # full-length (track.size) support array per replicate
-        for track, track_eligible, lag in tracks:
-            null_offsets = _member_offsets(w, lag)
-            null_base = np.arange(track.size)
-            valid_null = null_base + null_offsets.max() < n_cpg_total
+        for track, track_eligible, segments in tracks:
+            # Each segment reconstructs its OWN support against `deflated`'s
+            # genome-wide row indexing, using that segment's own lag and
+            # genome-wide start offset (spec §2b.2: one replicate now spans
+            # several chromosomes, each with its own lag, so a single scalar
+            # lag can no longer describe the whole track). `valid_null` is
+            # bounded to the segment's own extent, not the genome-wide
+            # total, so a window can never be read as reaching into the
+            # NEXT chromosome's rows.
             support = np.zeros(track.size, dtype=np.int64)
-            support[valid_null] = _window_support(
-                finite_mask, null_base[valid_null], null_offsets,
-            )
+            valid_null = np.zeros(track.size, dtype=bool)
+            position = 0
+            for _name, seg_lag, seg_start, seg_length in segments:
+                null_offsets = _member_offsets(w, seg_lag)
+                null_base = seg_start + np.arange(seg_length)
+                seg_valid = null_base + null_offsets.max() < seg_start + seg_length
+                seg_support = np.zeros(seg_length, dtype=np.int64)
+                seg_support[seg_valid] = _window_support(
+                    finite_mask, null_base[seg_valid], null_offsets,
+                )
+                support[position : position + seg_length] = seg_support
+                valid_null[position : position + seg_length] = seg_valid
+                position += seg_length
             null_full_support.append(support)
             usable = track_eligible & np.isfinite(track) & valid_null
             null_support_parts.append(support[usable])
@@ -2777,7 +4190,7 @@ def call_dmrs(
         )
         bin_result = _support_bin_edges(
             observed_support[usable_mask], config.support_bins,
-            config.min_null_values, pooled_null_support,
+            config.min_null_values_per_support_bin, pooled_null_support,
         )
         if bin_result["collapsed"]:
             support_binning = "collapsed_to_single"
@@ -2798,8 +4211,8 @@ def call_dmrs(
                         np.quantile(bin_values, config.null_quantile)
                     )
             # a bin with zero pooled null values (shouldn't happen after merging
-            # satisfied min_null_values, but guard defensively) falls back to the
-            # unconditioned scalar threshold for that bin only
+            # satisfied min_null_values_per_support_bin, but guard defensively)
+            # falls back to the unconditioned scalar threshold for that bin only
             per_bin_threshold = np.where(
                 np.isfinite(per_bin_threshold), per_bin_threshold, threshold,
             )
@@ -2845,7 +4258,13 @@ def call_dmrs(
     )
     manifest["n_regions"] = len(regions)
     if regions.size == 0:
-        manifest["status"] = "no_regions"
+        # A structural gate failure is a property of the null's construction,
+        # independent of whether any candidate happened to be called -- so it
+        # still headlines "status" here, even though there are no rows to
+        # annotate either way.
+        manifest["status"] = (
+            "inference_unreliable" if structural_gate_failure else "no_regions"
+        )
         return empty_regions, empty_values, manifest
 
     # Computed once, in one place, so both the row-building loop below and the
@@ -2859,6 +4278,7 @@ def call_dmrs(
     null_areas = []
     null_lengths = []
     null_edge_total = 0
+    null_edge_counts: list[int] = []
     # Reused (rather than re-segmenting) for `region_rate_by_support_bin`:
     # each entry is the `segment()` output for that replicate, already
     # computed against that replicate's OWN per-bin threshold array
@@ -2868,6 +4288,14 @@ def call_dmrs(
     # `support_binning in ("auto_on", "forced_on")` happens once, below,
     # before it's used.
     null_regions_by_replicate: list[np.ndarray] = []
+    # Spec §2c: retain per-replicate opportunity as the cluster dispersion
+    # offset, as well as the pooled N_s used by the adequacy guard. This is
+    # essential for fallback chromosomes: short- and long-region opportunity
+    # can differ materially even when total usable-edge counts are similar.
+    null_stratum_opportunity = dict.fromkeys(_LENGTH_STRATUM_MIN_EDGES, 0.0)
+    null_stratum_opportunity_by_replicate = {
+        s: [] for s in _LENGTH_STRATUM_MIN_EDGES
+    }
     for (track, null_eligible, *_rest), null_track_threshold in zip(
         region_tracks, region_track_thresholds, strict=True
     ):
@@ -2879,7 +4307,15 @@ def call_dmrs(
         # now every null shares the same per-bin threshold VALUES but each
         # applies them through its own support geometry.
         usable = null_eligible & np.isfinite(track)
-        null_edge_total += int(usable.sum())
+        replicate_edge_count = int(usable.sum())
+        null_edge_counts.append(replicate_edge_count)
+        null_edge_total += replicate_edge_count
+        replicate_opportunity = _stratum_opportunity(
+            _run_lengths_from_mask(usable), min_cpgs=config.min_cpgs
+        )
+        for s, opportunity in replicate_opportunity.items():
+            null_stratum_opportunity[s] += opportunity
+            null_stratum_opportunity_by_replicate[s].append(opportunity)
         null_regions = segment(
             track,
             usable,
@@ -3040,6 +4476,18 @@ def call_dmrs(
                 )
                 for medians in null_region_support_medians_by_replicate
             ]
+    # Spec §2c: O_s from the OBSERVED track's own usable mask -- independent
+    # of `config.length_stratified_fdr`, since opportunity is a property of
+    # where a region of stratum s's length COULD have formed at all, not of
+    # whether the estimator is currently reporting per length stratum.
+    observed_stratum_opportunity = _stratum_opportunity(
+        _run_lengths_from_mask(eligible & np.isfinite(statistic)),
+        min_cpgs=config.min_cpgs,
+    )
+    stratum_opportunity = {
+        s: (observed_stratum_opportunity[s], null_stratum_opportunity[s])
+        for s in _LENGTH_STRATUM_MIN_EDGES
+    }
     fdr_result = region_fdr_result(
         observed_areas,
         null_areas,
@@ -3049,21 +4497,57 @@ def call_dmrs(
         null_length_sets=null_lengths if config.length_stratified_fdr else None,
         observed_support_bins=observed_support_bins_for_fdr,
         null_support_bin_sets=null_support_bin_sets_for_fdr,
-        min_null_regions_for_fdr=config.min_null_regions_for_fdr,
+        stratum_opportunity=stratum_opportunity,
+        m_opportunity=config.m_opportunity,
+        null_edge_counts=null_edge_counts,
+        null_stratum_exposures=(
+            null_stratum_opportunity_by_replicate
+            if config.length_stratified_fdr else None
+        ),
     )
-    if config.fdr_decision == "upper":
-        # Spec §1.8 frames this guard as running "before computing regions";
-        # it actually runs here, after region_fdr_result, because `scale` and
-        # `m_bonferroni` (both required by the guard) aren't known until that
-        # call completes. This is intentional: the guard still fires before
-        # any region is reported to the user as significant, which is the
-        # actual intent behind the spec's wording (never silently return zero
-        # significant regions).
-        check_fdr_decision_vacuity(
-            fdr_result,
-            scale=fdr_result.diagnostics.get("scale", 0.0),
-            current_replicates=config.null_replicates,
-            target_fdr=config.target_fdr,
+    if structural_gate_failure:
+        # A structural gate (§2a.2) failed even though region_fdr_result's
+        # own aggregate-adequacy check happened to clear -- e.g. coverage
+        # below floor with enough pooled null REGIONS by count alone. That
+        # internal check is orthogonal (and, per §2c, on its way to being
+        # replaced by a per-stratum one), so it is left untouched; every
+        # inferential field is overridden here instead, uniformly, whichever
+        # gate tripped.
+        m = len(fdr_result.qvalue)
+        nan_f = np.full(m, np.nan, dtype=float)
+        neg_i = np.full(m, -1, dtype=np.int64)
+        fdr_result = RegionFdrResult(
+            qvalue=nan_f, tail_fdr=nan_f, qvalue_lower=nan_f,
+            qvalue_upper=nan_f, qvalue_resolution=nan_f,
+            null_exceedances=neg_i, qvalue_cutoff_rank=neg_i,
+            confidence_level=fdr_result.confidence_level,
+            diagnostics={
+                **fdr_result.diagnostics,
+                "status": "structural_gate_failure",
+                "structural_gate_failure_reasons": [
+                    name for name, g in structural_gates.items() if not g["passed"]
+                ],
+            },
+        )
+    elif config.fdr_decision == "upper":
+        # Record, but never reject, a valid no-call result. Replicate
+        # inadequacy is the separate nullable-inference path above. Name the
+        # setting that actually controls independent region-null clusters:
+        # member_step uses n_lag_draws, not null_replicates.
+        if resolved_region_null_mode == "member_step":
+            vacuity_replicate_knob = "n_lag_draws"
+            vacuity_current_replicates = len(region_lags)
+        else:
+            vacuity_replicate_knob = "null_replicates"
+            vacuity_current_replicates = config.null_replicates
+        fdr_result.diagnostics["upper_decision_diagnostic"] = (
+            check_fdr_decision_vacuity(
+                fdr_result,
+                scale=fdr_result.diagnostics.get("scale", 0.0),
+                current_replicates=vacuity_current_replicates,
+                target_fdr=config.target_fdr,
+                replicate_knob=vacuity_replicate_knob,
+            )
         )
     qvalues = fdr_result.qvalue
     manifest["fdr"] = fdr_result.diagnostics
@@ -3106,8 +4590,30 @@ def call_dmrs(
     decision_qvalue = (
         fdr_result.qvalue_upper if config.fdr_decision == "upper" else fdr_result.qvalue
     )
+    globally_unavailable = fdr_result.diagnostics.get("status") is not None
+    unavailable_strata = {
+        entry["stratum"]
+        for entry in (
+            fdr_result.diagnostics.get("insufficient_null_opportunity_strata") or []
+        )
+    }
+    unavailable_strata.update(
+        entry["stratum"].split("|sbin", 1)[0]
+        for entry in (
+            fdr_result.diagnostics.get("insufficient_cluster_replicates_strata") or []
+        )
+    )
+    unavailable_strata.update(
+        entry["stratum"].split("|sbin", 1)[0]
+        for entry in (
+            fdr_result.diagnostics.get("insufficient_scale_opportunity_strata") or []
+        )
+    )
 
     rows = []
+    support_rows: list[dict] | None = (
+        [] if config.biological_support_policy == "five_class_v1" else None
+    )
     value_rows = []
     for position, (first, last) in enumerate(regions):
         first, last = int(first), int(last)
@@ -3118,8 +4624,30 @@ def call_dmrs(
             np.nansum(block, axis=0), counts, out=means, where=counts > 0
         )
         description = characterise_region(means)
-        minority, minority_delta = region_minority_size(
-            means, (first, last), matrix
+        coordination_call = (
+            None if not np.isfinite(decision_qvalue[position])
+            else bool(decision_qvalue[position] <= config.target_fdr)
+        )
+        if (
+            coordination_call
+            and config.biological_support_policy == "five_class_v1"
+        ):
+            support = biological_support_diagnostics(
+                block, deflated[first : last + 1], means, config
+            )
+        else:
+            split = _two_means_partition(means)
+            support = {**split, **_SUPPORT_DIAGNOSTIC_DEFAULTS}
+        minority = int(support["minority_size"])
+        minority_delta = float(support["minority_delta"])
+        biological_class = (
+            classify_biological_support(
+                support,
+                coordination_significant=coordination_call,
+                n_observed=int(description["n_observed"]),
+            )
+            if config.biological_support_policy == "five_class_v1"
+            else None
         )
         chrom = frame["chr"].iloc[first]
         start = int(frame["start"].iloc[first])
@@ -3170,9 +4698,37 @@ def call_dmrs(
                 "minority_size_descriptive": int(minority),
                 "minority_delta_descriptive": float(minority_delta),
                 "passes_prevalence": bool(minority >= config.min_prevalence_samples),
-                "significant": bool(
-                    decision_qvalue[position] <= config.target_fdr
-                    and minority >= config.min_prevalence_samples
+                "coordination_significant": (
+                    pd.NA if coordination_call is None else coordination_call
+                ),
+                "biological_class": biological_class,
+                # Spec §2a.4: `False` means "tested, not significant" -- a
+                # different statement from "not tested because inference was
+                # unavailable". A refused run/stratum used to collapse both
+                # into `False` (`NaN <= target_fdr` is `False`), the same
+                # category error as reporting `q = 0` from an empty null.
+                # `pd.NA` (cast to BooleanDtype below) keeps them apart.
+                "significant": (
+                    pd.NA if not np.isfinite(decision_qvalue[position])
+                    else bool(
+                        decision_qvalue[position] <= config.target_fdr
+                        and minority >= config.min_prevalence_samples
+                    )
+                ),
+                "fdr_status": (
+                    "available"
+                    if np.isfinite(decision_qvalue[position])
+                    else (
+                        "unavailable_run"
+                        if globally_unavailable
+                        else (
+                            "unavailable_stratum"
+                            if length_stratum(last - first + 1) in unavailable_strata
+                            # Fail closed if a future refusal path produces a
+                            # non-finite decision without naming its stratum.
+                            else "unavailable_run"
+                        )
+                    )
                 ),
                 "n_samples_observed": description["n_observed"],
                 "missing_rate": float(np.mean(~np.isfinite(block))),
@@ -3190,18 +4746,157 @@ def call_dmrs(
                 "pvalue_descriptive": description["pvalue_descriptive"],
             }
         )
+        if support_rows is not None:
+            top_sample = int(support["furthest_mean_sample_index"])
+            support_rows.append(
+                {
+                    "region_id": region_id,
+                    "biological_support_policy": config.biological_support_policy,
+                    "biological_class": biological_class,
+                    "coordination_significant": (
+                        pd.NA if coordination_call is None else coordination_call
+                    ),
+                    "two_means_minority_size": minority,
+                    "two_means_minority_fraction": float(
+                        support["minority_fraction"]
+                    ),
+                    "two_means_delta_beta": minority_delta,
+                    "two_means_boundary_gap": support["boundary_gap"],
+                    "two_means_boundary_gap_fraction_delta": support[
+                        "boundary_gap_fraction_delta"
+                    ],
+                    "largest_gap_tail_size_legacy": description[
+                        "minor_group_size"
+                    ],
+                    "largest_gap_tail_fraction_legacy": description[
+                        "minor_group_fraction"
+                    ],
+                    "largest_gap_delta_beta_legacy": description["delta_beta"],
+                    "largest_adjacent_gap_legacy": description["largest_gap"],
+                    "direction_descriptive": description["direction"],
+                    "largest_gap_pvalue_descriptive_invalid_for_inference": (
+                        description["pvalue_descriptive"]
+                    ),
+                    "n_samples_observed": description["n_observed"],
+                    "missing_rate": float(np.mean(~np.isfinite(block))),
+                    "mean_beta": description["mean_beta"],
+                    "furthest_mean_sample": (
+                        sample_names[top_sample] if top_sample >= 0 else None
+                    ),
+                    "adjacent_support_score": support["adjacent_support_score"],
+                    "adjacent_support_score_without_furthest1": support[
+                        "adjacent_support_score_without_furthest1"
+                    ],
+                    "furthest1_adjacent_score_influence_fraction": support[
+                        "furthest1_adjacent_score_influence_fraction"
+                    ],
+                    "adjacent_support_score_without_furthest2": support[
+                        "adjacent_support_score_without_furthest2"
+                    ],
+                    "furthest2_adjacent_score_influence_fraction": support[
+                        "furthest2_adjacent_score_influence_fraction"
+                    ],
+                    "winsorised_adjacent_support_score": support[
+                        "winsorised_adjacent_support_score"
+                    ],
+                    "winsorised_score_retention": support[
+                        "winsorised_score_retention"
+                    ],
+                    "minority_direction_coherence": support[
+                        "minority_direction_coherence"
+                    ],
+                    "diagnostic_status": _diagnostic_status(coordination_call),
+                }
+            )
         value_rows.append(means)
 
     region_frame = pd.DataFrame(rows)[_REGION_COLUMNS]
+    # pandas would otherwise infer `object` dtype from a column mixing `bool`
+    # and `pd.NA`; the nullable BooleanDtype is what makes `pd.NA` survive a
+    # CSV round trip as a genuinely missing value rather than a stringified
+    # "<NA>" object (spec §2a.4).
+    region_frame["significant"] = region_frame["significant"].astype("boolean")
+    region_frame["coordination_significant"] = region_frame[
+        "coordination_significant"
+    ].astype("boolean")
+    if support_rows is not None:
+        support_frame = pd.DataFrame(
+            support_rows, columns=_SUPPORT_OUTPUT_COLUMNS
+        )
+        if len(support_frame):
+            support_frame["coordination_significant"] = support_frame[
+                "coordination_significant"
+            ].astype("boolean")
+        # Preserve the three-return-value API while exposing opt-in diagnostics.
+        region_frame.attrs["region_support_diagnostics"] = support_frame
     values_frame = pd.DataFrame(value_rows, columns=sample_names)
     values_frame.insert(0, "region_id", region_frame["region_id"].to_numpy())
-    manifest["status"] = "ok"
+
+    # Run status (spec §2a.1): `inference_unreliable` when any inferential
+    # column was suppressed for the whole run -- region_fdr_result sets a
+    # "status" diagnostics key on every one of its own refusal paths, and the
+    # structural-gate override above does the same, so its mere presence
+    # (never set on the success path) is sufficient. `ok_with_warnings` is a
+    # REPORTING label, not a gate (§0.1/§2a.3): calibration diagnostics are
+    # confounded with genuine signal on real data, so none of these suppress
+    # any column here, they only change which status string a reader sees.
+    inference_suppressed = fdr_result.diagnostics.get("status") is not None
+    acf_gate_result = manifest["gates"].get("acf")
+    region_exch = manifest["gates"].get("region_exchangeability")
+    null_exchangeability_ratio = null_diagnostics.get("null_exchangeability_ratio")
+    calibration_concern = (
+        (acf_gate_result is not None and not acf_gate_result["passed"])
+        or (
+            region_exch is not None
+            and region_exch["observed_regions"] > 0
+            and not math.isfinite(region_exch["region_exchangeability_ratio"])
+        )
+        or bool(fdr_result.diagnostics.get("null_count_overdispersion_warning"))
+        or (
+            null_exchangeability_ratio is not None
+            and math.isfinite(null_exchangeability_ratio)
+            and null_exchangeability_ratio > 1.25
+        )
+    )
+    # Spec §2c/§2a.1: a length stratum refused for insufficient null
+    # opportunity is a STRATUM-LOCAL failure, not a global one -- the null
+    # construction itself is sound, it just never had the chance to speak to
+    # regions this long. Checked after the global gate (which still wins:
+    # nothing is "partially" fine when the null is invalid as a whole) and
+    # before calibration concerns (an actual suppression of rows outranks a
+    # diagnostic that suppresses nothing).
+    stratum_refused = bool(
+        fdr_result.diagnostics.get("insufficient_null_opportunity_strata")
+        or fdr_result.diagnostics.get("insufficient_cluster_replicates_strata")
+        or fdr_result.diagnostics.get("insufficient_scale_opportunity_strata")
+    )
+    if inference_suppressed:
+        manifest["status"] = "inference_unreliable"
+    elif stratum_refused:
+        manifest["status"] = "partial_inference"
+    elif calibration_concern:
+        manifest["status"] = "ok_with_warnings"
+    else:
+        manifest["status"] = "ok"
     manifest["n_significant"] = int(region_frame["significant"].sum())
     manifest["n_passing_qvalue"] = int(
         (region_frame["region_qvalue"] <= config.target_fdr).sum()
     )
     manifest["n_passing_prevalence"] = int(region_frame["passes_prevalence"].sum())
-    manifest["schema_version"] = "2.2"
+    manifest["biological_support"] = {
+        "policy": support_policy_manifest,
+        "diagnostics_file": (
+            "region_support_diagnostics.csv"
+            if config.biological_support_policy == "five_class_v1"
+            else None
+        ),
+        "classification_counts": {
+            str(label): int((region_frame["biological_class"] == label).sum())
+            for label in _FIVE_CLASS_POLICY["labels"]
+        },
+        "not_classified": int(region_frame["biological_class"].isna().sum()),
+    }
+    manifest["schema_version"] = "2.3"
     manifest["fdr_decision"] = config.fdr_decision
     return region_frame, values_frame, manifest
 
@@ -3234,7 +4929,10 @@ _REGION_COLUMNS = [
     "minority_size_descriptive",
     "minority_delta_descriptive",
     "passes_prevalence",
+    "coordination_significant",
+    "biological_class",
     "significant",
+    "fdr_status",
     "n_samples_observed",
     "missing_rate",
     "mean_beta",
@@ -3246,3 +4944,23 @@ _REGION_COLUMNS = [
     "minor_group_samples_descriptive",
     "pvalue_descriptive",
 ]
+
+
+_REGION_MAIN_COLUMNS = [
+    "region_id", "chr", "start", "end", "n_cpg", "length_bp",
+    "cpg_index_start", "cpg_index_end", "statistic", "statistic_mean",
+    "statistic_min", "statistic_threshold", "region_support_median",
+    "region_threshold_mode", "region_area", "region_qvalue", "region_tail_fdr",
+    "region_qvalue_lower_95", "region_qvalue_upper_95",
+    "region_qvalue_resolution", "null_exceedances_at_cutoff",
+    "region_qvalue_cutoff_rank", "region_evidence_score",
+    "evidence_score_extrapolated", "coordination_significant",
+    "biological_class", "passes_prevalence", "significant", "fdr_status",
+]
+
+
+def main_region_table(regions: pd.DataFrame) -> pd.DataFrame:
+    """Return the concise CLI-facing subset of the region table."""
+
+    columns = [column for column in _REGION_MAIN_COLUMNS if column in regions]
+    return regions.loc[:, columns].copy()

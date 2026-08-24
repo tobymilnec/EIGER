@@ -1,5 +1,73 @@
 # EIGER benchmark: original vs EIGER 2
 
+## Stage 2D screen and confirm workflow
+
+Do not rerun the historical grid unchanged. The current suite derives both point
+and upper-bound decisions from each fitted run and records both, so stochastic null
+realisations are shared. It also includes a compact regression screen for the
+provisional biological-support layer:
+
+```bash
+python benchmarking/benchmark_suite.py support \
+  --out-dir benchmarking/results_stage2d_screen --seeds 10
+python benchmarking/benchmark_suite.py negative \
+  --out-dir benchmarking/results_stage2d_screen --seeds 20
+python benchmarking/benchmark_suite.py sweep \
+  --out-dir benchmarking/results_stage2d_screen --seeds 20
+```
+
+After the code, null definition and thresholds are frozen, use a fresh output
+directory and at least 100 seeds for confirmation:
+
+```bash
+python benchmarking/benchmark_suite.py negative \
+  --out-dir benchmarking/results_stage2d_confirm --seeds 100
+python benchmarking/benchmark_suite.py sweep \
+  --out-dir benchmarking/results_stage2d_confirm --seeds 100
+python benchmarking/benchmark_suite.py support \
+  --out-dir benchmarking/results_stage2d_confirm --seeds 100
+```
+
+The 2026-08-23 confirmatory manifests record commit `a4faddb`, but their dirty
+worktree fields are `null`; the harness now records the dirty state and source
+fingerprint. Re-run publication-grade results from a clean tagged commit. The
+checked-in CSVs remain useful audit evidence, but do not provide byte-level source
+provenance for that run.
+
+The confirmatory design must report coordination FDR/FDP, probability of any call
+under the complete null, point and upper power/recall by planted prevalence and
+region length, five-class accuracy, and one/two-sample influence-flag performance.
+Required signal types are private coherent epivariants, recurrent and cohort
+subgroups, continuous gradients, and realistic ordinary local background
+autocorrelation; required stresses are nuisance structure, small cohorts, high noise
+and random/structured missingness. The compact `support` command exercises those
+classification mechanics, but a publication claim still requires them inside full
+genomic simulations with null construction and segmentation active.
+
+> **Scale caveat, found running the 100-seed confirmatory grid above (Stage 2e):**
+> `negative`/`sweep` simulate ~10,000-20,000-CpG genomes and leave `null_min_lag`
+> at its genome-scale default of 1000. At that combination, `member_step`'s null
+> subtracks realise only 4-7 edges long, so the null has **zero** opportunity for
+> length strata at and above "10-19" CpGs -- including the 40-CpG stratum
+> `DEFAULT_STRATA` plants signal in. `sweep`'s point/upper realised-FDR and recall
+> columns are therefore not a valid real-signal calibration measurement at this
+> scale: true regions get correctly segmented and then refused from inference
+> (zero opportunity), not wrongly scored, which is the opportunity guard (§16 of
+> `docs/FDR.md`) working as designed, not a defect -- but it means this command
+> cannot be used to confirm or refute real-signal FDR control. `negative`'s
+> DMR-free `any_call` measurement is unaffected by this (it does not depend on the
+> null having opportunity for long strata to be meaningful) and is the one
+> confirmed quantity from this workflow; see `docs/FDR.md`'s "DMR-free
+> re-measurement (Stage 2e)". Real-signal calibration needed
+> `benchmarking/paper_grid.py`'s ~600,000-CpG `calibration`/`signal_grid`/
+> `power_curve` cells instead -- run 2026-08-23. Mean per-run FDP was 6.2%
+> overall and 6.9-15.4% in the weak-effect 4-CpG cells; the 4.4% pooled
+> false-call ratio is call-weighted and masks this boundary failure. See
+> `docs/FDR.md`'s "Real-signal re-measurement at genome scale (Stage 2e,
+> `paper_grid.py`)" for the per-cell results. `sweep`'s own scale bug still blocks this
+> command specifically for that purpose -- see `docs/FDR.md`'s "The
+> `heuristic_sweep` benchmark-scale bug, found en route (Stage 2e)".
+
 > **Historical — produced with EIGER v2.0.0 (commit `b8e4a19`).** All EIGER 2
 > region-level metrics below derive from the pre-v2.0.1 q-value calculation, which
 > had a confirmed direction/tie defect (see [docs/FDR.md](FDR.md)) and understated

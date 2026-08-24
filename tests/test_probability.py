@@ -30,7 +30,7 @@ from eiger2.probability import (  # noqa: E402
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("replicates", [1, 5, 20, 50])
+@pytest.mark.parametrize("replicates", [5, 10, 20, 50])
 def test_region_fdr_scale_is_not_double_discounted(replicates):
     """``null_edges`` is the total over replicates, so the expectation must use
     only the edge ratio.
@@ -48,17 +48,14 @@ def test_region_fdr_scale_is_not_double_discounted(replicates):
     # expected null count is the full per-replicate rate at every rank
     observed = np.linspace(1.9, 1.0, 100)
 
-    # region_fdr()'s signature is frozen, so it always applies the spec §5
-    # default min_null_regions_for_fdr=50; at replicates in {1, 5} the pooled
-    # null (replicates * per_replicate = 4 or 20) is deliberately far below
-    # that. Called through region_fdr_result directly with the guard disabled
-    # to isolate the scale arithmetic this test targets from null adequacy.
+    # No stratum_opportunity supplied, so spec §2c's per-stratum adequacy
+    # check is skipped (region_fdr_result's documented default), isolating
+    # the scale arithmetic this test targets from null adequacy entirely.
     q = region_fdr_result(
         observed,
         null_sets,
         observed_edges=observed_edges,
         null_edges=replicates * observed_edges,
-        min_null_regions_for_fdr=0,
     ).qvalue
     # expected null regions in a genome of observed_edges edges = per_replicate
     assert q[-1] == pytest.approx(per_replicate / observed.size, rel=1e-9)
@@ -214,7 +211,9 @@ def test_call_dmrs_emits_posterior_columns():
     )
     regions, _, manifest = call_dmrs(
         matrix, locations,
-        config=Eiger2Config(compute_posterior=True, region_null_mode="lag"),
+        config=Eiger2Config(
+            compute_posterior=True, region_null_mode="lag", null_min_lag=20,
+        ),
     )
     assert "region_evidence_score" in regions.columns
     assert "evidence_score_extrapolated" in regions.columns
@@ -301,16 +300,30 @@ def test_prevalence_floor_demotes_single_sample_regions():
         matrix[start : start + 30, rng.integers(0, 60)] += 0.45
     matrix = np.clip(matrix, 0.01, 0.99)
 
-    loose, _, _ = call_dmrs(
+    loose, _, loose_manifest = call_dmrs(
         matrix, locations,
         config=Eiger2Config(min_prevalence_samples=0, region_null_mode="lag"),
     )
-    strict, _, _ = call_dmrs(
+    strict, _, strict_manifest = call_dmrs(
         matrix, locations,
         config=Eiger2Config(min_prevalence_samples=3, region_null_mode="lag"),
     )
     # the regions themselves are unchanged; only their significance differs
     assert len(loose) == len(strict)
+    assert "region_support_diagnostics" not in loose.attrs
+    assert "region_support_diagnostics" not in strict.attrs
+    assert loose_manifest["biological_support"]["diagnostics_file"] is None
+    assert strict_manifest["biological_support"]["diagnostics_file"] is None
+    # The support layer and legacy prevalence filter are post-selection: the
+    # locked Stage 2D FDR and its coordination-only decision are bit-identical.
+    for column in (
+        "region_qvalue", "region_qvalue_lower_95", "region_qvalue_upper_95",
+        "region_qvalue_resolution",
+    ):
+        np.testing.assert_array_equal(loose[column], strict[column])
+    assert loose["coordination_significant"].reset_index(drop=True).equals(
+        strict["coordination_significant"].reset_index(drop=True)
+    )
     single = strict["minority_size_descriptive"] <= 1
     if single.any():
         assert not strict.loc[single, "significant"].any()

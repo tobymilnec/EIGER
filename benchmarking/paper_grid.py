@@ -18,13 +18,21 @@ a dedicated power-curve sweep (recall vs. effect size at fixed prevalence).
 
 Usage (out-of-band, per stage):
     python paper_grid.py calibration   --seeds 100 --jobs 16 --resume
+    python paper_grid.py length_boundary --seeds 100 --jobs 16 --resume
     python paper_grid.py signal_grid   --seeds 20  --jobs 16 --resume
     python paper_grid.py power_curve   --seeds 10  --jobs 16 --resume
     python paper_grid.py gap_sweep     --seeds 20  --jobs 16 --resume
+    python paper_grid.py multichrom    --seeds 20  --jobs 16 --resume
 
 At the measured 225s/cell median (STAGE1F_STOP_REPORT.md §3), serial totals are
 ~62.5h/17.5h/11.3h/6.7h; `--jobs 16` on a 16-core machine brings each to roughly
 1/16th of that, since every cell is independent.
+
+``multichrom`` (spec §2b.5) is DEFINED, not yet run or timed even provisionally --
+added alongside Stage 2b's chromosome-aware null construction fix, per-cell cost is
+unmeasured (likely higher than the single-chromosome cells above: `layout_chrom=None`
+spans all three fixture chromosomes at once). Execution belongs here, with the rest
+of this grid, at §2f.
 
 ``--jobs N`` (default 1, serial, no new dependency) parallelises across cells with
 ``concurrent.futures.ProcessPoolExecutor``. One cell per task; each cell's result is
@@ -40,15 +48,18 @@ robustness.
 Each subcommand writes its own combined CSV to results_v210/ and never overwrites
 another subcommand's file or an earlier results_* directory.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -58,10 +69,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "layouts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 
-from eiger2.benchmark import simulate, evaluate  # noqa: E402
-from eiger2.core import Eiger2Config, call_dmrs  # noqa: E402
 from benchmark_suite import (  # noqa: E402
-    DEFAULT_STRATA, SCENARIOS, _classify, _v2_called, GAP_SWEEP_VALUES, gap_sweep,
+    DEFAULT_STRATA,
+    GAP_SWEEP_VALUES,
+    SCENARIOS,
+    _classify,
+    _false_discovery_proportion,
+    _v2_called,
+    gap_sweep,
+)
+
+from eiger2.benchmark import evaluate, simulate  # noqa: E402
+from eiger2.core import (  # noqa: E402
+    Eiger2Config,
+    call_dmrs,
+    centre_cpgs,
+    chromosome_lag_feasibility,
+    null_tracks,
 )
 
 OUT = Path(__file__).resolve().parent / "results_v210"
@@ -70,8 +94,8 @@ CELLS_DIR = OUT / "cells"
 
 LAYOUTS = ("wgbs_real", "epic_fitted")
 SCENARIO_NAMES = ("clean", "nuisance", "missingness", "small_n", "high_noise")
-GENOME_SPACING = 50_000          # planted-signal calls: n_cpg ~= spacing*12 + 400
-CALIB_SPACING = 600_000          # DMR-free calls (strata=[]): n_cpg = spacing*1 + 400
+GENOME_SPACING = 50_000  # planted-signal calls: n_cpg ~= spacing*12 + 400
+CALIB_SPACING = 600_000  # DMR-free calls (strata=[]): n_cpg = spacing*1 + 400
 DENSE_EXCLUDED_NOTE = (
     "dense is excluded from every FDR-facing criterion here (Stage 1d-D SS5) -- "
     "if it is ever added to this script's LAYOUTS for statistic-level continuity "
@@ -87,10 +111,14 @@ DENSE_EXCLUDED_NOTE = (
 #: bottom rung of DEFAULT_STRATA at fraction=0.50); the additional 0.10 rung and
 #: reusing 0.05 at the OTHER three prevalences is what is new.
 SMALL_DELTA_STRATA: list[tuple[float, float]] = [
-    (0.05, 0.10), (0.05, 0.05),
-    (0.10, 0.10), (0.10, 0.05),
-    (0.25, 0.10), (0.25, 0.05),
-    (0.50, 0.10), (0.50, 0.05),
+    (0.05, 0.10),
+    (0.05, 0.05),
+    (0.10, 0.10),
+    (0.10, 0.05),
+    (0.25, 0.10),
+    (0.25, 0.05),
+    (0.50, 0.10),
+    (0.50, 0.05),
 ]
 
 #: effect sizes already used in DEFAULT_STRATA, at the two-carrier floor
@@ -100,7 +128,8 @@ LOW_PREVALENCE_EFFECT_SIZES: tuple[float, ...] = (0.35, 0.30, 0.25, 0.20)
 
 
 def two_carrier_floor_strata(
-    n_samples: int, effect_sizes=LOW_PREVALENCE_EFFECT_SIZES,
+    n_samples: int,
+    effect_sizes=LOW_PREVALENCE_EFFECT_SIZES,
 ) -> list[tuple[float, float]]:
     floor = 2.0 / n_samples
     return [(floor, delta) for delta in effect_sizes]
@@ -111,12 +140,16 @@ def two_carrier_floor_strata(
 #: extended-strata axis, not tested alone the way SCENARIOS["small_n"] already does.
 SMALL_N_VALUES: tuple[int, ...] = (12, 20)
 MIN_CPGS_DMR_LENGTH = 4  # Task 3: "DMR length at min_cpgs exactly"
+BOUNDARY_LENGTHS: tuple[int, ...] = (4, 6, 8, 10)
+BOUNDARY_SAMPLE_SIZES: tuple[int, ...] = (12, 20, 80)
 
 
 def _layout_kwargs(layout: str, seed: int, **extra) -> dict:
     kwargs = dict(layout=layout, seed=seed, **extra)
     if layout == "wgbs_real":
-        kwargs["layout_offset"] = int(np.random.default_rng(seed).integers(0, 1_000_000))
+        kwargs["layout_offset"] = int(
+            np.random.default_rng(seed).integers(0, 1_000_000)
+        )
     else:
         kwargs["layout_profile"] = "chr1"
     return kwargs
@@ -199,9 +232,7 @@ def _run_grid_parallel(
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["NUMBA_NUM_THREADS"] = "1"
         with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_init) as pool:
-            futures = {
-                pool.submit(cell_fn, *args): cid for cid, args in pending
-            }
+            futures = {pool.submit(cell_fn, *args): cid for cid, args in pending}
             for future in as_completed(futures):
                 _write_and_collect(futures[future], future.result())
 
@@ -215,12 +246,19 @@ def _run_grid_parallel(
 
 def _calibration_cell(layout: str, scenario: str, seed: int) -> dict:
     kwargs = _layout_kwargs(
-        layout, seed, strata=[], replicates=0, spacing=CALIB_SPACING,
+        layout,
+        seed,
+        strata=[],
+        replicates=0,
+        spacing=CALIB_SPACING,
         **SCENARIOS[scenario],
     )
     matrix, locations, _ = simulate(**kwargs)
     config = Eiger2Config(
-        window=4, null_min_lag=1000, random_seed=seed, max_cpg_gap_bp=300,
+        window=4,
+        null_min_lag=1000,
+        random_seed=seed,
+        max_cpg_gap_bp=300,
     )
     t0 = time.time()
     _, _, manifest = call_dmrs(matrix, locations, config=config)
@@ -232,8 +270,11 @@ def _calibration_cell(layout: str, scenario: str, seed: int) -> dict:
     # happens to call nothing doesn't crash this grid.
     region_exch = gates.get("region_exchangeability")
     return dict(
-        layout=layout, scenario=scenario, seed=seed,
-        n_cpg=len(locations), runtime_seconds=elapsed,
+        layout=layout,
+        scenario=scenario,
+        seed=seed,
+        n_cpg=len(locations),
+        runtime_seconds=elapsed,
         n_candidates=int(manifest.get("n_regions", 0)),
         acf_passed=gates["acf"]["passed"],
         region_exchangeability_ratio=(
@@ -250,7 +291,10 @@ def _calibration_cell(layout: str, scenario: str, seed: int) -> dict:
 
 
 def dmr_free_calibration(
-    seeds: range, *, jobs: int = 1, resume: bool = False,
+    seeds: range,
+    *,
+    jobs: int = 1,
+    resume: bool = False,
 ) -> pd.DataFrame:
     """Extends Stage 1e's 2-seed calibration_member_step.csv to the full
     100-seed design. Identical per-cell logic to that run (same manifest
@@ -258,10 +302,121 @@ def dmr_free_calibration(
     """
     cells = [
         (layout, scenario, seed)
-        for layout in LAYOUTS for scenario in SCENARIO_NAMES for seed in seeds
+        for layout in LAYOUTS
+        for scenario in SCENARIO_NAMES
+        for seed in seeds
     ]
     return _run_grid_parallel(
-        "calibration", cells, _calibration_cell, jobs=jobs, resume=resume,
+        "calibration",
+        cells,
+        _calibration_cell,
+        jobs=jobs,
+        resume=resume,
+    )
+
+
+# --------------------------------------------------------------------------
+# 1b. Multi-chromosome cell (spec §2b.5) -- DEFINED, NOT RUN as part of
+# Stage 2b. Execution belongs to §2f, alongside the rest of this grid.
+# --------------------------------------------------------------------------
+
+#: Real hg38, EVERY chromosome present at once (layout_chrom=None -- spec
+#: §2b.5), not sliced to one as every cell above and every benchmark ever
+#: run before Stage 2b always was (that is precisely why the genome-wide
+#: lag defect survived seven review stages). Spacing chosen so `n_cpg`
+#: comfortably clears member_step's ~103,000-CpG floor at defaults, so this
+#: cell exercises the actual production null_replicates=100.
+MULTICHROM_SPACING = 60_000  # n_cpg = spacing*1 + 400, strata=[] (DMR-free)
+
+
+def _multichrom_cell(scenario: str, seed: int) -> dict:
+    """The pytest-scale checks ``tests/test_chromosome_aware_null.py``
+    (spec §2b.5) pins, at full production scale and crossed with every
+    nuisance scenario, not just one seed at one scale: surviving null
+    tracks (>= 90% of null_replicates), null coverage, chromosome-exposure
+    (spec §2b.3), the composition check (each chromosome's own share of
+    pooled null positions vs. its share of eligible observed edges, within
+    a factor of 1.2 -- the check a cap-only fix would fail), and whether
+    every structural gate (spec §2a.2) passes.
+    """
+    kwargs = dict(
+        seed=seed,
+        strata=[],
+        replicates=0,
+        spacing=MULTICHROM_SPACING,
+        layout="wgbs_real",
+        layout_chrom=None,
+        **SCENARIOS[scenario],
+    )
+    matrix, locations, _ = simulate(**kwargs)
+    config = Eiger2Config(
+        window=4,
+        null_min_lag=1000,
+        random_seed=seed,
+        max_cpg_gap_bp=300,
+    )
+    t0 = time.time()
+    _, _, manifest = call_dmrs(matrix, locations, config=config)
+    elapsed = time.time() - t0
+    structural = manifest["gates"]["structural"]
+
+    # Composition check: not exposed by call_dmrs's own manifest (which
+    # reports the pooled null, not a per-chromosome breakdown of it), so
+    # recomputed directly here from null_tracks() -- the same construction
+    # call_dmrs itself makes internally, not a second null.
+    residuals = centre_cpgs(matrix)
+    tracks = null_tracks(residuals, config, locations)
+    null_positions_by_chromosome: dict[str, int] = {}
+    for _track, eligible, segments in tracks:
+        position = 0
+        for name, _lag, _start, length in segments:
+            segment_eligible = eligible[position : position + length]
+            null_positions_by_chromosome[name] = null_positions_by_chromosome.get(
+                name, 0
+            ) + int(segment_eligible.sum())
+            position += length
+    feasibility = chromosome_lag_feasibility(locations, config)
+    total_edges = sum(v["eligible_observed_edges"] for v in feasibility.values())
+    total_null = sum(null_positions_by_chromosome.values())
+    composition_ratio_by_chromosome = {
+        name: (
+            (null_positions_by_chromosome.get(name, 0) / total_null)
+            / (v["eligible_observed_edges"] / total_edges)
+        )
+        if total_null and total_edges and v["eligible_observed_edges"]
+        else None
+        for name, v in feasibility.items()
+    }
+    composition_within_factor_1_2 = all(
+        ratio is not None and 1 / 1.2 <= ratio <= 1.2
+        for ratio in composition_ratio_by_chromosome.values()
+    )
+
+    return dict(
+        scenario=scenario,
+        seed=seed,
+        n_cpg=len(locations),
+        chromosome_order=manifest.get("chromosome_order"),
+        runtime_seconds=elapsed,
+        surviving_null_tracks_fraction=structural["surviving_null_tracks"]["fraction"],
+        null_coverage=structural["null_coverage"]["value"],
+        chromosome_exposure_missing=structural["chromosome_exposure"][
+            "missing_exposure"
+        ],
+        composition_ratio_by_chromosome=composition_ratio_by_chromosome,
+        composition_within_factor_1_2=composition_within_factor_1_2,
+        structural_gates_all_passed=all(g["passed"] for g in structural.values()),
+    )
+
+
+def multichrom(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.DataFrame:
+    cells = [(scenario, seed) for scenario in SCENARIO_NAMES for seed in seeds]
+    return _run_grid_parallel(
+        "multichrom",
+        cells,
+        _multichrom_cell,
+        jobs=jobs,
+        resume=resume,
     )
 
 
@@ -281,10 +436,14 @@ def _signal_grid_cells_for(layout: str, seed: int) -> list[tuple]:
         grid_cells.append(
             (f"low_prevalence_n{n_samples}_len10", floor_strata, n_samples, 10)
         )
-        grid_cells.append((
-            f"small_delta_n{n_samples}_len{MIN_CPGS_DMR_LENGTH}",
-            SMALL_DELTA_STRATA, n_samples, MIN_CPGS_DMR_LENGTH,
-        ))
+        grid_cells.append(
+            (
+                f"small_delta_n{n_samples}_len{MIN_CPGS_DMR_LENGTH}",
+                SMALL_DELTA_STRATA,
+                n_samples,
+                MIN_CPGS_DMR_LENGTH,
+            )
+        )
     return [
         (layout, cell_name, strata, n_samples, dmr_length, seed)
         for cell_name, strata, n_samples, dmr_length in grid_cells
@@ -292,18 +451,33 @@ def _signal_grid_cells_for(layout: str, seed: int) -> list[tuple]:
 
 
 def _signal_grid_cell(
-    layout: str, cell_name: str, strata: list[tuple[float, float]],
-    n_samples: int, dmr_length: int, seed: int,
+    layout: str,
+    cell_name: str,
+    strata: list[tuple[float, float]],
+    n_samples: int,
+    dmr_length: int,
+    seed: int,
 ) -> dict:
     kwargs = _layout_kwargs(
-        layout, seed, strata=strata, replicates=3, spacing=GENOME_SPACING,
-        dmr_length=dmr_length, n_samples=n_samples, n_latent=2,
-        latent_loading_sd=0.07, noise_sd=0.04, missing_rate=0.0,
+        layout,
+        seed,
+        strata=strata,
+        replicates=3,
+        spacing=GENOME_SPACING,
+        dmr_length=dmr_length,
+        n_samples=n_samples,
+        n_latent=2,
+        latent_loading_sd=0.07,
+        noise_sd=0.04,
+        missing_rate=0.0,
     )
     matrix, locations, truth = simulate(**kwargs)
     config = Eiger2Config(
-        window=4, null_min_lag=1000, random_seed=seed,
-        max_cpg_gap_bp=300, min_cpgs=4,
+        window=4,
+        null_min_lag=1000,
+        random_seed=seed,
+        max_cpg_gap_bp=300,
+        min_cpgs=4,
     )
     t0 = time.time()
     regions, _, manifest = call_dmrs(matrix, locations, config=config)
@@ -312,11 +486,19 @@ def _signal_grid_cell(
     tp, fp, recovered = _classify(called, truth, min_overlap=4)
     n_called = tp + fp
     return dict(
-        layout=layout, cell=cell_name, seed=seed, n_samples=n_samples,
-        dmr_length=dmr_length, n_cpg=len(locations), runtime_seconds=elapsed,
-        n_truth=len(truth), n_candidates=int(manifest.get("n_regions", 0)),
-        n_significant=n_called, true_positive=tp, false_positive=fp,
-        realised_fdr=(fp / n_called if n_called else float("nan")),
+        layout=layout,
+        cell=cell_name,
+        seed=seed,
+        n_samples=n_samples,
+        dmr_length=dmr_length,
+        n_cpg=len(locations),
+        runtime_seconds=elapsed,
+        n_truth=len(truth),
+        n_candidates=int(manifest.get("n_regions", 0)),
+        n_significant=n_called,
+        true_positive=tp,
+        false_positive=fp,
+        realised_fdr=_false_discovery_proportion(fp, n_called),
         recall=(len(recovered) / len(truth) if truth else float("nan")),
     )
 
@@ -331,11 +513,67 @@ def signal_grid(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.Data
     """
     cells = [
         cell
-        for layout in LAYOUTS for seed in seeds
+        for layout in LAYOUTS
+        for seed in seeds
         for cell in _signal_grid_cells_for(layout, seed)
     ]
     return _run_grid_parallel(
-        "signal_grid", cells, _signal_grid_cell, jobs=jobs, resume=resume,
+        "signal_grid",
+        cells,
+        _signal_grid_cell,
+        jobs=jobs,
+        resume=resume,
+    )
+
+
+# --------------------------------------------------------------------------
+# 2b. Short-region calibration boundary
+# --------------------------------------------------------------------------
+
+
+def _length_boundary_cell(
+    layout: str,
+    n_samples: int,
+    dmr_length: int,
+    seed: int,
+) -> dict:
+    return _signal_grid_cell(
+        layout,
+        f"small_delta_n{n_samples}_len{dmr_length}",
+        SMALL_DELTA_STRATA,
+        n_samples,
+        dmr_length,
+        seed,
+    )
+
+
+def length_boundary(
+    seeds: range,
+    *,
+    jobs: int = 1,
+    resume: bool = False,
+) -> pd.DataFrame:
+    """Resolve the operating boundary at 4, 6, 8, and 10 CpGs.
+
+    The grid crosses region length with the two small cohorts and the standard
+    80-sample cohort under the difficult small-effect strata. Each row is one
+    independent run, so uncertainty must be calculated over seeds rather than
+    over the pooled set of called regions.
+    """
+
+    cells = [
+        (layout, n_samples, dmr_length, seed)
+        for layout in LAYOUTS
+        for n_samples in BOUNDARY_SAMPLE_SIZES
+        for dmr_length in BOUNDARY_LENGTHS
+        for seed in seeds
+    ]
+    return _run_grid_parallel(
+        "length_boundary",
+        cells,
+        _length_boundary_cell,
+        jobs=jobs,
+        resume=resume,
     )
 
 
@@ -348,62 +586,109 @@ def signal_grid(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.Data
 #: at a time (not mixed) so recall-per-delta is cleanly attributable.
 POWER_CURVE_PREVALENCE = 0.25
 POWER_CURVE_DELTAS: tuple[float, ...] = (
-    0.05, 0.075, 0.10, 0.125, 0.15, 0.20, 0.25, 0.30, 0.35,
+    0.05,
+    0.075,
+    0.10,
+    0.125,
+    0.15,
+    0.20,
+    0.25,
+    0.30,
+    0.35,
 )
 
 
 def _power_curve_cell(layout: str, delta: float, seed: int) -> dict:
     kwargs = _layout_kwargs(
-        layout, seed,
-        strata=[(POWER_CURVE_PREVALENCE, delta)], replicates=10,
-        spacing=GENOME_SPACING, dmr_length=10, n_samples=80,
-        n_latent=2, latent_loading_sd=0.07, noise_sd=0.04,
+        layout,
+        seed,
+        strata=[(POWER_CURVE_PREVALENCE, delta)],
+        replicates=10,
+        spacing=GENOME_SPACING,
+        dmr_length=10,
+        n_samples=80,
+        n_latent=2,
+        latent_loading_sd=0.07,
+        noise_sd=0.04,
         missing_rate=0.0,
     )
     matrix, locations, truth = simulate(**kwargs)
     config = Eiger2Config(
-        window=4, null_min_lag=1000, random_seed=seed,
-        max_cpg_gap_bp=300, min_cpgs=4,
+        window=4,
+        null_min_lag=1000,
+        random_seed=seed,
+        max_cpg_gap_bp=300,
+        min_cpgs=4,
     )
     regions, _, manifest = call_dmrs(matrix, locations, config=config)
     called = _v2_called(regions)
     tp, fp, recovered = _classify(called, truth, min_overlap=4)
     n_called = tp + fp
     return dict(
-        layout=layout, prevalence=POWER_CURVE_PREVALENCE, delta=delta,
-        seed=seed, n_truth=len(truth),
+        layout=layout,
+        prevalence=POWER_CURVE_PREVALENCE,
+        delta=delta,
+        seed=seed,
+        n_truth=len(truth),
         recall=(len(recovered) / len(truth) if truth else float("nan")),
-        realised_fdr=(fp / n_called if n_called else float("nan")),
+        realised_fdr=_false_discovery_proportion(fp, n_called),
     )
 
 
 def power_curve(seeds: range, *, jobs: int = 1, resume: bool = False) -> pd.DataFrame:
     cells = [
         (layout, delta, seed)
-        for layout in LAYOUTS for delta in POWER_CURVE_DELTAS for seed in seeds
+        for layout in LAYOUTS
+        for delta in POWER_CURVE_DELTAS
+        for seed in seeds
     ]
     return _run_grid_parallel(
-        "power_curve", cells, _power_curve_cell, jobs=jobs, resume=resume,
+        "power_curve",
+        cells,
+        _power_curve_cell,
+        jobs=jobs,
+        resume=resume,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "subcommand", choices=["calibration", "signal_grid", "power_curve", "gap_sweep"]
+        "subcommand",
+        choices=[
+            "calibration",
+            "signal_grid",
+            "length_boundary",
+            "power_curve",
+            "gap_sweep",
+            "multichrom",
+        ],
     )
     parser.add_argument("--seeds", type=int, default=100)
     parser.add_argument(
-        "--jobs", type=int, default=1,
+        "--jobs",
+        type=int,
+        default=1,
         help="parallel worker processes; 1 (default) runs serially with no "
-             "new dependency. Every cell is independent.",
+        "new dependency. Every cell is independent.",
     )
     parser.add_argument(
-        "--resume", action="store_true",
+        "--resume",
+        action="store_true",
         help="skip cells whose per-cell result file already exists under "
-             "results_v210/cells/<subcommand>/",
+        "results_v210/cells/<subcommand>/",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=OUT,
+        help="output directory (default: benchmarking/results_v210)",
     )
     args = parser.parse_args()
+
+    OUT = args.out.resolve()
+    OUT.mkdir(parents=True, exist_ok=True)
+    CELLS_DIR = OUT / "cells"
 
     # Set before any ProcessPoolExecutor worker is spawned: each worker is a
     # fresh interpreter that imports numpy/numba only after inheriting this
@@ -426,15 +711,62 @@ if __name__ == "__main__":
 
     t0 = time.time()
     if args.subcommand == "calibration":
-        frame = dmr_free_calibration(range(args.seeds), jobs=args.jobs, resume=args.resume)
+        frame = dmr_free_calibration(
+            range(args.seeds), jobs=args.jobs, resume=args.resume
+        )
         frame.to_csv(OUT / "calibration_member_step_full.csv", index=False)
     elif args.subcommand == "signal_grid":
         frame = signal_grid(range(args.seeds), jobs=args.jobs, resume=args.resume)
         frame.to_csv(OUT / "signal_grid_extended.csv", index=False)
+    elif args.subcommand == "length_boundary":
+        frame = length_boundary(range(args.seeds), jobs=args.jobs, resume=args.resume)
+        frame.to_csv(OUT / "length_boundary.csv", index=False)
     elif args.subcommand == "power_curve":
         frame = power_curve(range(args.seeds), jobs=args.jobs, resume=args.resume)
         frame.to_csv(OUT / "power_curve.csv", index=False)
+    elif args.subcommand == "multichrom":
+        frame = multichrom(range(args.seeds), jobs=args.jobs, resume=args.resume)
+        frame.to_csv(OUT / "multichrom.csv", index=False)
     else:
         frame = gap_sweep(list(range(args.seeds)))
         frame.to_csv(OUT / "gap_sweep_full.csv", index=False)
-    print(f"wrote {len(frame)} rows in {time.time() - t0:.0f}s", flush=True)
+    elapsed = time.time() - t0
+    repository = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repository,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = "unknown", None
+    metadata = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "command": sys.argv,
+        "subcommand": args.subcommand,
+        "seeds": args.seeds,
+        "jobs": args.jobs,
+        "resume": args.resume,
+        "rows": len(frame),
+        "runtime_seconds": elapsed,
+        "git_commit": commit,
+        "git_worktree_dirty": dirty,
+        "python": sys.version,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+    }
+    (OUT / f"{args.subcommand}_run_metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n"
+    )
+    print(f"wrote {len(frame)} rows in {elapsed:.0f}s", flush=True)

@@ -41,6 +41,10 @@ Six experiments, each answering a question the head-to-head accuracy tables in
                compares the two directly, DMR-free, per bin, and flags any
                bin whose ratio exceeds 2.0.
 
+``support``    Compact deterministic smoke grid for the five post-selection
+               biological-support labels. It is a regression screen, not a
+               substitute for the confirmatory full-pipeline grid.
+
 Run everything::
 
     python -m eiger2.benchmark_suite all --out-dir benchmark_v2 --seeds 10
@@ -70,8 +74,13 @@ import pandas as pd
 from compare import run_original
 
 from eiger2.benchmark import simulate
-from eiger2.cli import _git_commit, _peak_memory_mb
-from eiger2.core import Eiger2Config, call_dmrs
+from eiger2.cli import _git_provenance, _peak_memory_mb
+from eiger2.core import (
+    Eiger2Config,
+    biological_support_diagnostics,
+    call_dmrs,
+    classify_biological_support,
+)
 from eiger2.manifest_utils import build_manifest_envelope
 from eiger2.probability import calibration_error, reliability_table
 
@@ -146,6 +155,12 @@ def _classify(
     return true_positive, false_positive, recovered
 
 
+def _false_discovery_proportion(false_positive: int, n_called: int) -> float:
+    """Return V/max(R, 1), the per-run quantity averaged to estimate FDR."""
+
+    return false_positive / n_called if n_called else 0.0
+
+
 def _v2_called(regions: pd.DataFrame, *, significant_only: bool = True):
     if len(regions) == 0:
         return []
@@ -156,6 +171,24 @@ def _v2_called(regions: pd.DataFrame, *, significant_only: bool = True):
             frame["cpg_index_end"].astype(int),
         )
     )
+
+
+def _v2_called_by_qvalue(
+    regions: pd.DataFrame, column: str, target_fdr: float,
+    *, min_prevalence_samples: int = 0,
+) -> list[tuple[int, int]]:
+    """Evaluate a q-value decision with the configured prevalence floor."""
+
+    if len(regions) == 0:
+        return []
+    decision = pd.to_numeric(regions[column], errors="coerce") <= target_fdr
+    if min_prevalence_samples > 0:
+        decision &= regions["minority_size_descriptive"] >= min_prevalence_samples
+    frame = regions[decision.fillna(False)]
+    return list(zip(
+        frame["cpg_index_start"].astype(int),
+        frame["cpg_index_end"].astype(int),
+    ))
 
 
 # --------------------------------------------------------------------------
@@ -205,9 +238,19 @@ def negative_control(
             for statistic in statistics:
                 config = Eiger2Config(statistic=statistic)
                 regions, _, manifest = call_dmrs(matrix, locations, config=config)
-                significant = _v2_called(regions)
+                point = _v2_called_by_qvalue(
+                    regions, "region_qvalue", config.target_fdr,
+                    min_prevalence_samples=config.min_prevalence_samples,
+                )
+                upper = _v2_called_by_qvalue(
+                    regions, "region_qvalue_upper_95", config.target_fdr,
+                    min_prevalence_samples=config.min_prevalence_samples,
+                )
                 rows.append(_row(
-                    f"EIGER 2 {statistic}", len(significant),
+                    f"EIGER 2 {statistic}", len(point),
+                    point_false_regions=len(point),
+                    upper_false_regions=len(upper),
+                    point_any_call=bool(point), upper_any_call=bool(upper),
                     candidate_regions=int(manifest.get("n_regions", 0)),
                     threshold=manifest.get("null", {}).get("threshold", np.nan),
                     n_latent_removed=manifest.get(
@@ -237,11 +280,10 @@ def exchangeability(
     held-out half (the control -- must equal ``1 - null_quantile``) and on the
     observed track (the actual gate; median across seeds must be <= 1.25).
 
-    Gate 1 -- ACF match, Gate 2 -- region-level exchangeability (both master spec
-    §6.2, new in Stage 1d-B): computed from the SAME tracks/statistic already built
-    for the edge-level gate, not a second simulation. Both gates are expected to
-    FAIL on current code at every layout (master spec §6.3's baseline) -- this
-    function reports the numbers; it does not gate on them.
+    ACF match and region-level exchangeability are computed from the same tracks,
+    not a second simulation. They are calibration criteria here because these
+    inputs are known to be DMR-free; the same differences are descriptive, not
+    hard structural failures, on a signal-containing cohort.
     """
 
     from eiger2.core import (
@@ -381,9 +423,19 @@ def heuristic_sweep(
                     elapsed = time.perf_counter() - started
 
                     candidates = int(manifest.get("n_regions", 0))
-                    called = _v2_called(regions)
+                    called = _v2_called_by_qvalue(
+                        regions, "region_qvalue", target_fdr,
+                        min_prevalence_samples=config.min_prevalence_samples,
+                    )
+                    upper_called = _v2_called_by_qvalue(
+                        regions, "region_qvalue_upper_95", target_fdr,
+                        min_prevalence_samples=config.min_prevalence_samples,
+                    )
                     true_positive, false_positive, recovered = _classify(
                         called, truth, min_overlap=min_overlap
+                    )
+                    upper_tp, upper_fp, upper_recovered = _classify(
+                        upper_called, truth, min_overlap=min_overlap
                     )
                     n_called = true_positive + false_positive
                     rows.append({
@@ -393,10 +445,19 @@ def heuristic_sweep(
                         "significant_regions": n_called,
                         "true_positive": true_positive,
                         "false_positive": false_positive,
-                        "realised_fdr": (
-                            false_positive / n_called if n_called else np.nan
+                        "realised_fdr": _false_discovery_proportion(
+                            false_positive, n_called
                         ),
                         "recall": len(recovered) / len(truth) if truth else np.nan,
+                        "upper_significant_regions": upper_tp + upper_fp,
+                        "upper_true_positive": upper_tp,
+                        "upper_false_positive": upper_fp,
+                        "upper_realised_fdr": _false_discovery_proportion(
+                            upper_fp, upper_tp + upper_fp
+                        ),
+                        "upper_recall": (
+                            len(upper_recovered) / len(truth) if truth else np.nan
+                        ),
                         "n_truth": len(truth),
                         "target_fdr": target_fdr,
                         "runtime_seconds": elapsed,
@@ -489,8 +550,8 @@ def gap_sweep(
                     "significant_regions": n_called,
                     "true_positive": true_positive,
                     "false_positive": false_positive,
-                    "realised_fdr": (
-                        false_positive / n_called if n_called else np.nan
+                    "realised_fdr": _false_discovery_proportion(
+                        false_positive, n_called
                     ),
                     "recall": len(recovered) / len(truth) if truth else np.nan,
                     "n_truth": len(truth),
@@ -749,6 +810,95 @@ def _write(frame: pd.DataFrame, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# compact Stage 2D biological-support smoke grid
+# --------------------------------------------------------------------------
+
+
+def biological_support_smoke(
+    seeds: Sequence[int], *, statistics: Sequence[str] = ("correlation", "covariance")
+) -> pd.DataFrame:
+    """Run a deterministic smoke test of the five-class support layer."""
+
+    rows: list[dict] = []
+    for seed in seeds:
+        rng = np.random.default_rng(seed)
+        scenarios: list[tuple[str, np.ndarray, str, int]] = []
+
+        rare = 0.4 + rng.normal(0, 0.01, (8, 80))
+        rare[:, 0] += 0.40
+        scenarios.append(("genuine_rare_epivariant", rare, "rare_epivariant", 1))
+
+        one_artifact = 0.4 + rng.normal(0, 0.01, (8, 80))
+        one_artifact[:, 0] += np.array([.5, .5, .5, .5, -.1, -.1, -.1, -.1])
+        scenarios.append(("one_sample_artifact", one_artifact, "outlier_sensitive", 1))
+
+        two_artifact = 0.4 + rng.normal(0, 0.01, (8, 80))
+        two_artifact[:, :2] += np.array([.5, .5, .5, .5, -.1, -.1, -.1, -.1])[:, None]
+        scenarios.append(("two_sample_artifact", two_artifact, "outlier_sensitive", 2))
+
+        recurrent = 0.4 + rng.normal(0, 0.01, (10, 100))
+        recurrent[:, :5] += 0.30
+        scenarios.append(("recurrent_subgroup", recurrent, "recurrent_subgroup", 5))
+
+        cohort = 0.4 + rng.normal(0, 0.01, (20, 100))
+        cohort[:, :20] += 0.25
+        scenarios.append(("cohort_subgroup", cohort, "cohort_supported", 20))
+
+        gradient = np.tile(np.linspace(0.2, 0.8, 80), (12, 1))
+        gradient += rng.normal(0, 0.005, gradient.shape)
+        scenarios.append(("continuous_gradient", gradient, "diffuse_coordination", 40))
+
+        # Ordinary local background correlation without a discrete sample split.
+        background = rng.normal(0, 0.04, (12, 80))
+        for row in range(1, background.shape[0]):
+            background[row] = 0.8 * background[row - 1] + 0.6 * background[row]
+        background += 0.5
+        scenarios.append(("local_background_autocorrelation", background,
+                          "diffuse_coordination", 0))
+
+        for statistic in statistics:
+            config = Eiger2Config(
+                statistic=statistic, deflate_components=0, min_paired_samples=3
+            )
+            for scenario, block, expected, prevalence in scenarios:
+                # Exercise pairwise-complete handling under structured missingness.
+                evaluated = block.copy()
+                evaluated[::3, -1] = np.nan
+                means = np.nanmean(evaluated, axis=0)
+                centred = evaluated - np.nanmean(
+                    evaluated, axis=1, keepdims=True
+                )
+                diagnostics = biological_support_diagnostics(
+                    evaluated, centred, means, config
+                )
+                predicted = classify_biological_support(
+                    diagnostics, coordination_significant=True,
+                    n_observed=int(np.isfinite(means).sum()),
+                )
+                rows.append({
+                    "seed": seed, "scenario": scenario, "statistic": statistic,
+                    "n_samples": evaluated.shape[1], "length_cpg": evaluated.shape[0],
+                    "planted_prevalence_samples": prevalence,
+                    "expected_class": expected, "predicted_class": predicted,
+                    "classification_correct": predicted == expected,
+                    "furthest1_adjacent_score_influence_fraction": diagnostics[
+                        "furthest1_adjacent_score_influence_fraction"
+                    ],
+                    "furthest2_adjacent_score_influence_fraction": diagnostics[
+                        "furthest2_adjacent_score_influence_fraction"
+                    ],
+                    "influence_flag": max(
+                        diagnostics["furthest1_adjacent_score_influence_fraction"],
+                        diagnostics["furthest2_adjacent_score_influence_fraction"],
+                    ) >= 0.5,
+                    "winsorised_score_retention": diagnostics[
+                        "winsorised_score_retention"
+                    ],
+                })
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -761,7 +911,8 @@ def command_negative(args: argparse.Namespace) -> None:
     summary = _summarise(
         frame, ["scenario", "method"],
         ["false_regions", "false_regions_per_10k_cpg", "any_call",
-         "candidate_regions"],
+         "candidate_regions", "point_false_regions", "upper_false_regions",
+         "point_any_call", "upper_any_call"],
     )
     _write(summary, out / "negative_control_summary.csv")
     compact = summary[[
@@ -775,6 +926,20 @@ def command_negative(args: argparse.Namespace) -> None:
     print(compact.round(3).to_string(index=False))
 
 
+def command_support(args: argparse.Namespace) -> None:
+    out = Path(args.out_dir)
+    frame = biological_support_smoke(list(range(args.seeds)))
+    _write(frame, out / "biological_support_smoke.csv")
+    summary = _summarise(
+        frame, ["scenario", "statistic"],
+        ["classification_correct", "influence_flag",
+         "furthest1_adjacent_score_influence_fraction",
+         "winsorised_score_retention"],
+    )
+    _write(summary, out / "biological_support_smoke_summary.csv")
+    print(summary.to_string(index=False))
+
+
 def command_sweep(args: argparse.Namespace) -> None:
     out = Path(args.out_dir)
     seeds = list(range(args.seeds))
@@ -782,7 +947,8 @@ def command_sweep(args: argparse.Namespace) -> None:
     _write(frame, out / "heuristic_sweep.csv")
     summary = _summarise(
         frame, ["scenario", "parameter", "value"],
-        ["candidate_regions", "significant_regions", "realised_fdr", "recall"],
+        ["candidate_regions", "significant_regions", "realised_fdr", "recall",
+         "upper_significant_regions", "upper_realised_fdr", "upper_recall"],
     )
     _write(summary, out / "heuristic_sweep_summary.csv")
     print(summary.to_string(index=False))
@@ -841,9 +1007,7 @@ def command_calibration(args: argparse.Namespace) -> None:
 
 
 def command_exchangeability(args: argparse.Namespace) -> None:
-    """Master spec §6.2 (Stage 1d-B): all three permanent null-construction gates,
-    across every layout x scenario. Both new gates are expected to FAIL on current
-    code, at every layout -- this reports the numbers and fixes nothing."""
+    """DMR-free calibration diagnostics across every layout and scenario."""
 
     out = Path(args.out_dir)
     seeds = list(range(args.seeds))
@@ -934,6 +1098,7 @@ def command_all(args: argparse.Namespace) -> None:
         ("calibration", command_calibration),
         ("exchangeability", command_exchangeability),
         ("region_rate", command_region_rate),
+        ("support", command_support),
     ):
         print("=" * 78)
         print(name.upper())
@@ -946,7 +1111,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=[
         "negative", "sweep", "scaling", "calibration", "exchangeability",
-        "region_rate", "gap_sweep", "all",
+        "region_rate", "gap_sweep", "support", "all",
     ])
     parser.add_argument(
         "--layouts", nargs="+", default=["dense", "wgbs_real", "epic_fitted"],
@@ -972,6 +1137,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+    git_provenance = _git_provenance()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     dispatch = {
@@ -982,6 +1148,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "exchangeability": command_exchangeability,
         "region_rate": command_region_rate,
         "gap_sweep": command_gap_sweep,
+        "support": command_support,
         "all": command_all,
     }
     started = time.perf_counter()
@@ -998,7 +1165,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             for k, v in vars(args).items()
             if not callable(v)
         },
-        git_commit=_git_commit(),
+        git_commit=str(git_provenance["git_commit"]),
+        git_worktree_dirty=git_provenance["git_worktree_dirty"],
+        git_worktree_fingerprint_sha256=git_provenance[
+            "git_worktree_fingerprint_sha256"
+        ],
         # Every input is simulated in-process; nothing is read from disk.
         input_checksums={},
         random_seed=0,
@@ -1009,9 +1180,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         runtime_seconds=elapsed,
         peak_memory_mb=_peak_memory_mb(),
         warnings=[],
-        # Every Eiger2Config built by this suite leaves fdr_decision at its
-        # 'point' default; none of the five experiments override it.
-        fdr_decision="point",
+        # Full-pipeline experiments derive both decisions from the same region
+        # q-value/upper-bound fit; no duplicate stochastic run is required.
+        fdr_decision="point_and_upper_from_same_run",
     )
     (out / f"{args.command}_manifest.json").write_text(
         json.dumps(_manifest(args, extra=envelope), indent=2, default=str)

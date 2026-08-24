@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[legacy,dev]"
       - name: Lint
-        run: ruff check Python/eiger2 || true
+        run: ruff check Python/eiger2 tests benchmarking
       - name: Test the shipped package
         run: pytest tests -q
       - name: Test the superseded beta
@@ -30,9 +30,42 @@ jobs:
       - name: End-to-end smoke test
         run: |
           python examples/make_example_data.py
+          # examples/data is 50,000 CpGs on one chromosome -- below
+          # member_step's ~103,000-CpG floor by design, so
+          # region_null_mode="auto" falls back to "lag" (documented in
+          # examples/make_example_data.py and README.md). Every length
+          # stratum's own pooled null is empty at this fixture size ("lag"
+          # mode's region-null essentially never forms a multi-CpG run), but
+          # spec §2c changed what that means: K=0 backed by real per-stratum
+          # null OPPORTUNITY is reported (a finite Garwood upper bound), not
+          # refused -- the exact defect this fixture used to demonstrate
+          # (region_fdr_result's old AGGREGATE floor refusing the whole run
+          # over a coarser, wrong quantity) is what §2c fixes. So this run
+          # now legitimately exits 0 with real region_qvalue, not 1 -- see
+          # docs/FDR.md §15 and .process/STAGE_2C_STOP_REPORT.md.
+          # Asserted as exactly exit 0 (not "|| true", which passes on a
+          # crash too), so a regression back to spurious refusal, or any
+          # other crash, fails this step instead of being silently ignored.
+          e2_exit=0
           eiger2 call --betas examples/data/betas.tsv \
-                      --locations examples/data/cpgs.bed --out /tmp/e2
+                      --locations examples/data/cpgs.bed --out /tmp/e2 || e2_exit=$?
+          if [ "$e2_exit" -ne 0 ]; then
+            echo "expected eiger2 call to exit 0 (spec §2c: real per-stratum opportunity backs this fixture's K=0 strata, not a refusal), got $e2_exit" >&2
+            exit 1
+          fi
           eiger2 call --betas examples/data/betas.tsv \
                       --locations examples/data/cpgs.bed --out /tmp/lg --legacy
           test -s /tmp/e2/regions.csv
           test -s /tmp/lg/regions.csv
+          python -c "
+          import json
+          manifest = json.load(open('/tmp/e2/run_manifest.json'))
+          structural = manifest['caller_manifest']['gates']['structural']
+          failed = {k: v for k, v in structural.items() if not v['passed']}
+          assert not failed, f'structural gate(s) failed: {failed}'
+          fdr = manifest['caller_manifest']['fdr']
+          assert fdr.get('insufficient_null_opportunity_strata') == [], (
+              f'expected no refused strata, got {fdr.get(\"insufficient_null_opportunity_strata\")}'
+          )
+          print('structural gates: all passed; no strata refused for insufficient opportunity')
+          "

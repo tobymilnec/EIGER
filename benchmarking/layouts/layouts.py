@@ -24,6 +24,7 @@ import pandas as pd
 
 __all__ = [
     "load_wgbs_layout",
+    "wgbs_chromosome_sizes",
     "generate_epic_layout",
     "describe_layout",
     "eligible_run_lengths",
@@ -85,6 +86,21 @@ def load_wgbs_layout(
         locations = locations.iloc[offset:stop].reset_index(drop=True)
         out_depth = out_depth[offset:stop]
     return locations, out_depth
+
+
+def wgbs_chromosome_sizes(fixture: str | Path) -> dict[str, int]:
+    """Chromosome name -> CpG count in the vendored fixture, in storage
+    order, without materialising the full position/depth arrays
+    ``load_wgbs_layout`` returns -- just the small per-chromosome boundary
+    metadata already stored in the ``.npz``. Used to build a real
+    multi-chromosome layout proportioned to the fixture's actual chromosome
+    sizes (spec §2b.5 -- see ``paper_grid.py``'s ``multichrom`` cell).
+    """
+
+    with np.load(Path(fixture), allow_pickle=False) as data:
+        names = [str(x) for x in data["chrom_names"]]
+        starts = list(data["chrom_start"]) + [int(data["pos_delta"].size)]
+    return {name: int(starts[i + 1] - starts[i]) for i, name in enumerate(names)}
 
 
 # --------------------------------------------------------------------------

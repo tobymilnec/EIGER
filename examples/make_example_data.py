@@ -5,8 +5,8 @@
 
 Produces, in ``examples/data/``:
 
-    betas.tsv       5,000 CpGs x 24 samples, methylation proportions in [0, 1]
-    cpgs.bed        matching chr / start / end, two chromosomes
+    betas.tsv       50,000 CpGs x 24 samples, methylation proportions in [0, 1]
+    cpgs.bed        matching chr / start / end, one chromosome
     truth.tsv       the planted regions, for checking what was recovered
 
 The simulation carries the features that make DMR calling non-trivial:
@@ -15,6 +15,39 @@ spatially autocorrelated background methylation, two genome-wide latent factors
 mean depth of 15, and 5% missing observations. Twenty planted regions span a
 grid of effect sizes, lengths and affected-sample fractions, including cases
 below the detection limit of the covariance statistic.
+
+50,000 CpGs is below ``region_null_mode="member_step"``'s default
+~103,000-CpG floor (see ``README.md``'s "Minimum input size" section), so
+``eiger2 call``'s default ``region_null_mode="auto"`` falls back to ``"lag"``
+here -- deliberately: this example demonstrates that fallback, not the
+member-step construction. One chromosome, not two: the current (pre-§2b)
+null draws its lag from a genome-wide range rather than per chromosome, so a
+two-chromosome layout caps the fraction of null tracks that can survive at
+~50% *regardless of total CpG count* (confirmed empirically up to 100,000
+CpGs split across two chromosomes) -- below the spec §2a.2 structural gate's
+50% floor. That gate is exactly the defect a future chromosome-aware null
+construction (spec §2b) fixes; one chromosome sidesteps it here so this
+small illustrative fixture clears it.
+
+Clearing that structural gate is not the same as the run reporting `ok`,
+though, and this fixture does not reach `ok`: "lag" reuses the edge-level
+null directly as the region-level one, and that null's autocorrelation does
+not reproduce the observed sliding-window statistic's (``README.md``'s "The
+region-level null" section), so it essentially never forms a multi-CpG run by
+chance -- every length stratum's own pooled null is genuinely empty (`K=0`).
+Before spec §2c, `region_fdr_result`'s aggregate-adequacy floor
+(``min_null_regions_for_fdr``) checked the wrong quantity here and refused
+the whole run over that emptiness, reporting `inference_unreliable`. §2c
+replaced it with a per-stratum null-OPPORTUNITY check: this fixture's null
+had ample opportunity to form a region this long in every stratum and simply
+never did, which is real evidence (`K=0` backed by opportunity gives a finite
+Garwood upper bound, spec §2c.3), so nothing is refused -- the run reports
+`ok_with_warnings` (candidate-only calibration diagnostics still apply to
+"lag" mode, see below) with genuine `region_qvalue`s. The end-to-end smoke
+test (``.github/workflows/tests.yml``) checks exactly this: the structural
+gates pass, no stratum is refused for insufficient opportunity, and the run
+completes and writes real output -- not that its status is `ok`, which "lag"
+mode's calibration diagnostics still keep out of reach on any layout.
 
 The data are simulated, not real, and are provided only so that the software can
 be exercised end to end.
@@ -31,7 +64,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "Python"))
 
-N_CPG = 5000
+N_CPG = 50_000
 N_SAMPLES = 24
 MEAN_DEPTH = 15
 MISSING_RATE = 0.05
@@ -106,14 +139,13 @@ def main() -> int:
     observed = rng.binomial(depth, beta) / depth
     observed[rng.random(observed.shape) < MISSING_RATE] = np.nan
 
-    # two chromosomes, so the chromosome-aware null is exercised
-    half = N_CPG // 2
-    chrom = np.where(np.arange(N_CPG) < half, "chr1", "chr2")
-    position = np.where(
-        np.arange(N_CPG) < half,
-        np.arange(N_CPG) * 20,
-        (np.arange(N_CPG) - half) * 20,
-    )
+    # One chromosome, not two: see the module docstring -- the current
+    # (pre-§2b) null draws its lag from a genome-wide range rather than per
+    # chromosome, so a two-chromosome layout caps null-track survival at
+    # ~50% regardless of total CpG count, below spec §2a.2's structural gate
+    # floor.
+    chrom = np.array(["chr1"] * N_CPG)
+    position = np.arange(N_CPG) * 20
 
     out = Path(__file__).resolve().parent / "data"
     out.mkdir(parents=True, exist_ok=True)
@@ -128,7 +160,7 @@ def main() -> int:
     pd.DataFrame(truth).to_csv(out / "truth.tsv", sep="\t", index=False)
 
     print(f"wrote {out}/betas.tsv   {N_CPG} CpGs x {N_SAMPLES} samples")
-    print(f"wrote {out}/cpgs.bed    two chromosomes")
+    print(f"wrote {out}/cpgs.bed    one chromosome")
     print(f"wrote {out}/truth.tsv   {len(truth)} planted regions")
     print(f"missing fraction        {np.mean(~np.isfinite(observed)):.3f}")
     print()

@@ -61,10 +61,13 @@ The only thing you lose is the short `eiger2` command.
 python examples/make_example_data.py
 ```
 
-Writes `examples/data/`: a 5,000 CpG × 24 sample matrix across two chromosomes,
+Writes `examples/data/`: a 50,000 CpG × 24 sample matrix on one chromosome,
 with spatially autocorrelated background, two latent nuisance factors, read
 depth 15, 5% missing observations, and 20 planted regions spanning a grid of
-effect sizes and prevalences. `truth.tsv` records what was planted.
+effect sizes and prevalences. `truth.tsv` records what was planted. 50,000
+CpGs is below member-step's preferred ~103,000-CpG size but above its exact
+7,000-CpG minimum at the defaults, so this fixture exercises the measured
+short-subtrack fallback without lowering the locality-breaking lag.
 
 ---
 
@@ -87,14 +90,10 @@ eiger2 compare --betas examples/data/betas.tsv \
                --out examples/out_compare
 ```
 
-Expected output for the first command:
-
-```
-[eiger2] caller     : eiger2
-[eiger2] regions    : 40
-[eiger2] significant: 40 at q <= 0.05
-[eiger2] written to : examples/out_eiger2
-```
+The exact candidate/significant counts can change with method revisions. Confirm in
+`run_manifest.json` that the resolved region null is `member_step`, inspect the
+preferred/fallback chromosome diagnostics, and check whether any length stratum was
+refused for insufficient opportunity before using its q-values.
 
 ---
 
@@ -193,15 +192,18 @@ coverage files is not yet wired into the CLI.
 > reversed, which under-called false discoveries in v2.0.0 (see
 > [docs/FDR.md](docs/FDR.md)).
 >
-> **Known limitation:** realised FDR control has been found to be substantially
-> miscalibrated under high-missingness, small-sample, and high-noise conditions, even
-> with the corrected q-values above (see [docs/FDR.md](docs/FDR.md) and the README's
-> "Important limitations" section). Treat `region_qvalue`/`significant` with caution
-> in these regimes until this is investigated further.
+> **Stage 2e update:** the chromosome-aware region null greatly improves the earlier
+> high-missingness, small-sample, and high-noise results, and null-construction health
+> passes all 1,000 genome-scale calibration runs. FDR control is not uniform at the
+> detection boundary, however: mean per-run FDP is 0.8-4.1% in the 10-CpG cells and
+> 6.9-15.4% in the weak-effect 4-CpG cells. Across all runs it averages 6.2%; the
+> lower 4.4% pooled false-call ratio is call-weighted and is not the FDR estimator.
+> Treat weak calls near `min_cpgs` with caution and see [docs/FDR.md](docs/FDR.md).
 
 | File | Contents |
 |---|---|
-| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue` and six related FDR columns (new in v2.0.1, see below), `significant`, and `*_descriptive` characterisation fields |
+| `regions.csv` | lean one-row-per-region table: coordinates, area/FDR fields, nullable `coordination_significant`, one `biological_class`, `passes_prevalence`, legacy-compatible `significant`, and status |
+| `region_support_diagnostics.csv` | opt-in compact post-selection prevalence, largest-gap legacy tail, furthest-mean-sample influence screen and winsorised confirmation diagnostics, keyed by `region_id`; not created when the support policy is off |
 | `region_sample_means.csv` | per-region mean methylation for each sample |
 | `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, `schema_version`, `fdr_decision`, and the realised null diagnostics |
 
@@ -218,14 +220,14 @@ defines no false discovery rate. That is the point of the comparison.
 | Column | Meaning |
 |---|---|
 | `region_tail_fdr` | point FDR at the region's own area cutoff |
-| `region_qvalue_lower_95` | simultaneous Garwood lower Monte Carlo bound |
-| `region_qvalue_upper_95` | simultaneous Garwood upper bound; nonzero whenever the point estimate is zero |
+| `region_qvalue_lower_95` | simultaneous replicate-cluster quasi-Poisson lower bound |
+| `region_qvalue_upper_95` | simultaneous replicate-cluster quasi-Poisson upper bound; positive when the point estimate is zero |
 | `region_qvalue_resolution` | one scaled null exceedance's worth of change at the q-achieving cutoff |
 | `null_exceedances_at_cutoff` | pooled null exceedance count at the q-achieving cutoff (`-1` if unavailable) |
 | `region_qvalue_cutoff_rank` | number of observed regions at least as strong as the q-achieving cutoff (`-1` if unavailable) |
 
-See [docs/FDR.md](docs/FDR.md) for the full derivation, the Garwood interval's Poisson
-assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneous).
+See [docs/FDR.md](docs/FDR.md) for the derivation, model assumptions, simulation
+coverage checks, and simultaneity scope (per-stratum, not genome-wide).
 
 ### New in v2.2: two columns alongside `statistic_threshold`
 
@@ -253,10 +255,14 @@ assumption, and the coverage guarantees (per-stratum, not genome-wide simultaneo
 --min-cpgs 4                         # minimum region length
 --null-replicates 100                # default since v2.0.1 (was 20); raise further
                                       # for --compute-posterior (100-300)
+--n-lag-draws 75                    # independent genome-wide region-null clusters
 --fdr-decision point|upper           # default point; upper decides on
                                       # region_qvalue_upper_95 instead (conservative)
 --support-binned-threshold auto|on|off  # condition the null-quantile threshold on
                                       # local measurement support; default auto
+--biological-support-policy off|five_class_v1
+                                      # default off; opt in to the provisional
+                                      # five-class descriptive support layer
                                       # enables it only when support varies enough
                                       # to matter
 --support-bins N                     # number of support quantile bins when
@@ -286,10 +292,11 @@ more than resolution.
 unchanged in spirit from v2.0.0. `upper` instead requires
 `region_qvalue_upper_95 <= target-fdr` — the conservative decision under finite-null
 estimation uncertainty. Use `upper` when few null replicates are available and a point
-estimate of exactly zero should not, on its own, be trusted as a call. If the current
-replicate count cannot achieve the target even in the best case, `upper` refuses to
-run rather than silently returning zero significant regions; the error names the
-replicate count required.
+estimate of exactly zero should not, on its own, be trusted as a call. A valid
+zero-rejection result is returned normally and recorded in
+`manifest["fdr"]["upper_decision_diagnostic"]`. A stratum is refused only when its
+null opportunity is inadequate or fewer than five usable independent region-null
+clusters remain.
 
 ### Choosing a null: `--null-mode` and `--region-null-mode`
 
@@ -300,14 +307,14 @@ significant) is a separate null, `--region-null-mode` (Stage 1f, pre-release).
 
 **Default: leave it unset.** With no `--region-null-mode` flag, the resolved
 behaviour is `"auto"`: `member_step` (below) is used when the input clears its
-genome-scale minimum size, and the CLI falls back to `lag` automatically --
+min_cpgs-derived absolute floor, and the CLI falls back to `lag` automatically --
 printing a loud warning naming the input size, the required size, and that `lag`'s
 q-values are not calibrated -- when it does not. This is what a CLI user hitting a
 small test file, a targeted panel, or a single-chromosome subset now gets instead
 of a hard, uncatchable error (the gap flagged in an earlier release note, now
-fixed). `eiger2 call`'s startup output always reports the computed floor and the
-input's CpG count before the run, e.g. `region_null_mode='auto', input has 5,000
-CpGs, member_step needs >= 103,000`.
+fixed). At the defaults the absolute floor is 7,000 CpGs; 103,000 CpGs is the
+preferred 100-position subtrack size. Chromosomes between the two use the measured
+fallback and are reported separately in the manifest.
 
 `member_step` (the resolved default on large-enough input) is what actually fixed
 large-cohort saturation: on a 519-sample cohort, the pre-v2.1.0 default assigned
@@ -320,8 +327,8 @@ exact-zeros; see `docs/FDR.md` §11-§12).
 below the floor it raises, naming the required size, rather than silently using
 `lag` -- for a caller who wants to know for certain which construction ran.
 `--region-null-mode lag` (reproduces the pre-v2.1.0 region-level null, including
-the saturation above) is for small inputs below the floor
-(`null_min_lag * (min_subtrack_length + window - 1)`, 103,000 CpGs at shipped
+the saturation above) is for small inputs below the absolute floor
+(`null_min_lag * (min_cpgs + window - 1)`, 7,000 CpGs at shipped
 defaults) where you specifically want `lag`'s behaviour rather than the automatic
 fallback, or for reproducing historical comparisons -- not recommended for
 inference on real-sized data. `--region-null-mode off` skips the region-level null
@@ -338,17 +345,19 @@ beta.
 
 ### A prevalence floor: `--min-prevalence-samples`
 
-A single aberrant sample deviating across a run of CpGs produces genuine
-coordination, so it forms a region and no null will reject it. It is simply not
-a differentially methylated *region* in the usual sense. On the 519-sample ICGC
-cohort, 95% of otherwise unclassifiable regions were driven by one or two
-samples.
+A single aberrant sample deviating coherently across a run of CpGs can produce
+genuine coordination and pass a locality-breaking null. It is not automatically a
+cohort-level differentially methylated region; it may be a private epivariant or an
+artefact requiring orthogonal checks.
 
 This is a biological criterion, not a statistical one, so it is applied after
 calibration and reported separately: `region_qvalue` stays calibrated on the
-unfiltered set, `minority_size_descriptive` records how many samples carry the
-deviation, and `significant` requires both. It is exactly analogous to requiring
-a fold-change floor alongside a p-value.
+unfiltered set, the authoritative two-means prevalence is written to
+`region_support_diagnostics.csv`, and legacy `significant` requires both.
+`coordination_significant` always records the FDR-only decision. The five-class
+descriptive layer and the distinction from the misleading historical largest-gap
+tail split are documented in
+[docs/BIOLOGICAL_SUPPORT.md](docs/BIOLOGICAL_SUPPORT.md).
 
 ### `--legacy --fdr-replicates` no longer runs (removed in v2.1.0)
 
