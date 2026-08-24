@@ -66,6 +66,7 @@ from .core import (
     Eiger2Config,
     call_dmrs,
     chromosome_sort_permutation,
+    main_region_table,
     member_step_min_n_cpg,
 )
 from .manifest_utils import build_manifest_envelope
@@ -679,7 +680,16 @@ def command_call(args: argparse.Namespace) -> int:
                 regions[column] = kept[regions[column].to_numpy(dtype=int)]
 
     _require_default_confidence_level(None if args.legacy else 0.95)
-    regions.to_csv(out / "regions.csv", index=False)
+    if args.legacy:
+        regions_for_output = regions
+    else:
+        support_diagnostics = regions.attrs.get("region_support_diagnostics")
+        regions_for_output = main_region_table(regions)
+        if support_diagnostics is not None:
+            support_diagnostics.to_csv(
+                out / "region_support_diagnostics.csv", index=False
+            )
+    regions_for_output.to_csv(out / "regions.csv", index=False)
     if len(values):
         values.to_csv(out / "region_sample_means.csv", index=False)
 
@@ -1332,6 +1342,16 @@ def build_parser() -> argparse.ArgumentParser:
                             "target-fdr. 'upper': significant iff "
                             "region_qvalue_upper_95 <= target-fdr -- the "
                             "conservative decision under finite-null uncertainty.")
+        p.add_argument(
+            "--biological-support-policy",
+            dest="biological_support_policy",
+            choices=["off", "five_class_v1"],
+            default=None,
+            help="optional post-selection five-class biological support layer. "
+                 "Default 'off' preserves discovery runtime; 'five_class_v1' "
+                 "writes one biological_class plus a separate diagnostics "
+                 "CSV and never changes the FDR.",
+        )
         p.add_argument("--min-prevalence-samples", dest="min_prevalence_samples",
                        type=int, default=None,
                        help="require at least this many samples to carry the "

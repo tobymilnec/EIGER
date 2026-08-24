@@ -41,6 +41,7 @@ from eiger2.core import (  # noqa: E402
     _HAS_NUMBA,
     RegionFdrResult,
     _assign_support_bin,
+    _diagnostic_status,
     _fdr_from_areas_result,
     _overdispersion_diagnostic,
     _pair_statistic,
@@ -596,8 +597,11 @@ def test_call_dmrs_manifest_carries_both_gates_when_regions_are_called():
     # master spec §6.2: both gates present once there is something for Gate 2
     # (region exchangeability) to measure.
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
-    _, _, manifest = call_dmrs(
-        matrix, frame, config=Eiger2Config(**FAST, null_min_lag=5)
+    regions, _, manifest = call_dmrs(
+        matrix, frame, config=Eiger2Config(
+            **FAST, null_min_lag=5,
+            biological_support_policy="five_class_v1",
+        )
     )
     assert manifest["n_regions"] > 0
     assert "gates" in manifest
@@ -606,6 +610,35 @@ def test_call_dmrs_manifest_carries_both_gates_when_regions_are_called():
     assert region_exch["observed_regions"] == manifest["n_regions"]
     assert "region_exchangeability_ratio" in region_exch
     assert "null_count_adequate" in region_exch
+    diagnostics = regions.attrs["region_support_diagnostics"]
+    assert len(diagnostics) == len(regions)
+    assert "two_means_minority_samples" not in diagnostics
+    assert "largest_gap_tail_samples_legacy" not in diagnostics
+    assert manifest["biological_support"]["diagnostics_file"] \
+        == "region_support_diagnostics.csv"
+
+
+def test_support_diagnostic_status_distinguishes_all_three_states():
+    assert _diagnostic_status(True) == "computed"
+    assert _diagnostic_status(False) == "not_selected"
+    assert _diagnostic_status(None) == "unavailable"
+
+    matrix, frame, _ = simulate(strata=[(0.4, 0.4)], replicates=3, seed=5)
+    regions, _, manifest = call_dmrs(
+        matrix, frame, config=Eiger2Config(
+            **FAST, null_min_lag=5, target_fdr=0.5,
+            biological_support_policy="five_class_v1",
+        )
+    )
+    diagnostics = regions.attrs["region_support_diagnostics"]
+    assert set(diagnostics["diagnostic_status"]) <= {
+        "computed", "not_selected", "unavailable",
+    }
+    called = diagnostics.loc[
+        diagnostics["coordination_significant"] == True,  # noqa: E712
+        "diagnostic_status",
+    ]
+    assert len(called) > 0 and (called == "computed").all()
 
 
 def test_call_dmrs_manifest_records_member_step_gate_fields():
@@ -2167,6 +2200,41 @@ def test_stratum_opportunity_converts_cpg_minimum_to_edge_minimum(
     at_boundary = _stratum_opportunity(np.array([minimum_edges]))
     assert below[stratum] == 0.0
     assert at_boundary[stratum] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("min_cpgs", "expected_min_edges"), [(2, 1), (3, 2), (4, 3), (5, 3), (9, 3)],
+)
+def test_stratum_opportunity_bottom_floor_tracks_min_cpgs(
+    min_cpgs, expected_min_edges,
+):
+    # The bottom stratum follows min_cpgs below 4 and retains its normal floor
+    # when min_cpgs is higher.
+    below = _stratum_opportunity(
+        np.array([expected_min_edges - 1]), min_cpgs=min_cpgs
+    )
+    at_boundary = _stratum_opportunity(
+        np.array([expected_min_edges]), min_cpgs=min_cpgs
+    )
+    assert below["4-5"] == 0.0
+    assert at_boundary["4-5"] == 1.0
+
+
+@pytest.mark.parametrize("min_cpgs", [2, 3])
+def test_call_dmrs_does_not_crash_on_short_min_cpgs(min_cpgs):
+    # Regression for the zero-exposure crash at min_cpgs below 4.
+    DEFAULT_STRATA = [(0.05, 0.35), (0.10, 0.30), (0.25, 0.25), (0.50, 0.20)]
+    matrix, locs, _ = simulate(
+        seed=0, strata=DEFAULT_STRATA, replicates=6, spacing=400,
+        n_samples=80, n_latent=0, noise_sd=0.04, missing_rate=0.0,
+    )
+    config = Eiger2Config(
+        min_cpgs=min_cpgs, statistic="correlation", target_fdr=0.05,
+        null_replicates=20, min_null_regions_for_fdr=0,
+    )
+    regions, _, manifest = call_dmrs(matrix, locs, config=config)
+    assert manifest["n_regions"] > 0
+    assert (regions["n_cpg"] >= min_cpgs).all()
 
 
 def test_region_fdr_result_insufficient_opportunity_refuses_that_stratum_only():

@@ -1,5 +1,11 @@
 # Region-level FDR: estimator, bounds, and a known calibration limitation
 
+This FDR controls the stated **coordination relative to a locality-breaking
+null** estimand. It is not a group-comparison p-value and does not by itself imply
+cohort prevalence or disease specificity. The separate, non-inferential five-class
+support layer is documented in [BIOLOGICAL_SUPPORT.md](BIOLOGICAL_SUPPORT.md); it
+does not alter any quantity derived in this document.
+
 `Python/eiger2/core.py` (`_fdr_from_areas_result`, `region_fdr_result`, `region_fdr`),
 mirrored in `Python/eiger2/probability.py` (`_tail_area_fdr`, documented in
 [`docs/PROBABILITY.md`](PROBABILITY.md)).
@@ -23,13 +29,45 @@ Sections describing earlier Poisson/Garwood-only releases are historical where n
 
 ---
 
-## Known limitation: FDR calibration under missingness, small-n, and high-noise
+## Historical finding: FDR calibration under missingness, small-n, and high-noise
 
-**This is a release-blocking finding, not a footnote.** The corrected q-value machinery
-documented below is verified correct — see "What this finding does and does not
-implicate" — but under three of five tested simulation regimes, the **realised**
+> **Status as of Stage 2e (2026-08-23): substantially improved, but not
+> uniformly resolved.** The original finding below (commit `46327e7`, before Stage
+> 1e/2b/2c/2d) predates the region-null autocorrelation fix (§11), the
+> chromosome-aware null construction (§15), and the per-stratum opportunity
+> guard (§16) — all three target mechanisms this finding explicitly named as
+> plausible causes. Re-measurement on the current pipeline:
+>
+> - **DMR-free (measurement path 2 below), 100 seeds x 5 scenarios:** the
+>   observed `negative_control` any-call rate is now 3.0-7.5% across the two
+>   statistics, including `missingness` and `small_n`, down from 55-99%.
+> - **Real-signal (measurement path 3 below), confirmed at true genome scale on
+>   `benchmarking/paper_grid.py`'s `calibration`/`signal_grid`/`power_curve`
+>   cells (~600,000-CpG genomes, 100/20/10 seeds respectively, `--jobs 16`,
+>   completed 2026-08-23 in 1h45m):** null-construction health is essentially
+>   perfect (ACF gate and null-count-adequacy both pass 1000/1000 cells across
+>   both real layouts and all five scenarios, median region-exchangeability
+>   ratio 0.97-1.11 — see "Real-signal re-measurement at genome scale" below).
+>   In the detection-boundary `signal_grid`, mean per-run FDP is 0.8-4.1% in
+>   the four 10-CpG cells but 6.9-15.4% in the weak-effect 4-CpG cells. Across
+>   all 280 runs it averages 6.2%. The pooled false-call ratio is lower (4.4%,
+>   90/2051) because it weights high-power cells more heavily; it is not the
+>   FDR estimator. `power_curve` (recall vs.
+>   effect size at fixed 25% prevalence) shows near-perfect recall (99.4-100%)
+>   and near-zero realised FDR (0-0.6%) once effect size clears a modest
+>   threshold. The weak-effect minimum-length cells remain a calibration
+>   limitation; see the full per-cell table below.
+>   The original `heuristic_sweep`-based attempt at this re-measurement hit a
+>   **separate, distinct benchmark-scale bug** (documented below,
+>   unrelated to the finding here) before this correctly-scaled run replaced it.
+
+**This was a release-blocking finding, not a footnote, at the time it was measured.**
+The corrected q-value machinery documented below is verified correct — see "What this
+finding does and does not implicate" — but under three of five tested simulation
+regimes, the **realised**
 false discovery rate at the default `target_fdr = 0.05` and `--fdr-decision point`
-substantially exceeds the nominal 5% target, in genuinely null (DMR-free) data:
+substantially exceeded the nominal 5% target, in genuinely null (DMR-free) data,
+**as originally measured, before the fixes named in the status box above**:
 
 | scenario | realised FDR (nominal target: 5%) |
 |---|---|
@@ -93,6 +131,10 @@ scenario tested, before Stage 1's FDR machinery existed at all.
 
 ### What to do about it, until this is investigated further
 
+*(This list is the original, as-measured recommendation. See "DMR-free
+re-measurement (Stage 2e)" and "Real-signal re-measurement: a benchmark scale
+gap (Stage 2e)" below for what has since changed.)*
+
 - **Do not rely on `region_qvalue` / `significant` at face value** for data with
   substantial missingness, small sample size (`small_n`-like regimes), or high
   measurement noise. Treat calls from those regimes as a ranked candidate list, not
@@ -117,6 +159,152 @@ scenario tested, before Stage 1's FDR machinery existed at all.
   checks reported above as "0 violations" (gate criteria 1 and 2) are likewise
   confirmed only at the 3-5 seed scale actually run, not at the spec's full
   100-seed design.
+
+### DMR-free re-measurement (Stage 2e)
+
+`benchmarking/benchmark_suite.py negative --seeds 100` (all 5 scenarios, both
+`correlation`/`covariance` statistics, `target_fdr = 0.05`, point decision) on the
+current pipeline. The reported quantity is `any_call` -- whether a DMR-free
+100,000-bp-scale simulated genome produced **any** significant call at all -- the
+same quantity measurement path 2 above used ("reproduces the same pattern:
+clean/nuisance near nominal, high_noise 70%, small_n 55%, missingness 99%"); the
+`any_call`/`frac_runs_with_a_call` column has been unchanged since this benchmark
+script's first commit, so the comparison is apples-to-apples, just at 100 seeds
+instead of 3 and on the current, Stage 2b/2c/2d/2e pipeline instead of pre-Stage-1e.
+
+| scenario | any-call rate (200 method-runs) | originally |
+|---|---|---|
+| clean | 3.0% | ~9-10% |
+| nuisance | 4.5% | ~9% |
+| high_noise | 7.5% | ~56-70% |
+| small_n | 7.5% | ~55-71% |
+| missingness | 7.5% | **~99%** |
+
+Each value pools correlation and covariance results from the same 100 simulated
+seeds. Those paired method-runs are not independent, so a 200-trial binomial
+interval would be inappropriate. The observed reduction is large, but point
+estimates above 5% do not prove exact nominal control. Full data:
+`benchmarking/results_stage2d_confirm/negative_control.csv` and
+`negative_control_summary.csv`.
+
+This measurement does not by itself confirm real-signal calibration (below) --
+`any_call` on DMR-free data cannot distinguish "controls FDR well" from "never
+forms a candidate region long enough to be evaluated in the first place," which
+is exactly the mechanism the next section describes.
+
+### The `heuristic_sweep` benchmark-scale bug, found en route (Stage 2e)
+
+Re-running `heuristic_sweep` (measurement path 3's experiment) to re-check the
+original `missingness` 33.5%-FDR-with-real-signal finding required fixing the
+`min_cpgs` crash first (§17). Once fixed, the full sweep completed -- and its
+output revealed that this specific benchmark cannot answer the question being
+asked of it, for a reason that has nothing to do with the min_cpgs fix itself.
+
+**What was found.** `benchmarking/benchmark_suite.py`'s `negative_control` and
+`heuristic_sweep` simulate genomes of roughly 10,000-20,000 CpGs
+(`n_cpg_target = 20000`, `spacing = 400`), and neither overrides
+`Eiger2Config.null_min_lag` away from its default of 1000 -- a constant
+documented as needing to "comfortably exceed the methylation correlation
+length" at **real chromosome scale** (hundreds of thousands to millions of
+CpGs; every unit test that uses a small matrix explicitly lowers
+`null_min_lag`, and `benchmarking/paper_grid.py` -- the properly-scaled
+publication grid, see below -- pairs `null_min_lag = 1000` with
+600,000-CpG simulated genomes, not 10,000). At `heuristic_sweep`'s scale with
+this genome-scale `null_min_lag`, `member_step`'s own diagnostics
+(`manifest["gates"]["implied_subtrack_length_range"]`) show realised null
+subtracks of only 4-7 edges -- far short of the 19 edges the "20-49" CpG length
+stratum needs to have any opportunity at all. `DEFAULT_STRATA`'s planted DMRs
+are 40 CpGs long, so they land exactly in that stratum.
+
+Checked directly on `clean`, seed 0, at the shipped default hyperparameters:
+all 24 planted DMRs are correctly *segmented* -- 24 candidate regions form,
+each 40-42 CpGs long, matching truth almost exactly -- but every one of them
+is **refused from inference** (`fdr_status = "unavailable_stratum"`,
+`region_qvalue = NaN`), because `manifest["fdr"]["insufficient_null_opportunity_strata"]`
+reports `null_opportunity = 0.0` for stratum "20-49" against an `observed_opportunity`
+of 9981. This is the opportunity guard (§16) doing exactly what it is designed to
+do -- refusing to answer rather than fabricating a q-value from zero real null
+backing -- not a defect in the FDR machinery. But it means `heuristic_sweep`'s
+realised-FDR and recall numbers, as currently configured, measure a mix of
+correctly-refused true signal (contributing zero recorded recall) and whatever
+small, noise-driven candidates happen to land in the much shorter strata the
+null *can* represent at this scale -- not the pipeline's true-signal calibration.
+It is likely that the original 33.5% missingness figure (measurement path 3,
+commit `46327e7`) was measuring substantially the same artefact rather than a
+clean real-signal FDR estimate either, though that cannot be established
+retroactively.
+
+**This is a benchmark configuration gap, not a re-confirmation of the original
+finding in either direction**, and it is orthogonal to the `min_cpgs` crash fix
+in §17 -- fixing the crash was necessary to discover this, but does not fix it.
+
+**The fix.** `benchmarking/paper_grid.py` already exists as the correctly-scaled
+tool: its `calibration`, `signal_grid`, and `power_curve` cells simulate
+~600,000-CpG genomes (`GENOME_SPACING = 50_000`, `CALIB_SPACING = 600_000`),
+matching the scale §11.3/§11.5 measured `member_step`'s own region-level gates
+at. Its own module docstring calls it "genuinely hours of compute... explicitly
+out-of-band" -- in practice, `--jobs 16` on this machine's 16 cores completed
+`calibration --seeds 100`, `signal_grid --seeds 20`, and `power_curve --seeds 10`
+in 1h45m serially chained, well under the docstring's own serial-time estimate.
+Results below.
+
+`benchmarking/benchmark_suite.py`'s `negative`/`sweep`/`support` commands remain
+useful as a fast regression *screen* (§2D's own screen/confirm split in
+`docs/BENCHMARK.md`) for anything not scale-sensitive -- the crash fix in §17,
+the biological-support classifier, and DMR-free short-stratum calibration all
+check out validly at this smaller scale. `sweep`'s point/upper realised-FDR
+columns specifically should not be read as a real-signal calibration
+measurement until `benchmark_suite.py` itself is fixed (raise `n_cpg_target`
+enough to give `null_min_lag=1000` room, or add a benchmark-scale-appropriate
+`null_min_lag`/`min_subtrack_length` override) -- not attempted here; flagged
+for follow-up in `docs/BENCHMARK.md`.
+
+### Real-signal re-measurement at genome scale (Stage 2e, `paper_grid.py`)
+
+**Null-construction health.** `calibration` (100 seeds x 2 real layouts x 5
+scenarios = 1000 cells, DMR-free, ~600,400 CpGs each): the ACF gate and
+`null_count_adequate` both pass **1000/1000** cells, every layout, every
+scenario including `missingness`/`small_n`/`high_noise`. Median
+`region_exchangeability_ratio` (target: near 1.0, gated at <=3.0) ranges
+0.969-1.111 across all ten layout/scenario combinations -- essentially the null
+and the observed track forming regions at the same rate, everywhere. This is
+the structural counterpart to Stage 2b's own diagnosis (7-of-100 surviving
+tracks on the pre-fix ICGC audit) confirmed resolved at matching real-world
+scale. Full data: `benchmarking/results_v210/calibration_member_step_full.csv`.
+
+**Realised FDR and recall at the detection boundary.** `signal_grid` (20 seeds
+x 7 cells spanning low prevalence, small effect size, short DMR length, and
+small cohorts down toward the detection boundary -- not the comfortably-easy
+`DEFAULT_STRATA` grid):
+
+| cell | calls | false positives | mean per-run FDP | pooled FP/calls | mean recall |
+|---|---|---|---|---|---|
+| `default_n80_len10` | 347 | 3 | 0.8% | 0.9% | 100.0% |
+| `low_prevalence_n12_len10` | 359 | 16 | 4.1% | 4.5% | 99.6% |
+| `low_prevalence_n20_len10` | 361 | 17 | 4.1% | 4.7% | 100.0% |
+| `small_delta_n80_len10` | 537 | 7 | 1.2% | 1.3% | 76.8% |
+| `small_delta_n80_len4` | 394 | 30 | 6.9% | 7.6% | 41.5% |
+| `small_delta_n20_len4` | 47 | 12 | 15.4% | 25.5% | 4.0% |
+| `small_delta_n12_len4` | 6 | 5 | 11.3% | 83.3% | 0.1% |
+| **all 280 runs** | **2051** | **90** | **6.2%** | **4.4%** | **60.3%** |
+
+Full data: `benchmarking/results_v210/signal_grid_extended.csv`.
+
+FDR is estimated by averaging the per-run quantity `V / max(R, 1)`, which is
+zero when a run makes no calls. The 4.4% ratio instead pools all calls and gives
+more weight to high-power cells; it must not be used to claim overall 5% FDR
+control. The 10-CpG cells are encouraging, while every weak-effect 4-CpG cell
+is above target. The `n=12` cell makes calls in only 5 of 40 runs, so its
+estimate is imprecise; the `n=20` and `n=80` results show that the limitation is
+not confined to that sparse cell. **Treat weak regions at or near `min_cpgs` as
+not yet demonstrated to be FDR-controlled, especially in small cohorts.**
+
+**Power.** `power_curve` (10 seeds x effect size 0.05-0.35 at fixed 25%
+prevalence): recall 99.4-100% and realised FDR 0-0.6% across the entire swept
+range once effect size clears roughly 0.075 -- matching the existing
+README/BENCHMARK claim that `DEFAULT_STRATA`-scale signal is comfortably
+detectable, now extended down toward (not fully to) the boundary. Full data:
+`benchmarking/results_v210/power_curve.csv`.
 
 ---
 
@@ -332,10 +520,14 @@ valid upper bound on `q_i`, even though it would still look like one in the outp
 ## 8. Per-stratum vs. joint coverage
 
 `m_bonferroni` is computed as the **maximum** number of distinct observed cutoffs
-across all length strata (`m_bonferroni = max_s G_s`, where `G_s` is the distinct-cutoff
-count within stratum `s`), and the same `m_bonferroni` is then used for every stratum's
-cluster-interval calculation. This is what makes `region_qvalue_upper_95` comparable in
-magnitude across strata.
+across every stratum actually being tested (`m_bonferroni = max_s G_s`, where `G_s`
+is the distinct-cutoff count within stratum `s`), and the same `m_bonferroni` is
+then used for every stratum's cluster-interval calculation. This is what makes
+`region_qvalue_upper_95` comparable in magnitude across strata. "Stratum" here means
+whatever partition `region_fdr_result` is actually reporting over: a pure length
+stratum when support-conditioned stratification is off, or the finer joint
+(length × support-bin) partition when it is on (§1c.6) -- `m_bonferroni` is always
+taken over the partition in use, not hardcoded to length alone.
 
 State this explicitly: **the nominal family is one complete cutoff curve within a
 stratum.** Under the stated quasi-Poisson approximation its target coverage is
@@ -513,10 +705,9 @@ The shipped `"lag"` construction at its `null_replicates=100` default gives
 `s ≈ 0.01`. `member_step`'s `n_lag_draws` was originally set to `150` by measuring `s`
 at genome scale on both real layouts and raising the draw count until `s ≤ 0.01` held
 on the tighter of the two (EPIC-seq): `s = 0.0090` (WGBS chr1), `s = 0.0097` (EPIC-seq)
-at `n_lag_draws = 150`. That target predates the realised-FDR measurement described
-below (§13): once realised FDR was shown to be substantially conservative relative to
-the 5% nominal target, a resolution finer than what a 5% decision needs stopped being
-load-bearing. A sensitivity sweep (`n_lag_draws` in {40, 60, 75, 100, 150}, both real
+at `n_lag_draws = 150`. That target predates the easy-signal measurement described
+below (§13), which initially appeared conservative. A sensitivity sweep
+(`n_lag_draws` in {40, 60, 75, 100, 150}, both real
 layouts, 3 seeds, genome scale) found `n_lag_draws = 75` gives `s ≈ 0.019` with both
 region-level gates still passing and recall/realised FDR unchanged from `150` on every
 cell measured, at ~27% lower wall-clock per cell (closer to a 2x cut in the null
@@ -605,50 +796,18 @@ Stage 2c subsequently added the per-length opportunity guard, and Stage 2d uses 
 same opportunity at the estimator's scale. The historical global-only account above
 does not describe the current member-step publication path.
 
-## 13. Calibrated, or conservative? Quantifying the realised-FDR claim (Stage 1f Task 2,
-master spec pre-release)
+## 13. Historical easy-signal result (superseded by Stage 2e)
 
-STOP 1e reported realised FDR of exactly `0.0000` in 25 of 26 measured planted-signal
-cells (`benchmarking/results_v210/gap_sweep.csv`, 20 cells, plus the dedicated
-`missingness`-scenario measurement, 6 cells; `STAGE1D_D_STOP_REPORT.md` §6.4 and
-`STAGE1E_STOP_REPORT.md` §2). **That is not, on its own, evidence of calibration at
-5%.** With 6–16 significant calls per cell, both "controls FDR at 0.05" and
-"substantially conservative" predict roughly zero observed false positives — the two
-hypotheses are not distinguishable cell by cell. The question has to be asked of the
-**pooled** count, not read off individual cells.
+The Stage 1f grid produced 293 calls with one false positive, a pooled false-call
+ratio of 0.34%. This showed that the planted signal was easy, not that FDR was
+uniformly conservative. Calls within a run are dependent, and pooling calls across
+heterogeneous cells weights high-power cells more heavily, so a call-level binomial
+or Clopper–Pearson calculation is not a valid confidence interval for FDR.
 
-**Pooled across all 26 cells: 293 significant calls, 1 false positive.** (One extra
-candidate at `wgbs_real`, seed 1, `max_cpg_gap_bp=100` — §11.4's small-`n` caveat,
-not smoothed over.) The realised-FDR point estimate is `1/293 = 0.0034` (0.34%). The
-one-sided 95% Clopper–Pearson upper bound on the true FDR given this count is:
-
-```
-upper_95 = Beta.ppf(0.95, false_positives + 1, significant_calls - false_positives)
-         = Beta.ppf(0.95, 2, 292)
-         = 0.0161
-```
-
-**The 95% upper bound is 1.6%, comfortably below the 5% nominal target.** For scale:
-if the true FDR were exactly 5%, the expected false-positive count at 293 calls would
-be `14.65`, and the probability of observing 1 or fewer is `4.9 x 10^-6`
-(`scipy.stats.binom.cdf(1, 293, 0.05)`) — essentially impossible. The pooled data
-reject "calibrated at exactly 5%" and are consistent with "substantially
-conservative", the same direction STOP 1e's own DMR-free calibration numbers already
-pointed (`benchmarking/results_v210/calibration_member_step.csv`: Gate 2 ratios
-0.6–1.6, comfortably under the 3.0 gate, on every completed cell).
-
-**Say "conservative", not "calibrated".** This is the honest reading of the evidence,
-it is the safe direction for a discovery tool (a conservative FDR estimator
-under-calls before it over-calls), and it names where power is being left on the
-table — a reader comparing this method to one that reports realised FDR nearer 5%
-should not conclude EIGER is "better calibrated"; the fair comparison is at matched
-realised FDR, which is not what 293-vs-1 data can establish on its own.
-Overclaiming calibration on evidence that cannot distinguish "controls FDR" from
-"substantially conservative" would be the one thing to undermine an otherwise
-careful record — this section exists so the claim actually matches the evidence
-behind it. Quantifying exactly how conservative (a power curve against a
-"realised FDR near nominal" boundary, not the comfortably-detectable signal grid
-`DEFAULT_STRATA` provides) is Stage 1f Task 3's paper-grid work, not resolved here.
+The current interpretation is the Stage 2e per-run analysis near the top of this
+document: estimate FDR by averaging `V / max(R, 1)` within each benchmark regime and
+report regimes separately. On that basis, weak-effect 4-CpG cells remain above the
+5% target.
 
 ---
 
@@ -952,6 +1111,59 @@ inadequate pooled null, with no value able to do one without the other. Split in
 `min_null_values` (pooled floor, unchanged default 1,000) and
 `min_null_values_per_support_bin` (per-bin collapse trigger, same default, independently
 tunable) -- unrelated to opportunity, found while exercising this stage's full test suite.
+
+---
+
+## 17. The bottom length stratum's opportunity floor must track `min_cpgs` (Stage 2e)
+
+### 17.1 The defect
+
+`_LENGTH_STRATUM_MIN_EDGES["4-5"] = 3` hardcodes the assumption that the shortest
+region `segment()` can ever produce is 4 CpGs (3 edges) -- true only at
+`Eiger2Config.min_cpgs`'s default of 4. `length_stratum()`'s bottom bucket has no
+lower bound of its own (`n_cpg <= 5`), so it silently absorbs any region shorter
+than 4 CpGs. Below the default -- `min_cpgs` is validated down to 2 -- `segment()`
+legitimately produces regions as short as `min_cpgs` CpGs, which `length_stratum()`
+still buckets into "4-5", while `_stratum_opportunity()` kept demanding 3 edges of
+run length before counting any opportunity for that stratum at all. The result: a
+replicate whose only eligible runs were 1-2 edges long could still produce pooled
+"4-5" null regions (`segment()` correctly forms them) while its measured
+opportunity for that stratum was zero (the opportunity formula's floor was too
+high to see them) -- tripping `_replicate_cluster_dispersion`'s own internal
+invariant, `ValueError("a zero-exposure null replicate cannot contain regions")`.
+
+This was not a rare corner case: running `benchmarking/benchmark_suite.py`'s
+`sweep` command -- the heuristic-insensitivity experiment `docs/BENCHMARK.md`
+describes, which exists specifically to sweep `min_cpgs` across
+`(2, 3, 4, 6, 10, 20)` and confirm realised FDR stays near target throughout --
+raised this `ValueError` deterministically on every one of the five DMR-free/
+signal scenarios at `min_cpgs` in `{2, 3}`, before this fix. The heuristic-
+insensitivity claim was therefore untested, not merely unconfirmed, at the two
+smallest `min_cpgs` values in the sweep's own grid for as long as this defect
+was present.
+
+### 17.2 The fix
+
+`_stratum_opportunity()` now takes `min_cpgs` and lowers the "4-5" stratum's
+edge floor to `min(3, max(min_cpgs - 1, 1))` -- 3 only ever gets smaller, never
+larger. Both call sites (observed and per-replicate null opportunity in
+`call_dmrs`) pass `config.min_cpgs`, so the floor always matches what
+`segment()` was actually configured to produce. Raising `min_cpgs` above the
+default needs no adjustment in the other direction: the segmenter then never
+forms a "4-5"-length region in the first place, so the stratum simply goes
+unpopulated (as it already correctly did before this fix) rather than
+mismatched. All other stratum boundaries (`"6-9"` through `"50+"`) are fixed
+cutpoints the segmenter's floor cannot undercut, so only the bottom stratum
+needed this.
+
+Regression coverage: `tests/test_eiger2_core.py::test_stratum_opportunity_bottom_floor_tracks_min_cpgs`
+pins the corrected floor at `min_cpgs` in `{2, 3, 4, 5, 9}`, and
+`test_call_dmrs_does_not_crash_on_short_min_cpgs` reruns the exact crashing
+configuration end-to-end through `call_dmrs` at `min_cpgs` in `{2, 3}`. The full
+`sweep` grid across all five scenarios and the complete `(window, max_gap_edges,
+min_cpgs)` grid was re-run after the fix with zero exceptions, confirmed as part
+of this release's confirmatory benchmarking (§13-equivalent results in
+`benchmarking/results_stage2d_confirm/heuristic_sweep_summary.csv`).
 
 ---
 

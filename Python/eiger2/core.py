@@ -56,6 +56,9 @@ __all__ = [
     "permutation_null_tracks",
     "region_fdr",
     "region_minority_size",
+    "biological_support_diagnostics",
+    "classify_biological_support",
+    "main_region_table",
     "segment",
 ]
 
@@ -368,6 +371,9 @@ class Eiger2Config:
     ``docs/FDR.md``.
     """
 
+    biological_support_policy: str = "off"
+    """``off`` or the post-selection descriptive ``five_class_v1`` policy."""
+
     min_null_values: int = 1_000
     """Warn below this many usable null positions, POOLED across the whole
     run -- also the ``null_construction`` structural gate's hard floor on
@@ -540,6 +546,10 @@ class Eiger2Config:
             raise ValueError("target_fdr must lie in (0, 1)")
         if self.fdr_decision not in {"point", "upper"}:
             raise ValueError("fdr_decision must be 'point' or 'upper'")
+        if self.biological_support_policy not in {"off", "five_class_v1"}:
+            raise ValueError(
+                "biological_support_policy must be 'off' or 'five_class_v1'"
+            )
         if self.support_binned_threshold not in {"auto", "on", "off"}:
             raise ValueError("support_binned_threshold must be 'auto', 'on', or 'off'")
         if self.support_bins < 2:
@@ -1683,46 +1693,26 @@ def permutation_null_tracks(
     )
 
 
-def region_minority_size(
-    values: np.ndarray, region: Sequence[int], matrix: np.ndarray
-) -> tuple[int, float]:
-    """Size of the deviating sample group for a region, and its effect.
+def _two_means_partition(region_means: np.ndarray) -> dict:
+    """Return a deterministic one-dimensional two-means split."""
 
-    Splits the per-sample region means at their largest gap and returns the size
-    of the *minority* side together with the difference between the two cluster
-    means. The minority side is returned rather than the low side so that a
-    hypermethylated subgroup is not reported as a hypomethylated majority.
-    """
-
-    first, last = int(region[0]), int(region[1])
-    block = matrix[first : last + 1]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        means = np.nanmean(block, axis=0)
+    means = np.asarray(region_means, dtype=float)
     finite = np.isfinite(means)
-    if finite.sum() < 4:
-        return 0, 0.0
     index = np.flatnonzero(finite)
-    order = index[np.argsort(means[index])]
-    values = means[order]
-    n = values.size
-    if n < 4:
-        return 0, 0.0
-
-    # Split by minimising within-cluster sum of squares over every cut point,
-    # not by taking the largest adjacent gap.
-    #
-    # The largest gap is the criterion the original find_separators used and it
-    # fails badly once the cohort is large. With several hundred samples the
-    # sorted region means are near-continuous, so the biggest single gap sits
-    # beside an outlier rather than at a group boundary: measured on 3,000
-    # regions whose tumour and benign group means differed by at least 0.20, the
-    # largest gap returned a minority of one sample in the median case, while
-    # two-means returned 221 -- the correct size for a 267 versus 227 split.
-    # Two-means also still isolates genuinely small subgroups, because four
-    # strongly displaced samples minimise the criterion at a 4-versus-rest cut.
-    cumulative = np.cumsum(values)
-    cumulative_square = np.cumsum(values * values)
+    if index.size < 4:
+        return {
+            "minority_size": 0,
+            "minority_fraction": float("nan"),
+            "minority_delta": 0.0,
+            "minority_samples": np.empty(0, dtype=int),
+            "boundary_gap": float("nan"),
+            "boundary_gap_fraction_delta": float("nan"),
+        }
+    order = index[np.argsort(means[index], kind="mergesort")]
+    ordered = means[order]
+    n = ordered.size
+    cumulative = np.cumsum(ordered)
+    cumulative_square = np.cumsum(ordered * ordered)
     left = np.arange(1, n)
     mean_left = cumulative[:-1] / left
     mean_right = (cumulative[-1] - cumulative[:-1]) / (n - left)
@@ -1732,8 +1722,41 @@ def region_minority_size(
            - (n - left) * mean_right ** 2)
     )
     cut = int(np.argmin(within))
+    lower = order[: cut + 1]
+    upper = order[cut + 1 :]
+    minority = lower if lower.size <= upper.size else upper
     delta = float(abs(mean_left[cut] - mean_right[cut]))
-    return int(min(cut + 1, n - cut - 1)), delta
+    boundary_gap = float(ordered[cut + 1] - ordered[cut])
+    return {
+        "minority_size": int(minority.size),
+        "minority_fraction": float(minority.size / n),
+        "minority_delta": delta,
+        "minority_samples": minority,
+        "boundary_gap": boundary_gap,
+        "boundary_gap_fraction_delta": (
+            float(boundary_gap / delta) if delta > 0 else float("nan")
+        ),
+    }
+
+
+def region_minority_size(
+    values: np.ndarray, region: Sequence[int], matrix: np.ndarray
+) -> tuple[int, float]:
+    """Size of the deviating sample group for a region, and its effect.
+
+    Uses a one-dimensional two-means partition of per-sample region means and
+    returns the smaller group and the difference between cluster means.
+    """
+
+    del values  # historical parameter retained for API compatibility
+    first, last = int(region[0]), int(region[1])
+    block = matrix[first : last + 1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        means = np.nanmean(block, axis=0)
+    # Unlike the largest-gap diagnostic, two-means estimates a group partition.
+    split = _two_means_partition(means)
+    return int(split["minority_size"]), float(split["minority_delta"])
 
 
 def null_exchangeability(
@@ -2315,16 +2338,21 @@ def _run_lengths_from_mask(usable: np.ndarray) -> np.ndarray:
     return lengths[lengths > 0]
 
 
-def _stratum_opportunity(run_lengths: np.ndarray) -> dict[str, float]:
-    """Spec §2c.1: for each length stratum ``s``, sum over maximal eligible
-    runs of ``max(0, run_len - min_edges(s) + 1)`` -- the number of distinct
-    positions a region of stratum ``s``'s minimum length could have started
-    at within these runs."""
+def _stratum_opportunity(
+    run_lengths: np.ndarray, min_cpgs: int = 4
+) -> dict[str, float]:
+    """Count possible region starts per length stratum.
+
+    The bottom stratum follows ``min_cpgs`` when it is below the default of 4;
+    all higher stratum boundaries are fixed.
+    """
 
     run_lengths = np.asarray(run_lengths, dtype=np.int64)
+    min_edges = dict(_LENGTH_STRATUM_MIN_EDGES)
+    min_edges["4-5"] = min(min_edges["4-5"], max(int(min_cpgs) - 1, 1))
     return {
-        stratum: float(np.sum(np.maximum(0, run_lengths - min_edges + 1)))
-        for stratum, min_edges in _LENGTH_STRATUM_MIN_EDGES.items()
+        stratum: float(np.sum(np.maximum(0, run_lengths - edges + 1)))
+        for stratum, edges in min_edges.items()
     }
 
 
@@ -3267,6 +3295,279 @@ def characterise_region(values: np.ndarray) -> dict:
     }
 
 
+_FIVE_CLASS_POLICY = {
+    "name": "five_class_v1",
+    "status": "provisional_descriptive_pending_validation",
+    "rare_max_fraction": 0.01,
+    "rare_minimum_max_samples": 2,
+    "cohort_min_fraction": 0.10,
+    "stable_group_min_delta_beta": 0.10,
+    "stable_group_min_boundary_gap_fraction_delta": 0.10,
+    "direction_coherence_min": 0.80,
+    "outlier_influence_min": 0.50,
+    "bounded_score_retention_min": 0.50,
+    "winsor_tail_fraction": 0.05,
+    "labels": [
+        "cohort_supported",
+        "recurrent_subgroup",
+        "rare_epivariant",
+        "outlier_sensitive",
+        "diffuse_coordination",
+    ],
+    "note": (
+        "Post-selection description only. It does not alter region_qvalue, "
+        "coordination_significant, or the empirical coordination FDR. "
+        "rare_epivariant means candidate rare epivariant; coherent technical "
+        "blocks are not identifiable from the selected region alone. Influence "
+        "screens the furthest-mean one/two samples, not every possible removal."
+    ),
+}
+
+
+# Defaults keep computed and skipped diagnostic rows on the same schema.
+_SUPPORT_DIAGNOSTIC_DEFAULTS: dict[str, float | int] = {
+    "furthest_mean_sample_index": -1,
+    "adjacent_support_score": float("nan"),
+    "adjacent_support_score_without_furthest1": float("nan"),
+    "adjacent_support_score_without_furthest2": float("nan"),
+    "furthest1_adjacent_score_influence_fraction": float("nan"),
+    "furthest2_adjacent_score_influence_fraction": float("nan"),
+    "winsorised_adjacent_support_score": float("nan"),
+    "winsorised_score_retention": float("nan"),
+    "minority_direction_coherence": float("nan"),
+}
+
+
+def _adjacent_support_score(block: np.ndarray, config: Eiger2Config) -> float:
+    """Mean pairwise-complete adjacent statistic within a selected region."""
+
+    values = np.asarray(block, dtype=float)
+    if values.ndim != 2 or values.shape[0] < 2:
+        return float("nan")
+    per_edge = _pair_statistic(
+        values[:-1], values[1:], config.statistic,
+        config.min_paired_samples, config.min_paired_fraction,
+    )
+    finite = np.isfinite(per_edge)
+    return float(np.mean(per_edge[finite])) if finite.any() else float("nan")
+
+
+def _winsorise_rows(values: np.ndarray, tail_fraction: float) -> np.ndarray:
+    """Row-wise deterministic winsorisation preserving missing values."""
+
+    result = np.array(values, dtype=float, copy=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        lower = np.nanquantile(result, tail_fraction, axis=1)
+        upper = np.nanquantile(result, 1.0 - tail_fraction, axis=1)
+    result = np.maximum(result, lower[:, None], where=np.isfinite(result), out=result)
+    result = np.minimum(result, upper[:, None], where=np.isfinite(result), out=result)
+    return result
+
+
+def biological_support_diagnostics(
+    raw_block: np.ndarray,
+    statistic_block: np.ndarray,
+    region_means: np.ndarray,
+    config: Eiger2Config,
+) -> dict:
+    """Compute post-selection prevalence and influence diagnostics.
+
+    Influence is measured on the adjacent support score after removing the
+    one or two furthest-mean samples. Winsorisation is descriptive because the
+    discovery and null tracks are not rebuilt with the same transform.
+    """
+
+    raw = np.asarray(raw_block, dtype=float)
+    score_values = np.asarray(statistic_block, dtype=float)
+    means = np.asarray(region_means, dtype=float)
+    split = _two_means_partition(means)
+    finite_means = np.flatnonzero(np.isfinite(means))
+    top_sample = -1
+    top_samples = np.empty(0, dtype=int)
+    if finite_means.size:
+        centre = float(np.nanmedian(means))
+        ranked = finite_means[
+            np.argsort(-np.abs(means[finite_means] - centre), kind="mergesort")
+        ]
+        top_samples = ranked[:2]
+        top_sample = int(top_samples[0])
+
+    score = _adjacent_support_score(score_values, config)
+    score_without_top1 = float("nan")
+    if top_sample >= 0:
+        without = np.array(score_values, copy=True)
+        without[:, top_sample] = np.nan
+        score_without_top1 = _adjacent_support_score(without, config)
+    score_without_top2 = float("nan")
+    if top_samples.size >= 2:
+        without_two = np.array(score_values, copy=True)
+        without_two[:, top_samples] = np.nan
+        score_without_top2 = _adjacent_support_score(without_two, config)
+    bounded = _winsorise_rows(
+        score_values, _FIVE_CLASS_POLICY["winsor_tail_fraction"]
+    )
+    bounded_score = _adjacent_support_score(bounded, config)
+
+    def retention(candidate: float) -> float:
+        if not (np.isfinite(score) and score > 0 and np.isfinite(candidate)):
+            return float("nan")
+        return float(candidate / score)
+
+    loo_retention = retention(score_without_top1)
+    influence = (
+        float(np.clip(1.0 - loo_retention, 0.0, 1.0))
+        if np.isfinite(loo_retention) else float("nan")
+    )
+    loo2_retention = retention(score_without_top2)
+    top2_influence = (
+        float(np.clip(1.0 - loo2_retention, 0.0, 1.0))
+        if np.isfinite(loo2_retention) else float("nan")
+    )
+    bounded_retention = retention(bounded_score)
+
+    # Measure whether the two-means minority shifts consistently across CpGs.
+    minority_samples = np.asarray(split["minority_samples"], dtype=int)
+    coherence = float("nan")
+    if minority_samples.size and raw.shape[0]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            row_medians = np.nanmedian(raw, axis=1)
+            minority_shift = np.nanmean(
+                raw[:, minority_samples] - row_medians[:, None], axis=1
+            )
+        finite_shift = np.isfinite(minority_shift) & (minority_shift != 0)
+        if finite_shift.any():
+            direction = np.sign(np.nanmedian(minority_shift[finite_shift]))
+            coherence = float(
+                np.mean(np.sign(minority_shift[finite_shift]) == direction)
+            )
+
+    computed = {
+        "furthest_mean_sample_index": top_sample,
+        "adjacent_support_score": score,
+        "adjacent_support_score_without_furthest1": score_without_top1,
+        "adjacent_support_score_without_furthest2": score_without_top2,
+        "furthest1_adjacent_score_influence_fraction": influence,
+        "furthest2_adjacent_score_influence_fraction": top2_influence,
+        "winsorised_adjacent_support_score": bounded_score,
+        "winsorised_score_retention": bounded_retention,
+        "minority_direction_coherence": coherence,
+    }
+    assert computed.keys() == _SUPPORT_DIAGNOSTIC_DEFAULTS.keys(), (
+        "biological_support_diagnostics' return keys drifted from "
+        "_SUPPORT_DIAGNOSTIC_DEFAULTS -- update both together"
+    )
+    return {**split, **computed}
+
+
+def classify_biological_support(
+    diagnostics: Mapping[str, object],
+    *,
+    coordination_significant: bool | None,
+    n_observed: int,
+) -> str | None:
+    """Apply the mutually exclusive provisional five-class hierarchy."""
+
+    if coordination_significant is not True:
+        return None
+    minority = int(diagnostics.get("minority_size", 0))
+    fraction = float(diagnostics.get("minority_fraction", np.nan))
+    delta = float(diagnostics.get("minority_delta", np.nan))
+    gap_fraction = float(
+        diagnostics.get("boundary_gap_fraction_delta", np.nan)
+    )
+    coherence = float(diagnostics.get("minority_direction_coherence", np.nan))
+    influence = float(diagnostics.get(
+        "furthest1_adjacent_score_influence_fraction", np.nan
+    ))
+    influence2 = float(diagnostics.get(
+        "furthest2_adjacent_score_influence_fraction", np.nan
+    ))
+    bounded_retention = float(
+        diagnostics.get("winsorised_score_retention", np.nan)
+    )
+    rare_max = max(
+        int(_FIVE_CLASS_POLICY["rare_minimum_max_samples"]),
+        int(_FIVE_CLASS_POLICY["rare_max_fraction"] * n_observed),
+    )
+    coherent = np.isfinite(coherence) and (
+        coherence >= _FIVE_CLASS_POLICY["direction_coherence_min"]
+    )
+    bounded = np.isfinite(bounded_retention) and (
+        bounded_retention >= _FIVE_CLASS_POLICY["bounded_score_retention_min"]
+    )
+    influential = (
+        (np.isfinite(influence) and
+         influence >= _FIVE_CLASS_POLICY["outlier_influence_min"])
+        or (np.isfinite(influence2) and
+            influence2 >= _FIVE_CLASS_POLICY["outlier_influence_min"])
+    )
+
+    # Coherent private events remain rare candidates if winsorisation attenuates
+    # them.
+    if 0 < minority <= rare_max and coherent:
+        return "rare_epivariant"
+    if influential and not bounded:
+        return "outlier_sensitive"
+    stable_discrete = (
+        minority > 0
+        and np.isfinite(delta)
+        and delta >= _FIVE_CLASS_POLICY["stable_group_min_delta_beta"]
+        and np.isfinite(gap_fraction)
+        and gap_fraction >= _FIVE_CLASS_POLICY[
+            "stable_group_min_boundary_gap_fraction_delta"
+        ]
+        # Coherence without single-sample influence is an alternative when
+        # winsorisation attenuates a small subgroup by construction.
+        and (bounded or (coherent and not influential))
+    )
+    if stable_discrete and np.isfinite(fraction):
+        if fraction >= _FIVE_CLASS_POLICY["cohort_min_fraction"]:
+            return "cohort_supported"
+        if minority > rare_max:
+            return "recurrent_subgroup"
+    return "diffuse_coordination"
+
+
+def _diagnostic_status(coordination_call: bool | None) -> str:
+    if coordination_call is None:
+        return "unavailable"
+    return "computed" if coordination_call else "not_selected"
+
+
+_SUPPORT_OUTPUT_COLUMNS = [
+    "region_id",
+    "biological_support_policy",
+    "biological_class",
+    "coordination_significant",
+    "two_means_minority_size",
+    "two_means_minority_fraction",
+    "two_means_delta_beta",
+    "two_means_boundary_gap",
+    "two_means_boundary_gap_fraction_delta",
+    "largest_gap_tail_size_legacy",
+    "largest_gap_tail_fraction_legacy",
+    "largest_gap_delta_beta_legacy",
+    "largest_adjacent_gap_legacy",
+    "direction_descriptive",
+    "largest_gap_pvalue_descriptive_invalid_for_inference",
+    "n_samples_observed",
+    "missing_rate",
+    "mean_beta",
+    "furthest_mean_sample",
+    "adjacent_support_score",
+    "adjacent_support_score_without_furthest1",
+    "furthest1_adjacent_score_influence_fraction",
+    "adjacent_support_score_without_furthest2",
+    "furthest2_adjacent_score_influence_fraction",
+    "winsorised_adjacent_support_score",
+    "winsorised_score_retention",
+    "minority_direction_coherence",
+    "diagnostic_status",
+]
+
+
 # --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
@@ -3417,6 +3718,19 @@ def call_dmrs(
     frame = frame.loc[keep].reset_index(drop=True)
     source_index = np.flatnonzero(keep)
 
+    support_policy_manifest = (
+        dict(_FIVE_CLASS_POLICY)
+        if config.biological_support_policy == "five_class_v1"
+        else {
+            "name": "off",
+            "status": "disabled",
+            "labels": list(_FIVE_CLASS_POLICY["labels"]),
+            "note": (
+                "Enable biological_support_policy='five_class_v1' for the "
+                "provisional post-selection classification."
+            ),
+        }
+    )
     manifest: dict = {
         "config": config.to_dict(),
         "n_cpg_input": int(n_cpg),
@@ -3433,9 +3747,25 @@ def call_dmrs(
         "chromosome_order": chromosome_order,
         "schema_version": "2.3",
         "fdr_decision": config.fdr_decision,
+        "biological_support": {
+            "policy": support_policy_manifest,
+            "diagnostics_file": (
+                "region_support_diagnostics.csv"
+                if config.biological_support_policy == "five_class_v1"
+                else None
+            ),
+            "classification_counts": {
+                str(label): 0 for label in _FIVE_CLASS_POLICY["labels"]
+            },
+            "not_classified": 0,
+        },
     }
     empty_regions = pd.DataFrame(columns=_REGION_COLUMNS)
     empty_values = pd.DataFrame(columns=["region_id", *sample_names])
+    if config.biological_support_policy == "five_class_v1":
+        empty_regions.attrs["region_support_diagnostics"] = pd.DataFrame(
+            columns=_SUPPORT_OUTPUT_COLUMNS
+        )
     if matrix.shape[0] < config.min_cpgs:
         manifest["status"] = "insufficient_cpgs"
         return empty_regions, empty_values, manifest
@@ -3980,7 +4310,9 @@ def call_dmrs(
         replicate_edge_count = int(usable.sum())
         null_edge_counts.append(replicate_edge_count)
         null_edge_total += replicate_edge_count
-        replicate_opportunity = _stratum_opportunity(_run_lengths_from_mask(usable))
+        replicate_opportunity = _stratum_opportunity(
+            _run_lengths_from_mask(usable), min_cpgs=config.min_cpgs
+        )
         for s, opportunity in replicate_opportunity.items():
             null_stratum_opportunity[s] += opportunity
             null_stratum_opportunity_by_replicate[s].append(opportunity)
@@ -4149,7 +4481,8 @@ def call_dmrs(
     # where a region of stratum s's length COULD have formed at all, not of
     # whether the estimator is currently reporting per length stratum.
     observed_stratum_opportunity = _stratum_opportunity(
-        _run_lengths_from_mask(eligible & np.isfinite(statistic))
+        _run_lengths_from_mask(eligible & np.isfinite(statistic)),
+        min_cpgs=config.min_cpgs,
     )
     stratum_opportunity = {
         s: (observed_stratum_opportunity[s], null_stratum_opportunity[s])
@@ -4278,6 +4611,9 @@ def call_dmrs(
     )
 
     rows = []
+    support_rows: list[dict] | None = (
+        [] if config.biological_support_policy == "five_class_v1" else None
+    )
     value_rows = []
     for position, (first, last) in enumerate(regions):
         first, last = int(first), int(last)
@@ -4288,8 +4624,30 @@ def call_dmrs(
             np.nansum(block, axis=0), counts, out=means, where=counts > 0
         )
         description = characterise_region(means)
-        minority, minority_delta = region_minority_size(
-            means, (first, last), matrix
+        coordination_call = (
+            None if not np.isfinite(decision_qvalue[position])
+            else bool(decision_qvalue[position] <= config.target_fdr)
+        )
+        if (
+            coordination_call
+            and config.biological_support_policy == "five_class_v1"
+        ):
+            support = biological_support_diagnostics(
+                block, deflated[first : last + 1], means, config
+            )
+        else:
+            split = _two_means_partition(means)
+            support = {**split, **_SUPPORT_DIAGNOSTIC_DEFAULTS}
+        minority = int(support["minority_size"])
+        minority_delta = float(support["minority_delta"])
+        biological_class = (
+            classify_biological_support(
+                support,
+                coordination_significant=coordination_call,
+                n_observed=int(description["n_observed"]),
+            )
+            if config.biological_support_policy == "five_class_v1"
+            else None
         )
         chrom = frame["chr"].iloc[first]
         start = int(frame["start"].iloc[first])
@@ -4340,6 +4698,10 @@ def call_dmrs(
                 "minority_size_descriptive": int(minority),
                 "minority_delta_descriptive": float(minority_delta),
                 "passes_prevalence": bool(minority >= config.min_prevalence_samples),
+                "coordination_significant": (
+                    pd.NA if coordination_call is None else coordination_call
+                ),
+                "biological_class": biological_class,
                 # Spec §2a.4: `False` means "tested, not significant" -- a
                 # different statement from "not tested because inference was
                 # unavailable". A refused run/stratum used to collapse both
@@ -4384,6 +4746,68 @@ def call_dmrs(
                 "pvalue_descriptive": description["pvalue_descriptive"],
             }
         )
+        if support_rows is not None:
+            top_sample = int(support["furthest_mean_sample_index"])
+            support_rows.append(
+                {
+                    "region_id": region_id,
+                    "biological_support_policy": config.biological_support_policy,
+                    "biological_class": biological_class,
+                    "coordination_significant": (
+                        pd.NA if coordination_call is None else coordination_call
+                    ),
+                    "two_means_minority_size": minority,
+                    "two_means_minority_fraction": float(
+                        support["minority_fraction"]
+                    ),
+                    "two_means_delta_beta": minority_delta,
+                    "two_means_boundary_gap": support["boundary_gap"],
+                    "two_means_boundary_gap_fraction_delta": support[
+                        "boundary_gap_fraction_delta"
+                    ],
+                    "largest_gap_tail_size_legacy": description[
+                        "minor_group_size"
+                    ],
+                    "largest_gap_tail_fraction_legacy": description[
+                        "minor_group_fraction"
+                    ],
+                    "largest_gap_delta_beta_legacy": description["delta_beta"],
+                    "largest_adjacent_gap_legacy": description["largest_gap"],
+                    "direction_descriptive": description["direction"],
+                    "largest_gap_pvalue_descriptive_invalid_for_inference": (
+                        description["pvalue_descriptive"]
+                    ),
+                    "n_samples_observed": description["n_observed"],
+                    "missing_rate": float(np.mean(~np.isfinite(block))),
+                    "mean_beta": description["mean_beta"],
+                    "furthest_mean_sample": (
+                        sample_names[top_sample] if top_sample >= 0 else None
+                    ),
+                    "adjacent_support_score": support["adjacent_support_score"],
+                    "adjacent_support_score_without_furthest1": support[
+                        "adjacent_support_score_without_furthest1"
+                    ],
+                    "furthest1_adjacent_score_influence_fraction": support[
+                        "furthest1_adjacent_score_influence_fraction"
+                    ],
+                    "adjacent_support_score_without_furthest2": support[
+                        "adjacent_support_score_without_furthest2"
+                    ],
+                    "furthest2_adjacent_score_influence_fraction": support[
+                        "furthest2_adjacent_score_influence_fraction"
+                    ],
+                    "winsorised_adjacent_support_score": support[
+                        "winsorised_adjacent_support_score"
+                    ],
+                    "winsorised_score_retention": support[
+                        "winsorised_score_retention"
+                    ],
+                    "minority_direction_coherence": support[
+                        "minority_direction_coherence"
+                    ],
+                    "diagnostic_status": _diagnostic_status(coordination_call),
+                }
+            )
         value_rows.append(means)
 
     region_frame = pd.DataFrame(rows)[_REGION_COLUMNS]
@@ -4392,6 +4816,19 @@ def call_dmrs(
     # CSV round trip as a genuinely missing value rather than a stringified
     # "<NA>" object (spec §2a.4).
     region_frame["significant"] = region_frame["significant"].astype("boolean")
+    region_frame["coordination_significant"] = region_frame[
+        "coordination_significant"
+    ].astype("boolean")
+    if support_rows is not None:
+        support_frame = pd.DataFrame(
+            support_rows, columns=_SUPPORT_OUTPUT_COLUMNS
+        )
+        if len(support_frame):
+            support_frame["coordination_significant"] = support_frame[
+                "coordination_significant"
+            ].astype("boolean")
+        # Preserve the three-return-value API while exposing opt-in diagnostics.
+        region_frame.attrs["region_support_diagnostics"] = support_frame
     values_frame = pd.DataFrame(value_rows, columns=sample_names)
     values_frame.insert(0, "region_id", region_frame["region_id"].to_numpy())
 
@@ -4446,6 +4883,19 @@ def call_dmrs(
         (region_frame["region_qvalue"] <= config.target_fdr).sum()
     )
     manifest["n_passing_prevalence"] = int(region_frame["passes_prevalence"].sum())
+    manifest["biological_support"] = {
+        "policy": support_policy_manifest,
+        "diagnostics_file": (
+            "region_support_diagnostics.csv"
+            if config.biological_support_policy == "five_class_v1"
+            else None
+        ),
+        "classification_counts": {
+            str(label): int((region_frame["biological_class"] == label).sum())
+            for label in _FIVE_CLASS_POLICY["labels"]
+        },
+        "not_classified": int(region_frame["biological_class"].isna().sum()),
+    }
     manifest["schema_version"] = "2.3"
     manifest["fdr_decision"] = config.fdr_decision
     return region_frame, values_frame, manifest
@@ -4479,6 +4929,8 @@ _REGION_COLUMNS = [
     "minority_size_descriptive",
     "minority_delta_descriptive",
     "passes_prevalence",
+    "coordination_significant",
+    "biological_class",
     "significant",
     "fdr_status",
     "n_samples_observed",
@@ -4492,3 +4944,23 @@ _REGION_COLUMNS = [
     "minor_group_samples_descriptive",
     "pvalue_descriptive",
 ]
+
+
+_REGION_MAIN_COLUMNS = [
+    "region_id", "chr", "start", "end", "n_cpg", "length_bp",
+    "cpg_index_start", "cpg_index_end", "statistic", "statistic_mean",
+    "statistic_min", "statistic_threshold", "region_support_median",
+    "region_threshold_mode", "region_area", "region_qvalue", "region_tail_fdr",
+    "region_qvalue_lower_95", "region_qvalue_upper_95",
+    "region_qvalue_resolution", "null_exceedances_at_cutoff",
+    "region_qvalue_cutoff_rank", "region_evidence_score",
+    "evidence_score_extrapolated", "coordination_significant",
+    "biological_class", "passes_prevalence", "significant", "fdr_status",
+]
+
+
+def main_region_table(regions: pd.DataFrame) -> pd.DataFrame:
+    """Return the concise CLI-facing subset of the region table."""
+
+    columns = [column for column in _REGION_MAIN_COLUMNS if column in regions]
+    return regions.loc[:, columns].copy()

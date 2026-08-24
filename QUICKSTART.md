@@ -192,15 +192,18 @@ coverage files is not yet wired into the CLI.
 > reversed, which under-called false discoveries in v2.0.0 (see
 > [docs/FDR.md](docs/FDR.md)).
 >
-> **Known limitation:** realised FDR control has been found to be substantially
-> miscalibrated under high-missingness, small-sample, and high-noise conditions, even
-> with the corrected q-values above (see [docs/FDR.md](docs/FDR.md) and the README's
-> "Important limitations" section). Treat `region_qvalue`/`significant` with caution
-> in these regimes until this is investigated further.
+> **Stage 2e update:** the chromosome-aware region null greatly improves the earlier
+> high-missingness, small-sample, and high-noise results, and null-construction health
+> passes all 1,000 genome-scale calibration runs. FDR control is not uniform at the
+> detection boundary, however: mean per-run FDP is 0.8-4.1% in the 10-CpG cells and
+> 6.9-15.4% in the weak-effect 4-CpG cells. Across all runs it averages 6.2%; the
+> lower 4.4% pooled false-call ratio is call-weighted and is not the FDR estimator.
+> Treat weak calls near `min_cpgs` with caution and see [docs/FDR.md](docs/FDR.md).
 
 | File | Contents |
 |---|---|
-| `regions.csv` | one row per region: coordinates, `n_cpg`, `region_area`, `region_qvalue` and six related FDR columns (new in v2.0.1, see below), `significant`, and `*_descriptive` characterisation fields |
+| `regions.csv` | lean one-row-per-region table: coordinates, area/FDR fields, nullable `coordination_significant`, one `biological_class`, `passes_prevalence`, legacy-compatible `significant`, and status |
+| `region_support_diagnostics.csv` | opt-in compact post-selection prevalence, largest-gap legacy tail, furthest-mean-sample influence screen and winsorised confirmation diagnostics, keyed by `region_id`; not created when the support policy is off |
 | `region_sample_means.csv` | per-region mean methylation for each sample |
 | `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, `schema_version`, `fdr_decision`, and the realised null diagnostics |
 
@@ -257,6 +260,9 @@ coverage checks, and simultaneity scope (per-stratum, not genome-wide).
                                       # region_qvalue_upper_95 instead (conservative)
 --support-binned-threshold auto|on|off  # condition the null-quantile threshold on
                                       # local measurement support; default auto
+--biological-support-policy off|five_class_v1
+                                      # default off; opt in to the provisional
+                                      # five-class descriptive support layer
                                       # enables it only when support varies enough
                                       # to matter
 --support-bins N                     # number of support quantile bins when
@@ -339,17 +345,19 @@ beta.
 
 ### A prevalence floor: `--min-prevalence-samples`
 
-A single aberrant sample deviating across a run of CpGs produces genuine
-coordination, so it forms a region and no null will reject it. It is simply not
-a differentially methylated *region* in the usual sense. On the 519-sample ICGC
-cohort, 95% of otherwise unclassifiable regions were driven by one or two
-samples.
+A single aberrant sample deviating coherently across a run of CpGs can produce
+genuine coordination and pass a locality-breaking null. It is not automatically a
+cohort-level differentially methylated region; it may be a private epivariant or an
+artefact requiring orthogonal checks.
 
 This is a biological criterion, not a statistical one, so it is applied after
 calibration and reported separately: `region_qvalue` stays calibrated on the
-unfiltered set, `minority_size_descriptive` records how many samples carry the
-deviation, and `significant` requires both. It is exactly analogous to requiring
-a fold-change floor alongside a p-value.
+unfiltered set, the authoritative two-means prevalence is written to
+`region_support_diagnostics.csv`, and legacy `significant` requires both.
+`coordination_significant` always records the FDR-only decision. The five-class
+descriptive layer and the distinction from the misleading historical largest-gap
+tail split are documented in
+[docs/BIOLOGICAL_SUPPORT.md](docs/BIOLOGICAL_SUPPORT.md).
 
 ### `--legacy --fdr-replicates` no longer runs (removed in v2.1.0)
 

@@ -300,16 +300,30 @@ def test_prevalence_floor_demotes_single_sample_regions():
         matrix[start : start + 30, rng.integers(0, 60)] += 0.45
     matrix = np.clip(matrix, 0.01, 0.99)
 
-    loose, _, _ = call_dmrs(
+    loose, _, loose_manifest = call_dmrs(
         matrix, locations,
         config=Eiger2Config(min_prevalence_samples=0, region_null_mode="lag"),
     )
-    strict, _, _ = call_dmrs(
+    strict, _, strict_manifest = call_dmrs(
         matrix, locations,
         config=Eiger2Config(min_prevalence_samples=3, region_null_mode="lag"),
     )
     # the regions themselves are unchanged; only their significance differs
     assert len(loose) == len(strict)
+    assert "region_support_diagnostics" not in loose.attrs
+    assert "region_support_diagnostics" not in strict.attrs
+    assert loose_manifest["biological_support"]["diagnostics_file"] is None
+    assert strict_manifest["biological_support"]["diagnostics_file"] is None
+    # The support layer and legacy prevalence filter are post-selection: the
+    # locked Stage 2D FDR and its coordination-only decision are bit-identical.
+    for column in (
+        "region_qvalue", "region_qvalue_lower_95", "region_qvalue_upper_95",
+        "region_qvalue_resolution",
+    ):
+        np.testing.assert_array_equal(loose[column], strict[column])
+    assert loose["coordination_significant"].reset_index(drop=True).equals(
+        strict["coordination_significant"].reset_index(drop=True)
+    )
     single = strict["minority_size_descriptive"] <= 1
     if single.any():
         assert not strict.loc[single, "significant"].any()

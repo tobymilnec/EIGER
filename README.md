@@ -112,19 +112,22 @@ Pass `--region-null-mode member_step` to raise an error instead of falling back,
 
 ---
 
-## Error rate: conservative, not calibrated
+## Error rate varies by regime
 
-Pooled across every measured planted-signal benchmark cell — **293 significant calls, 1 false positive** — the realised false discovery rate is:
+The earlier easy-signal grid produced 293 calls with one false positive (0.34%
+pooled false calls), but it did not probe the detection boundary.
 
-| | value |
-|---|---|
-| point estimate | 0.34% |
-| one-sided 95% Clopper–Pearson upper bound | **1.6%** |
-| P(observing ≤ 1 false positive if the true FDR were 5%) | 4.9 × 10⁻⁶ |
+Stage 2e extended the test to ~600,000-CpG genomes. Null-construction diagnostics
+passed in all 1,000 calibration runs. In the planted-signal grid, the mean per-run
+false discovery proportion was 0.8-4.1% in the four 10-CpG cells, but rose to 6.9%,
+15.4%, and 11.3% in the weak-effect 4-CpG cells. Across all 280 runs it averaged
+6.2%. The often-quoted 4.4% value is the call-weighted ratio (90 false / 2,051
+calls), not the FDR estimator, and it masks the short-region failure mode.
 
-At a nominal `target_fdr = 0.05`, EIGER2 v2.1.0 is therefore **conservative rather than calibrated**: the measured error rate sits well below the target, which means some detection power is being left unused. This is stated as measured rather than claimed as calibration — the benchmark's planted signal is comfortably detectable, so these cells cannot distinguish "controls FDR at exactly 5%" from "controls it at well under 5%".
-
-The earlier v2.0.1 finding of substantial FDR miscalibration under structured missingness, small sample size, and high noise **does not survive the corrected region-level null**. Re-measured at genome scale on real hg38 CpG layouts under 25% structured dropout: realised FDR 0.0000 and recall 1.000 on 6 of 6 instances. That miscalibration was downstream of a region-level null that formed essentially no regions, not an independent problem.
+These results are a substantial improvement over the earlier null, but they do not
+establish uniform 5% FDR control. Treat weak regions near the `min_cpgs` floor with
+caution, especially in small cohorts. Full results and methodology are in
+**[docs/FDR.md](docs/FDR.md)**.
 
 ### Per-region evidence score
 
@@ -209,7 +212,7 @@ pytest tests -q
 pytest old_code/tests -q
 ```
 
-At the time of writing (v2.1.0), the current package contains 234 tests and the superseded beta implementation contains 27 tests.
+At the time of writing (v2.2.0), the current package contains 326 tests and the superseded beta implementation contains 27 tests.
 
 ---
 
@@ -217,7 +220,11 @@ At the time of writing (v2.1.0), the current package contains 234 tests and the 
 
 > **Migration note (v2.1.0):** results from v2.0.0 and v2.0.1 are **void and must be regenerated.** The region-level null was replaced, which changes the edge threshold, the set of candidate regions, their areas, and every FDR column. Region *identifiers* are therefore not comparable across versions either. The edge statistic itself, the eligibility mask, and the latent-structure removal are unchanged.
 
-The principal region-level output is `regions.csv`, with one row per detected region.
+The principal region-level output is the deliberately lean `regions.csv`, with one
+row per detected region. When the support policy is enabled, compact post-selection
+prevalence, largest-gap tail and influence/robustness details live in
+`region_support_diagnostics.csv`, keyed by `region_id`; see
+**[docs/BIOLOGICAL_SUPPORT.md](docs/BIOLOGICAL_SUPPORT.md)**.
 
 **`region_qvalue` is the principal field used to assess region-level statistical support.**
 
@@ -242,6 +249,18 @@ A `region_qvalue` of exactly zero means the null produced no region at least as 
 (pandas `BooleanDtype`): `pd.NA` means inference was unavailable for that row, a
 different statement from `False` ("tested, not significant") -- see `fdr_status` and
 `docs/FDR.md` §14.
+
+`coordination_significant` is the prevalence-independent, nullable result of the
+configured point/upper FDR decision. `biological_class` is missing for non-calls and
+otherwise uses exactly five provisional descriptive labels: `cohort_supported`,
+`recurrent_subgroup`, `rare_epivariant`, `outlier_sensitive`, or
+`diffuse_coordination`. Neither field changes the Stage 2D q-values. Historical
+largest-gap `minor_group_*` API fields are not authoritative prevalence measures.
+The provisional classification is opt-in with
+`--biological-support-policy five_class_v1`; the default `off` leaves
+`biological_class` missing, constructs no diagnostics table, writes no diagnostics
+file and preserves discovery runtime. See the support document for the candidate-label
+and performance limitations.
 
 ### `--fdr-decision {point,upper}`
 

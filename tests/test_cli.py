@@ -122,7 +122,10 @@ def test_insufficient_opportunity_advice_names_mode_effective_volume_control(
     )
 
     out = tmp_path / region_null_mode
-    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
+    assert cli.main([
+        "call", "--matrix", "unused.tsv", "--out", str(out),
+        "--biological-support-policy", "five_class_v1",
+    ]) == 0
     captured = capsys.readouterr()
     assert expected_option in captured.err
     assert wrong_option not in captured.err
@@ -166,6 +169,92 @@ def test_legacy_call_accepts_none_fdr_diagnostics(monkeypatch, tmp_path):
     assert manifest["git_commit"] == "dirty-head"
     assert manifest["git_worktree_dirty"] is True
     assert manifest["git_worktree_fingerprint_sha256"] == "a" * 64
+
+
+def test_revised_cli_writes_lean_regions_and_separate_support_diagnostics(
+    monkeypatch, tmp_path
+):
+    matrix = np.full((5, 5), 0.5)
+    locations = pd.DataFrame(
+        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
+    )
+    regions = pd.DataFrame({
+        "region_id": ["r1"], "region_qvalue": [0.01],
+        "coordination_significant": pd.array([True], dtype="boolean"),
+        "biological_class": ["cohort_supported"],
+        "significant": pd.array([True], dtype="boolean"),
+        "passes_prevalence": [True],
+        "minority_size_descriptive": [2],
+        "minor_group_size_descriptive": [1],
+    })
+    regions.attrs["region_support_diagnostics"] = pd.DataFrame({
+        "region_id": ["r1"], "two_means_minority_size": [2],
+        "largest_gap_tail_size_legacy": [1],
+    })
+    caller_manifest = {
+        "status": "ok", "gates": {"structural": {}}, "fdr": {},
+        "layout": {}, "null": {}, "n_regions": 1,
+        "biological_support": {
+            "policy": {"name": "five_class_v1"},
+            "diagnostics_file": "region_support_diagnostics.csv",
+        },
+    }
+    monkeypatch.setattr(
+        cli, "_resolve_inputs",
+        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
+    )
+    monkeypatch.setattr(
+        cli, "call_dmrs",
+        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
+    )
+    out = tmp_path / "support"
+    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
+    main = pd.read_csv(out / "regions.csv")
+    diagnostics = pd.read_csv(out / "region_support_diagnostics.csv")
+    assert "biological_class" in main
+    assert "coordination_significant" in main
+    assert "passes_prevalence" in main
+    assert "minority_size_descriptive" not in main
+    assert diagnostics.loc[0, "two_means_minority_size"] == 2
+    assert "two_means_minority_samples" not in diagnostics
+    assert "largest_gap_tail_samples_legacy" not in diagnostics
+    manifest = json.loads((out / "run_manifest.json").read_text())
+    assert manifest["caller_manifest"]["biological_support"]["policy"]["name"] \
+        == "five_class_v1"
+
+
+def test_revised_cli_default_off_writes_no_support_diagnostics(
+    monkeypatch, tmp_path
+):
+    matrix = np.full((5, 5), 0.5)
+    locations = pd.DataFrame(
+        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
+    )
+    regions = pd.DataFrame({
+        "region_id": ["r1"], "region_qvalue": [0.5],
+        "coordination_significant": pd.array([False], dtype="boolean"),
+        "biological_class": [None],
+        "significant": pd.array([False], dtype="boolean"),
+    })
+    caller_manifest = {
+        "status": "ok", "gates": {"structural": {}}, "fdr": {},
+        "layout": {}, "null": {}, "n_regions": 1,
+        "biological_support": {
+            "policy": {"name": "off"}, "diagnostics_file": None,
+        },
+    }
+    monkeypatch.setattr(
+        cli, "_resolve_inputs",
+        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
+    )
+    monkeypatch.setattr(
+        cli, "call_dmrs",
+        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
+    )
+    out = tmp_path / "support_off"
+    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
+    assert (out / "regions.csv").exists()
+    assert not (out / "region_support_diagnostics.csv").exists()
 
 
 def test_cli_input_parsing_matches_python_api_dtype_bit_for_bit(tmp_path):

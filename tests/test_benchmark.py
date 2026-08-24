@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -213,6 +214,53 @@ def test_simulate_real_layout_recall_still_works_end_to_end():
     regions, _, _ = call_dmrs(matrix, locations, config=config)
     recovered, _false = evaluate(regions, truth, min_overlap=2)
     assert isinstance(recovered, set)
+
+
+def test_stage2d_biological_support_smoke_covers_all_named_scenarios():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarking"))
+    from benchmark_suite import biological_support_smoke
+
+    frame = biological_support_smoke([0])
+    assert set(frame["scenario"]) == {
+        "one_sample_artifact", "two_sample_artifact",
+        "genuine_rare_epivariant", "recurrent_subgroup", "cohort_subgroup",
+        "continuous_gradient", "local_background_autocorrelation",
+    }
+    assert set(frame["statistic"]) == {"correlation", "covariance"}
+    assert frame["classification_correct"].all()
+
+
+def test_false_discovery_proportion_is_zero_when_nothing_is_called():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarking"))
+    from benchmark_suite import _false_discovery_proportion
+
+    assert _false_discovery_proportion(0, 0) == 0.0
+    assert _false_discovery_proportion(2, 5) == 0.4
+
+
+def test_benchmark_manifest_records_dirty_worktree_provenance(
+    monkeypatch, tmp_path
+):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarking"))
+    import benchmark_suite
+
+    monkeypatch.setattr(benchmark_suite, "command_support", lambda _args: None)
+    monkeypatch.setattr(
+        benchmark_suite,
+        "_git_provenance",
+        lambda: {
+            "git_commit": "deadbeef",
+            "git_worktree_dirty": True,
+            "git_worktree_fingerprint_sha256": "a" * 64,
+        },
+    )
+    assert benchmark_suite.main([
+        "support", "--out-dir", str(tmp_path), "--seeds", "0",
+    ]) == 0
+    manifest = json.loads((tmp_path / "support_manifest.json").read_text())
+    assert manifest["git_commit"] == "deadbeef"
+    assert manifest["git_worktree_dirty"] is True
+    assert manifest["git_worktree_fingerprint_sha256"] == "a" * 64
 
 
 # --------------------------------------------------------------------------

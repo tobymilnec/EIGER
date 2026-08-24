@@ -70,6 +70,7 @@ from benchmark_suite import (  # noqa: E402
     GAP_SWEEP_VALUES,
     SCENARIOS,
     _classify,
+    _false_discovery_proportion,
     _v2_called,
     gap_sweep,
 )
@@ -423,7 +424,7 @@ def _signal_grid_cell(
         dmr_length=dmr_length, n_cpg=len(locations), runtime_seconds=elapsed,
         n_truth=len(truth), n_candidates=int(manifest.get("n_regions", 0)),
         n_significant=n_called, true_positive=tp, false_positive=fp,
-        realised_fdr=(fp / n_called if n_called else float("nan")),
+        realised_fdr=_false_discovery_proportion(fp, n_called),
         recall=(len(recovered) / len(truth) if truth else float("nan")),
     )
 
@@ -480,7 +481,7 @@ def _power_curve_cell(layout: str, delta: float, seed: int) -> dict:
         layout=layout, prevalence=POWER_CURVE_PREVALENCE, delta=delta,
         seed=seed, n_truth=len(truth),
         recall=(len(recovered) / len(truth) if truth else float("nan")),
-        realised_fdr=(fp / n_called if n_called else float("nan")),
+        realised_fdr=_false_discovery_proportion(fp, n_called),
     )
 
 

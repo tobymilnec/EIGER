@@ -9,17 +9,20 @@ Everything about *which* samples differ and *by how much* is post-selection
 characterisation and is kept strictly downstream of discovery.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 from .core import (
     Eiger2Config,
     RegionFdrResult,
+    biological_support_diagnostics,
     call_dmrs,
     centre_cpgs,
     characterise_region,
+    classify_biological_support,
     deflate,
     edge_statistic,
     estimate_latent_basis,
+    main_region_table,
     null_threshold,
     region_fdr,
     region_fdr_result,
@@ -39,12 +42,15 @@ __all__ = [
     "LocalFdrResult",
     "RegionFdrResult",
     "calibration_error",
+    "biological_support_diagnostics",
     "call_dmrs",
     "centre_cpgs",
     "characterise_region",
     "deflate",
     "edge_statistic",
     "estimate_latent_basis",
+    "classify_biological_support",
+    "main_region_table",
     "estimate_pi0",
     "local_fdr",
     "null_threshold",
