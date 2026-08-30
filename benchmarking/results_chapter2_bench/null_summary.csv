@@ -1,9 +1,0 @@
-method,null_calls_mean,null_calls_std,false_calls_per_mb_mean,false_calls_per_mb_std
-EIGER 1 @ 0.01 (complete-case),0.0,0.0,0.0,0.0
-EIGER 1 @ 0.01 (mean-imputed),17.3,9.322,216.25,116.525
-EIGER 1 @ 0.012 (complete-case),0.0,0.0,0.0,0.0
-EIGER 1 @ 0.012 (mean-imputed),8.8,5.789,110.0,72.361
-EIGER 1 @ 0.015 (complete-case),0.0,0.0,0.0,0.0
-EIGER 1 @ 0.015 (mean-imputed),3.2,3.12,40.0,38.998
-EIGER 2 correlation,6.3,6.8,78.75,84.994
-EIGER 2 covariance,8.5,7.2,106.25,89.994
