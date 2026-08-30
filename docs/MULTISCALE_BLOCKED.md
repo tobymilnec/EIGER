@@ -92,7 +92,9 @@ fraction, not the run-count fraction. Reporting the run-count number as if it an
 "how often can EIGER use `w = 8`" was reasoning from a per-run summary about a per-edge
 question — the same class of error as the depth-fit issue caught two stages earlier in
 this project (fitting depth from a per-run level distribution when depth is a per-CpG
-quantity; see `benchmarking/layouts/README.md`, "Depth is generated in two steps").
+quantity; see the layout fixture's README in `eiger_paper`,
+[`benchmarking/layouts/README.md`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/layouts/README.md), "Depth is
+generated in two steps").
 Whenever a distribution is this heavy-tailed (chr1's eligible-run lengths: median 3
 edges, max 35,404 — master spec §2.4), the unweighted view and the size-weighted view
 diverge sharply, and the operative one is whichever matches the unit the method

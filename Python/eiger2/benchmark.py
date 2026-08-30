@@ -48,8 +48,8 @@ MARGINALS = ("unimodal",)
 #: Mode names that named a fixture maintained in ``eiger_paper`` when the
 #: benchmark harness and the software lived in one repository. They are rejected
 #: by name -- rather than falling through to a generic "unknown mode" message or
-#: to a search for a ``benchmarking/`` directory that an installed package does
-#: not have -- so the failure states where the fixture went and how to supply it.
+#: to a search for a paper fixture directory that an installed package does not
+#: have -- so the failure states where the fixture went and how to supply it.
 PAPER_ONLY_LAYOUTS = ("wgbs_real", "epic_fitted")
 PAPER_ONLY_MARGINALS = ("bimodal_fitted", "bimodal_atlas")
 

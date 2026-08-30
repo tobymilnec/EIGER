@@ -30,8 +30,9 @@ Confirmed before this fixture was generated: neither ``edge_statistic`` nor
 of Python/eiger2/core.py, and a direct text diff of both functions' bodies
 between commit 306fa8f (the pre-Stage-1 commit the old v2.0.0 fixture was
 generated from) and the current worktree is empty. The current worktree
-state is therefore the correct v2.0.1-equivalent baseline to pin -- see
-task-6-report.md for the full investigation.
+state is therefore the correct v2.0.1-equivalent baseline to pin. The full
+investigation is in that task's report, an unpublished development record kept
+outside this repository.
 
 Run ONLY when ``edge_statistic``/``eligible_edges`` are believed to still be
 unchanged since this fixture was generated (i.e. essentially never again

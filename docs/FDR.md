@@ -42,9 +42,10 @@ Sections describing earlier Poisson/Garwood-only releases are historical where n
 >   observed `negative_control` any-call rate is now 3.0-7.5% across the two
 >   statistics, including `missingness` and `small_n`, down from 55-99%.
 > - **Real-signal (measurement path 3 below), confirmed at true genome scale on
->   `benchmarking/paper_grid.py`'s `calibration`/`signal_grid`/`power_curve`
->   cells (~600,000-CpG genomes, 100/20/10 seeds respectively, `--jobs 16`,
->   completed 2026-08-23 in 1h45m):** null-construction health is essentially
+>   [`benchmarking/paper_grid.py`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/paper_grid.py)'s
+>   `calibration`/`signal_grid`/`power_curve` cells (~600,000-CpG genomes,
+>   100/20/10 seeds respectively, `--jobs 16`, completed 2026-08-23 in
+>   1h45m):** null-construction health is essentially
 >   perfect (ACF gate and null-count-adequacy both pass 1000/1000 cells across
 >   both real layouts and all five scenarios, median region-exchangeability
 >   ratio 0.97-1.11 — see "Real-signal re-measurement at genome scale" below).
@@ -81,8 +82,9 @@ substantially exceeded the nominal 5% target, in genuinely null (DMR-free) data,
 > moved 0.10 -> 0.12 (FIX_SPEC §WP7b). Every number in this document is measured on
 > the synthetic marginal, whose loading-concentration band maxes at 0.0850 -- below
 > both cutoffs, so every component these runs deflated at 0.10 is deflated at 0.12
-> and none is added. This is checked rather than assumed: `tests/test_wp7b_cutoff.py`
-> asserts, over every committed artefact that records a loading concentration, that
+> and none is added. This is checked rather than assumed: `eiger_paper`'s
+> `tests/test_wp7b_cutoff.py` asserts, over every artefact committed there that
+> records a loading concentration, that
 > only one arm (Table S2's M values, re-measured separately) has a candidate in
 > `(0.10, 0.12]`.
 > The `nuisance` scenario's name refers to a planted latent factor, not to this
@@ -94,18 +96,21 @@ this release's code (branch `fix/region-fdr`, commit `46327e7`):
 1. A direct `call_dmrs` run over 5 DMR-free seeds x 5 scenarios (231 candidate regions
    total), using the pipeline's own `significant` column exactly as `eiger2 call`
    computes it.
-2. The official `benchmarking/benchmark_suite.py` `negative_control` experiment
-   (3 seeds, DMR-free by construction) — an independently generated dataset that
-   reproduces the same pattern: clean/nuisance near nominal, high_noise 70%, small_n
+2. The `negative_control` experiment (3 seeds, DMR-free by construction) of the
+   paper-side benchmark harness
+   [`benchmarking/benchmark_suite.py`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/benchmark_suite.py), which
+   is maintained in `eiger_paper` and is not part of this package — an
+   independently generated dataset that reproduces the same pattern: clean/nuisance near nominal, high_noise 70%, small_n
    55%, missingness 99%.
-3. The official `benchmarking/benchmark_suite.py` `heuristic_sweep` experiment, which
+3. That same harness's `heuristic_sweep` experiment, which
    plants **real** ground-truth DMRs and matches calls against them by region overlap
    rather than by construction being null — critically, this shows `missingness` still
    realises **33.5%** FDR at the pipeline's own default hyperparameters, even with real
    signal present, so the miscalibration is not an artefact of a fully-null test case.
 
-Full data, commands, and per-run numbers are in
-`.superpowers/sdd/2026-08-18-stage1-region-fdr/task-11-report.md`.
+Full data, commands, and per-run numbers were recorded in the Stage 1 region-FDR
+task report, an unpublished development record retained outside this repository;
+the figures it carries are reproduced above.
 
 ### What this finding does and does not implicate
 
@@ -163,8 +168,9 @@ gap (Stage 2e)" below for what has since changed.)*
   `null_mode`s x windows {1,4,6,8} x `null_replicates` {20,100}), is the recommended
   next step before relying on this release's FDR control in these regimes.
 - This release's benchmarks ran at reduced scale — 3-5 seeds, a single discovery
-  statistic, no sweep over `null_mode`, `window`, or `null_replicates` (see
-  `results_v201/`) — so it is not only the miscalibration (criterion 3) that is
+  statistic, no sweep over `null_mode`, `window`, or `null_replicates` (the
+  v2.0.1 benchmark outputs) — so it is not only the miscalibration (criterion 3)
+  that is
   confirmed only at this reduced scale: the monotonicity and zero-q uncertainty
   invariant
   checks reported above as "0 violations" (gate criteria 1 and 2) are likewise
@@ -173,7 +179,7 @@ gap (Stage 2e)" below for what has since changed.)*
 
 ### DMR-free re-measurement (Stage 2e)
 
-`benchmarking/benchmark_suite.py negative --seeds 100` (all 5 scenarios, both
+The paper harness's `negative` command at 100 seeds (all 5 scenarios, both
 `correlation`/`covariance` statistics, `target_fdr = 0.05`, point decision) on the
 current pipeline. The reported quantity is `any_call` -- whether a DMR-free
 100,000-bp-scale simulated genome produced **any** significant call at all -- the
@@ -194,9 +200,11 @@ instead of 3 and on the current, Stage 2b/2c/2d/2e pipeline instead of pre-Stage
 Each value pools correlation and covariance results from the same 100 simulated
 seeds. Those paired method-runs are not independent, so a 200-trial binomial
 interval would be inappropriate. The observed reduction is large, but point
-estimates above 5% do not prove exact nominal control. Full data:
-`benchmarking/results_stage2d_confirm/negative_control.csv` and
-`negative_control_summary.csv`.
+estimates above 5% do not prove exact nominal control. Full data, committed in
+`eiger_paper`:
+[`benchmarking/results_stage2d_confirm/negative_control.csv`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/results_stage2d_confirm/negative_control.csv)
+and
+[`negative_control_summary.csv`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/results_stage2d_confirm/negative_control_summary.csv).
 
 This measurement does not by itself confirm real-signal calibration (below) --
 `any_call` on DMR-free data cannot distinguish "controls FDR well" from "never
@@ -211,14 +219,14 @@ original `missingness` 33.5%-FDR-with-real-signal finding required fixing the
 output revealed that this specific benchmark cannot answer the question being
 asked of it, for a reason that has nothing to do with the min_cpgs fix itself.
 
-**What was found.** `benchmarking/benchmark_suite.py`'s `negative_control` and
-`heuristic_sweep` simulate genomes of roughly 10,000-20,000 CpGs
+**What was found.** The paper harness's `negative_control` and
+`heuristic_sweep` experiments simulate genomes of roughly 10,000-20,000 CpGs
 (`n_cpg_target = 20000`, `spacing = 400`), and neither overrides
 `Eiger2Config.null_min_lag` away from its default of 1000 -- a constant
 documented as needing to "comfortably exceed the methylation correlation
 length" at **real chromosome scale** (hundreds of thousands to millions of
 CpGs; every unit test that uses a small matrix explicitly lowers
-`null_min_lag`, and `benchmarking/paper_grid.py` -- the properly-scaled
+`null_min_lag`, and `paper_grid.py` -- the properly-scaled
 publication grid, see below -- pairs `null_min_lag = 1000` with
 600,000-CpG simulated genomes, not 10,000). At `heuristic_sweep`'s scale with
 this genome-scale `null_min_lag`, `member_step`'s own diagnostics
@@ -249,9 +257,9 @@ retroactively.
 finding in either direction**, and it is orthogonal to the `min_cpgs` crash fix
 in §17 -- fixing the crash was necessary to discover this, but does not fix it.
 
-**The fix.** `benchmarking/paper_grid.py` already exists as the correctly-scaled
-tool: its `calibration`, `signal_grid`, and `power_curve` cells simulate
-~600,000-CpG genomes (`GENOME_SPACING = 50_000`, `CALIB_SPACING = 600_000`),
+**The fix.** `paper_grid.py`, in the same paper repository, already exists as
+the correctly-scaled tool: its `calibration`, `signal_grid`, and `power_curve`
+cells simulate ~600,000-CpG genomes (`GENOME_SPACING = 50_000`, `CALIB_SPACING = 600_000`),
 matching the scale §11.3/§11.5 measured `member_step`'s own region-level gates
 at. Its own module docstring calls it "genuinely hours of compute... explicitly
 out-of-band" -- in practice, `--jobs 16` on this machine's 16 cores completed
@@ -259,7 +267,7 @@ out-of-band" -- in practice, `--jobs 16` on this machine's 16 cores completed
 in 1h45m serially chained, well under the docstring's own serial-time estimate.
 Results below.
 
-`benchmarking/benchmark_suite.py`'s `negative`/`sweep`/`support` commands remain
+`benchmark_suite.py`'s `negative`/`sweep`/`support` commands remain
 useful as a fast regression *screen* (§2D's own screen/confirm split in
 `docs/BENCHMARK.md`) for anything not scale-sensitive -- the crash fix in §17,
 the biological-support classifier, and DMR-free short-stratum calibration all
@@ -281,7 +289,9 @@ scenario including `missingness`/`small_n`/`high_noise`. Median
 and the observed track forming regions at the same rate, everywhere. This is
 the structural counterpart to Stage 2b's own diagnosis (7-of-100 surviving
 tracks on the pre-fix ICGC audit) confirmed resolved at matching real-world
-scale. Full data: `benchmarking/results_v210/calibration_member_step_full.csv`.
+scale. Full data: the combined `calibration` CSV from that `paper_grid.py` run,
+which is retained with the v2.1.0 paper outputs and is not among the result files
+committed in `eiger_paper` at the commit this document links to.
 
 **Realised FDR and recall at the detection boundary.** `signal_grid` (20 seeds
 x 7 cells spanning low prevalence, small effect size, short DMR length, and
@@ -299,7 +309,9 @@ small cohorts down toward the detection boundary -- not the comfortably-easy
 | `small_delta_n12_len4` | 6 | 5 | 11.3% | 83.3% | 0.1% |
 | **all 280 runs** | **2051** | **90** | **6.2%** | **4.4%** | **60.3%** |
 
-Full data: `benchmarking/results_v210/signal_grid_extended.csv`.
+Full data: the extended `signal_grid` CSV from that `paper_grid.py` run, retained
+with the v2.1.0 paper outputs and not among the result files committed in
+`eiger_paper` at the commit this document links to.
 
 FDR is estimated by averaging the per-run quantity `V / max(R, 1)`, which is
 zero when a run makes no calls. The 4.4% ratio instead pools all calls and gives
@@ -320,8 +332,10 @@ note per run carrying the measured range above. It is a note, not a gate --
 prevalence): recall 99.4-100% and realised FDR 0-0.6% across the entire swept
 range once effect size clears roughly 0.075 -- matching the existing
 README/BENCHMARK claim that `DEFAULT_STRATA`-scale signal is comfortably
-detectable, now extended down toward (not fully to) the boundary. Full data:
-`benchmarking/results_v210/power_curve.csv`.
+detectable, now extended down toward (not fully to) the boundary. Full data: the
+`power_curve` CSV from that `paper_grid.py` run, retained with the v2.1.0 paper
+outputs and not among the result files committed in `eiger_paper` at the commit
+this document links to.
 
 ---
 
@@ -641,8 +655,10 @@ columns whose confidence level the fixed schema doesn't record.
 ### 11.1 Why the observed track has autocorrelation, and why that is geometry, not biology
 
 The observed track's lag-1 autocorrelation is close to +0.5 on every real layout
-measured (`STAGE1D_B_STOP_REPORT.md` §4.2: dense/wgbs_real/epic_fitted all ≈ −0.50 in
-the *diff from a flat null*, i.e. the observed value itself is ≈ +0.50). This is not a
+measured (Stage 1d-B stop report §4.2: dense/wgbs_real/epic_fitted all ≈ −0.50
+in the *diff from a flat null*, i.e. the observed value itself is ≈ +0.50; the
+stage reports cited in this section are unpublished development records retained
+outside this repository, and every figure they carry is reproduced here). This is not a
 biological claim about regional coordination — it follows mechanically from how
 `edge_statistic()` builds a window: the statistic at edge `e` is the mean over pairs
 among CpGs `{e - offset0, ..., e - offset0 + window - 1}`, and the statistic at edge
@@ -664,7 +680,7 @@ for Stage 1b's purpose (an edge-level marginal that does not inherit the far-apa
 pairing's own irrelevant structure) and exactly wrong for a REGION-level null, which
 needs the SAME member-overlap property the observed track has in order to be compared
 against fairly. Measured: Gate 1 fails on 0/75 instances at every layout
-(`STAGE1D_B_STOP_REPORT.md` §4.2); Gate 2 correspondingly finds an inadequate,
+(Stage 1d-B stop report §4.2); Gate 2 correspondingly finds an inadequate,
 near-empty null pool on 75/75 (§4.3) — a null with no autocorrelation forms almost no
 runs, so there is almost nothing to compare the observed region-formation rate against.
 
@@ -682,8 +698,8 @@ single offset alone gives a short sub-track); the null pool is one array per DRA
 LAG, sub-tracks concatenated with the eligible mask broken at each boundary so
 `segment()` cannot merge two unrelated offsets (`member_step_lag_null_ensemble`).
 
-Measured on the real fixture at genome scale (600,000 CpGs, `STAGE1D_C_STOP_REPORT.md`
-§5, `STAGE1D_D_STOP_REPORT.md` §1): Gate 1 passes 45/45; Gate 2 median ratio
+Measured on the real fixture at genome scale (600,000 CpGs, Stage 1d-C stop report
+§5, Stage 1d-D stop report §1): Gate 1 passes 45/45; Gate 2 median ratio
 1.10–1.12 with an adequate pooled null count on 15/15 instances on both real layouts.
 
 ### 11.4 The two gates
@@ -691,8 +707,8 @@ Measured on the real fixture at genome scale (600,000 CpGs, `STAGE1D_C_STOP_REPO
 **Gate 1 (ACF match).** Null autocorrelation must be within ±0.05 of the observed
 track's at lags `1..window`, on DMR-free data (`acf_gate`, `track_autocorrelation`).
 This is the gate Stage 1b lacked — it validated the null's marginal and variance but
-never re-validated the dependence structure its own fix had just changed
-(`EIGER_NULL_CALIBRATION_DIAGNOSIS.md`, corrected banner; master spec §2.2, §10).
+never re-validated the dependence structure its own fix had just changed (the
+Stage 1b null-calibration diagnosis, corrected banner; master spec §2.2, §10).
 
 **Gate 2 (region-level exchangeability).** `observed_rate` / `null_rate`, both regions
 per 10,000 eligible edges; the ratio's median across seeds must be ≤ 3.0, **and** the
@@ -701,7 +717,7 @@ to an aggregate check in §12) so the ratio is estimated from something
 (`region_exchangeability_gate`). `inf` is
 reported explicitly — never coerced to `NaN` or hidden — when the null rate is zero and
 the observed rate is not; that was the state on every layout before this stage
-(`STAGE1D_B_STOP_REPORT.md` §4.3) and had to stay visible while it was.
+(Stage 1d-B stop report §4.3) and had to stay visible while it was.
 
 Both run alongside the pre-existing edge-level gate (`null_exchangeability`, Stage 1b,
 median ≤ 1.25, unchanged) and are recorded, together with `region_null_mode`,
@@ -1149,7 +1165,7 @@ opportunity for that stratum was zero (the opportunity formula's floor was too
 high to see them) -- tripping `_replicate_cluster_dispersion`'s own internal
 invariant, `ValueError("a zero-exposure null replicate cannot contain regions")`.
 
-This was not a rare corner case: running `benchmarking/benchmark_suite.py`'s
+This was not a rare corner case: running the paper harness's
 `sweep` command -- the heuristic-insensitivity experiment `docs/BENCHMARK.md`
 describes, which exists specifically to sweep `min_cpgs` across
 `(2, 3, 4, 6, 10, 20)` and confirm realised FDR stays near target throughout --
@@ -1180,7 +1196,8 @@ configuration end-to-end through `call_dmrs` at `min_cpgs` in `{2, 3}`. The full
 `sweep` grid across all five scenarios and the complete `(window, max_gap_edges,
 min_cpgs)` grid was re-run after the fix with zero exceptions, confirmed as part
 of this release's confirmatory benchmarking (§13-equivalent results in
-`benchmarking/results_stage2d_confirm/heuristic_sweep_summary.csv`).
+[`benchmarking/results_stage2d_confirm/heuristic_sweep_summary.csv`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/results_stage2d_confirm/heuristic_sweep_summary.csv),
+committed in `eiger_paper`).
 
 ---
 

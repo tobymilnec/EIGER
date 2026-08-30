@@ -180,7 +180,7 @@ def test_simulate_truth_records_the_realised_effective_delta():
 #
 # Real coordinate layouts and marginals fitted to real cohorts are maintained in
 # eiger_paper, not shipped in the wheel. The installed package must reject their
-# mode names with one actionable message instead of searching for a benchmarking/
+# mode names with one actionable message instead of searching for a paper fixture
 # directory that an installed package does not have, and must offer the injection
 # points paper code uses instead.
 

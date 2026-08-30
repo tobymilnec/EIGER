@@ -2,17 +2,17 @@
 
 ``describe_layout`` and ``eligible_run_lengths`` are required in every ``eiger2 call``
 manifest (master spec §6.1) for whatever coordinates a caller supplies -- real data, not
-just the benchmark fixtures -- so they live here rather than in ``benchmarking/``, which
-is not installed (see ``pyproject.toml``: only ``eiger2*``/``functions*`` ship).
+just the benchmark fixtures -- so they live here rather than in the paper benchmark
+harness, which is not installed (see ``pyproject.toml``: only ``eiger2*``/``functions*``
+ship).
 
-The benchmark-only loaders that need the large committed fixture files
-(``load_wgbs_layout``, ``generate_epic_layout``) stay in
-``benchmarking/layouts/layouts.py``, which re-exports the two functions below so
-there is exactly one implementation -- its own module docstring calls
-``describe_layout`` "the same function the benchmark and the caller should both
-use". Eligibility here is computed via :func:`eiger2.core.eligible_edges` (not
-re-derived) so a layout diagnostic can never disagree with what the caller
-itself will use to build regions.
+The benchmark-only loaders that need the large fixture files (``load_wgbs_layout``,
+``generate_epic_layout``) live in the ``eiger_paper`` repository's ``layouts.py``,
+which re-exports the two functions below so there is exactly one implementation --
+its own module docstring calls ``describe_layout`` "the same function the benchmark
+and the caller should both use". Eligibility here is computed via
+:func:`eiger2.core.eligible_edges` (not re-derived) so a layout diagnostic can
+never disagree with what the caller itself will use to build regions.
 """
 
 from __future__ import annotations

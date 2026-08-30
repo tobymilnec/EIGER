@@ -274,4 +274,5 @@ above, but it shared the same measured failure the region-level null had: zero u
 null regions across 400 replicates. `permutation_null_tracks` now raises immediately
 rather than returning that null, so both functions raise too, naming
 `region_null_mode="member_step"` as the region-level replacement. See `docs/FDR.md`
-§11-§12 and `STAGE1D_D_STOP_REPORT.md` §6.1/§6.3.
+§11-§12 and the Stage 1d-D stop report §6.1/§6.3, an unpublished development record
+retained outside this repository.

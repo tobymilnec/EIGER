@@ -93,7 +93,8 @@ from eiger2.core import (  # noqa: E402
 # 1), ~10^5 CpGs at defaults -- far more than these deliberately small test
 # matrices. These tests exercise calling/statistic/segmentation logic, not the
 # region null construction itself (which has its own dedicated tests, and its
-# own real-fixture-scale acceptance measurement in STAGE1D_D_STOP_REPORT.md).
+# own real-fixture-scale acceptance measurement in the Stage 1d-D acceptance
+# run, an unpublished development record kept outside this repository).
 FAST = {
     "null_replicates": 6, "min_null_regions_for_fdr": 0, "region_null_mode": "lag",
     # Spec §2c: the per-length-stratum null-opportunity floor default
@@ -3483,8 +3484,9 @@ def test_block_permutation_acf_matches_the_closed_form_law():
     # Confirms, empirically, the law the spec derives: under block permutation
     # with block length b, a lag-1 pair survives (stays inside one block) with
     # probability (b-1)/b, so null_ACF(lag 1) ~= rho * (b-1)/b. An AR(1) process
-    # with rho matching the measured observed lag-1 ACF (STAGE1D_B_STOP_REPORT
-    # section 4.2: ~0.50 on every layout) stands in for the observed track --
+    # with rho matching the measured observed lag-1 ACF (Stage 1d-B stop report
+    # section 4.2: ~0.50 on every layout; see docs/FDR.md §11.1, which reproduces
+    # the figure) stands in for the observed track --
     # the law is about the permutation mechanism, not about any one dataset.
     rng = np.random.default_rng(7)
     n = 200_000
@@ -4052,8 +4054,8 @@ def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
         null_exchangeability,
         null_tracks,
     )
-    # Sourced from benchmarking.benchmark_suite.SCENARIOS rather than a hand-copied
-    # dict, so the two definitions cannot silently drift apart. Only "missingness"
+    # Uses this module's own SCENARIOS table, which mirrors the five standard
+    # benchmark scenarios the paper harness also defines. Only "missingness"
     # is overridden: missing_rate=0.5, not SCENARIOS' default 0.25. Ruled by the
     # user after Task 1's reproduction found 0.25 leaves the pre-fix defect
     # marginal and seed-dependent (measured ratios 1.631 and 1.262 -- both over
@@ -4079,13 +4081,12 @@ def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
             # ~0.5% tail rate), not a systematic bias -- spacing=5000 is
             # simply too small a panel for a tight 1.25 per-instance gate to
             # be reliable. spacing=20000 matches the codebase's own canonical
-            # spec-1b.3 implementation (benchmarking/benchmark_suite.py's
-            # exchangeability(), added in this same stage) and Task 5's
-            # verified reproduction (spacing=19600), and passes all 50
-            # combos with comfortable margin (max ratio 1.169 across a full
-            # sweep). See
-            # docs/superpowers/plans/2026-08-18-stage1b-lag-null-window-fix.md
-            # for the full investigation.
+            # spec-1b.3 implementation (the paper harness's exchangeability()
+            # command, added in this same stage) and Task 5's verified
+            # reproduction (spacing=19600), and passes all 50 combos with
+            # comfortable margin (max ratio 1.169 across a full sweep). The
+            # full investigation is in the Stage 1b lag-null/window-fix plan,
+            # an unpublished development record kept outside this repository.
             matrix, locs, _ = simulate(seed=seed, strata=[], replicates=0,
                                         spacing=20000, **params)
             config = Eiger2Config(window=4, random_seed=seed, null_replicates=100)
@@ -4548,7 +4549,8 @@ def test_member_step_lag_null_narrows_the_acf_gap_relative_to_shipped():
     # the null's ACF measurably toward the observed track's, even before
     # reaching genome scale. The stronger claim -- C.3 actually PASSES Gate 1
     # -- is confirmed on real data at real scale in the Stage 1d-C acceptance
-    # run (STAGE1D_C_STOP_REPORT.md), not here: at this toy scale (n=60,000,
+    # run (an unpublished development record; docs/FDR.md §11.3 reproduces its
+    # numbers), not here: at this toy scale (n=60,000,
     # single sample-like column) sub-tracks are short enough that edge effects
     # keep C.3 short of the +-0.05 threshold even though the mechanism is
     # visibly working -- exactly the failure mode spec section 3 warns tests at
@@ -4665,8 +4667,9 @@ def test_statistic_threshold_stays_scalar_when_single_mode():
 
 
 def test_auto_enable_fires_only_on_missingness_at_calibrated_cut():
-    # Calibration basis (Task 8, full table in task-8-report.md): the 5
-    # standard scenarios (benchmarking.benchmark_suite.SCENARIOS) at
+    # Calibration basis (Task 8; the full table is in that task's report, an
+    # unpublished development record kept outside this repository): the 5
+    # standard scenarios (this module's SCENARIOS table) at
     # strata=DEFAULT_STRATA, replicates=6, spacing=400 (matching the
     # benchmark harness's own standard invocation, e.g. heuristic_sweep()/
     # calibration()), 10 seeds each. Measured manifest["support_dispersion"]
@@ -5034,7 +5037,7 @@ def test_single_bin_collapse_reproduces_the_unconditioned_path_end_to_end():
 def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
     # spec §1c.7 item 8. Gate methodology is this stage's ruling: per-scenario
     # MEDIAN across seeds <= 1.25, per-instance outliers reported but not gated
-    # (see the same policy applied in benchmarking/benchmark_suite.py's
+    # (see the same policy applied in the paper harness's
     # command_exchangeability).
     #
     # missing_rate=0.5, matching the override
@@ -5050,8 +5053,8 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
     # fact engage on this data (asserted below). Measured out of suite at
     # missing_rate=0.25 as well (seeds 0-4, binning forced on): ratios 1.031,
     # 0.993, 0.887, 1.206, 0.883, median 0.993 -- also passing; that
-    # configuration is ~13x slower per seed, so it is recorded in
-    # task-11-report.md rather than run here.
+    # configuration is ~13x slower per seed, so it was recorded in that task's
+    # report (an unpublished development record) rather than run here.
     params = {**SCENARIOS["missingness"], "missing_rate": 0.5}
     ratios = []
     for seed in range(5):
@@ -5072,7 +5075,8 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
 def test_support_stratified_fdr_reports_zero_exceedance_when_opportunity_is_real():
     # Spec §2c supersedes this test's earlier form (a Stage 1e "refuses under
     # missingness" pin, itself replacing a Stage 1c-bis KNOWN-BAD STATE PIN --
-    # see task-11-report.md). Same input as always: the standard `missingness`
+    # recorded in that task's report, an unpublished development record). Same
+    # input as always: the standard `missingness`
     # scenario with the standard planted signal, shipped defaults
     # (support_binned_threshold="auto", fdr_decision="point"). The pooled null
     # REGION count is still exactly zero here (`null_regions_per_replicate`),

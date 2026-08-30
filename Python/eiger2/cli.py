@@ -944,9 +944,10 @@ def command_call(args: argparse.Namespace) -> int:
     # regions are carried by one or two samples. The measured alternative --
     # shipping min_prevalence_samples=3 -- cost up to 80 recall points in the
     # two-carrier-floor signal_grid cells, so the count is reported and the
-    # filter left to the user (see LOW_PREVALENCE_NOTE in core.py and
-    # benchmarking/results_v220/prevalence_default/README.md). Informational
-    # only: no column and no run status depends on it.
+    # filter left to the user (see LOW_PREVALENCE_NOTE in core.py, and
+    # Eiger2Config.min_prevalence_samples' docstring for the measurement that
+    # decided it). Informational only: no column and no run status depends on
+    # it.
     n_low_prevalence = caller_manifest.get("n_significant_low_prevalence") or 0
     if n_low_prevalence:
         print(

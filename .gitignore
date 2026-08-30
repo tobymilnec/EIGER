@@ -29,21 +29,16 @@ env/
 .DS_Store
 
 # generated outputs
-# Scoped deliberately. An unanchored "results*/" or "legacy*/" also matches
-# benchmarking/results_* (the committed benchmark outputs the docs cite) and
-# old_code/beta_2026/legacy/ (source code), so both are anchored to the repo
-# root where the README's example commands actually write.
+# Scoped deliberately. Each rule is anchored to the repository root, where the
+# README's example commands actually write, so an unanchored "results*/" or
+# "legacy*/" cannot swallow a similarly named directory somewhere else in the
+# tree.
 /results/
 /legacy/
 /both/
 examples/data/
 examples/out_*/
-benchmarking/out*/
 *.tsv.gz
-
-# paper_grid.py's per-cell --resume cache -- regenerable, not the committed
-# combined CSVs (those stay tracked at benchmarking/results_v210/*.csv)
-benchmarking/results_v210/cells/
 
 # development process record -- archived locally, never published
 .superpowers/

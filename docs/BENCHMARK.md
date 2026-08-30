@@ -2,37 +2,30 @@
 
 ## Stage 2D screen and confirm workflow
 
+> **This workflow belongs to `eiger_paper`, not to this repository.** The
+> benchmark harness `benchmark_suite.py` is maintained in the separate
+> `eiger_paper` repository and is **not** installed by the `eiger2` wheel, so
+> none of it can be run from a checkout or an installation of this repository.
+> It is recorded here as the design of the measurement the numbers in this
+> document come from.
+
 Do not rerun the historical grid unchanged. The current suite derives both point
 and upper-bound decisions from each fitted run and records both, so stochastic null
 realisations are shared. It also includes a compact regression screen for the
-provisional biological-support layer:
+provisional biological-support layer. Screen stage, against
+[`benchmarking/benchmark_suite.py`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/benchmark_suite.py) in
+`eiger_paper`: the `support` command at 10 seeds, then `negative` and `sweep` at
+20 seeds, all three writing to one shared screen output directory.
 
-```bash
-python benchmarking/benchmark_suite.py support \
-  --out-dir benchmarking/results_stage2d_screen --seeds 10
-python benchmarking/benchmark_suite.py negative \
-  --out-dir benchmarking/results_stage2d_screen --seeds 20
-python benchmarking/benchmark_suite.py sweep \
-  --out-dir benchmarking/results_stage2d_screen --seeds 20
-```
-
-After the code, null definition and thresholds are frozen, use a fresh output
-directory and at least 100 seeds for confirmation:
-
-```bash
-python benchmarking/benchmark_suite.py negative \
-  --out-dir benchmarking/results_stage2d_confirm --seeds 100
-python benchmarking/benchmark_suite.py sweep \
-  --out-dir benchmarking/results_stage2d_confirm --seeds 100
-python benchmarking/benchmark_suite.py support \
-  --out-dir benchmarking/results_stage2d_confirm --seeds 100
-```
+After the code, null definition and thresholds are frozen, the confirmation stage
+reruns `negative`, `sweep` and `support` at 100 seeds each into a **fresh** output
+directory, so no screen-stage result is overwritten or silently reused.
 
 The 2026-08-23 confirmatory manifests record commit `a4faddb`, but their dirty
 worktree fields are `null`; the harness now records the dirty state and source
 fingerprint. Re-run publication-grade results from a clean tagged commit. The
-checked-in CSVs remain useful audit evidence, but do not provide byte-level source
-provenance for that run.
+confirmatory CSVs committed in `eiger_paper` remain useful audit evidence, but do
+not provide byte-level source provenance for that run.
 
 The confirmatory design must report coordination FDR/FDP, probability of any call
 under the complete null, point and upper power/recall by planted prevalence and
@@ -59,8 +52,9 @@ genomic simulations with null construction and segmentation active.
 > null having opportunity for long strata to be meaningful) and is the one
 > confirmed quantity from this workflow; see `docs/FDR.md`'s "DMR-free
 > re-measurement (Stage 2e)". Real-signal calibration needed
-> `benchmarking/paper_grid.py`'s ~600,000-CpG `calibration`/`signal_grid`/
-> `power_curve` cells instead -- run 2026-08-23. Mean per-run FDP was 6.2%
+> [`benchmarking/paper_grid.py`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/paper_grid.py)'s ~600,000-CpG
+> `calibration`/`signal_grid`/`power_curve` cells in `eiger_paper` instead -- run
+> 2026-08-23. Mean per-run FDP was 6.2%
 > overall and 6.9-15.4% in the weak-effect 4-CpG cells; the 4.4% pooled
 > false-call ratio is call-weighted and masks this boundary failure. See
 > `docs/FDR.md`'s "Real-signal re-measurement at genome scale (Stage 2e,
@@ -77,8 +71,10 @@ genomic simulations with null construction and segmentation active.
 > v2.0.1's calibration, and note that even those v2.0.1 figures are themselves now
 > superseded: they used what is now called `region_null_mode="lag"`, which is known
 > to fail both region-level exchangeability gates on real layouts and is no longer
-> the default. Current (v2.1.0, `region_null_mode="member_step"`) figures are in
-> `benchmarking/results_v210/` and `STAGE1E_STOP_REPORT.md`.
+> the default. Current (v2.1.0, `region_null_mode="member_step"`) figures are
+> reproduced in [docs/FDR.md](FDR.md); they were produced by the v2.1.0 paper-grid
+> run and recorded in the Stage 1e stop report, an unpublished development record
+> retained outside this repository.
 
 Seeds per scenario: 3. All values are means across seeds. The original method's covariance threshold is swept; EIGER 2 runs once at its automatic operating point.
 

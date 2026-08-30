@@ -304,7 +304,9 @@ realistic marginal the *nuisance* band rises: fitted to purified leukocyte
 cell types it runs to 0.145 with a 95th percentile of 0.1146, so the original
 0.10 kept a nuisance component in 158 of 280 simulated runs and the deflation
 stage was half switched off on exactly the data type the method is for. 0.12 is
-set from both sides and nothing else (`specs/publication/FIX_SPEC.md` §WP7b):
+set from both sides and nothing else (the pre-publication fix spec §WP7b,
+[`provenance/internal_specs/FIX_SPEC.md`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/provenance/internal_specs/FIX_SPEC.md)
+in `eiger_paper`):
 
 | side | measurement |
 |---|---|

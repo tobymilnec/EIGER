@@ -49,7 +49,7 @@ EIGER2 was developed to address this limitation and to provide a clearer statist
 | **A separate region-level null** | Deciding whether a *run* of elevated edges is longer or stronger than chance requires a different null from the one that sets the edge threshold. See "The region-level null" below. |
 | **Region-level empirical FDR estimation** | Null coordination tracks are processed through the same segmentation procedure as the observed data. Region areas are compared within CpG-count strata, giving an empirical region-level false discovery rate with explicit finite-null uncertainty bounds. |
 
-The validation analyses, assumptions, and commands underlying these changes are documented in **[docs/](docs/)** and **[analysis/](analysis/README.md)**.
+The assumptions and commands underlying these changes are documented in **[docs/](docs/)**. The validation analyses themselves live in the separate `eiger_paper` repository, which is not part of this package: see its **[analysis/README.md](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/analysis/README.md)**.
 
 ---
 
@@ -265,8 +265,10 @@ Minimum number of samples that must carry a region's deviation for it to be
 omission.** A one- or two-sample deviation across a run of CpGs is genuinely
 coordinated — it is not a false positive under any null — it is simply not a
 subgroup-defining DMR. Raising the floor to 3 was measured on the full 280-run
-`signal_grid` and on the 519-sample ICGC cohort
-(`benchmarking/results_v220/prevalence_default/`):
+`signal_grid` and on the 519-sample ICGC cohort by the paper-side sweep
+[`benchmarking/prevalence_default.py`](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/benchmarking/prevalence_default.py),
+which lives in the separate `eiger_paper` repository and is not part of this
+package:
 
 - in 10 of the 14 grid cells it costs nothing at all — mean recall identical to
   the last decimal, because their planted subgroups are 4 samples or larger;

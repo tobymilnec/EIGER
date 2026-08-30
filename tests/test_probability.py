@@ -242,7 +242,8 @@ def test_permutation_null_tracks_raises_naming_the_replacement():
     # edge-wise permutation (block length 1) -- measured at zero null regions
     # across 400 replicates and, before the Stage 1c-bis null-adequacy guard
     # existed to catch it, 3/3 significant on DMR-free clean data
-    # (STAGE1D_C_COMPRESSED_SPEC.md §0; docs/MULTISCALE_BLOCKED.md). The
+    # (the Stage 1d-C compressed spec §0, an unpublished development record;
+    # docs/MULTISCALE_BLOCKED.md). The
     # "richer null than the lag null" narrative this test used to pin
     # (replaced below) was itself part of the problem -- more candidate
     # regions from a null this broken is anti-conservative, not an
