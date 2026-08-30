@@ -174,3 +174,209 @@ def test_simulate_truth_records_the_realised_effective_delta():
         _start, _end, _fraction, delta, _run_start, _run_end, effective = entry
         assert effective == pytest.approx(delta, rel=0.05)
         assert effective <= delta
+
+
+# --- The eiger_paper boundary (plan Fix S1) -------------------------------------
+#
+# Real coordinate layouts and marginals fitted to real cohorts are maintained in
+# eiger_paper, not shipped in the wheel. The installed package must reject their
+# mode names with one actionable message instead of searching for a benchmarking/
+# directory that an installed package does not have, and must offer the injection
+# points paper code uses instead.
+
+
+@pytest.mark.parametrize("layout", ["wgbs_real", "epic_fitted"])
+def test_simulate_rejects_a_paper_only_layout_by_name(layout):
+    with pytest.raises(ValueError) as excinfo:
+        simulate(strata=[], seed=0, layout=layout)
+    message = str(excinfo.value)
+    assert "eiger_paper" in message
+    assert "locations" in message
+    assert len(message.splitlines()) == 1
+
+
+@pytest.mark.parametrize("marginal", ["bimodal_fitted", "bimodal_atlas"])
+def test_simulate_rejects_a_paper_only_marginal_by_name(marginal):
+    with pytest.raises(ValueError) as excinfo:
+        simulate(strata=[], seed=0, marginal=marginal)
+    message = str(excinfo.value)
+    assert "eiger_paper" in message
+    assert "marginal_sampler" in message
+    assert len(message.splitlines()) == 1
+
+
+def test_simulate_reads_no_files_and_needs_no_source_checkout():
+    """No shipped mode may touch the filesystem: the wheel carries no fixtures."""
+
+    import builtins
+
+    real_open = builtins.open
+    opened: list[str] = []
+
+    def recording_open(file, *args, **kwargs):
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(builtins, "open", recording_open)
+        simulate(strata=[(0.1, 0.3)], replicates=1, seed=11)
+    finally:
+        monkey.undo()
+    assert opened == []
+
+
+def test_advertised_layouts_and_marginals_are_the_self_contained_ones():
+    from eiger2 import benchmark
+
+    assert benchmark.LAYOUTS == ("dense",)
+    assert benchmark.MARGINALS == ("unimodal",)
+
+
+def test_cli_help_describes_only_installed_package_behaviour(capsys):
+    from eiger2 import benchmark
+
+    with pytest.raises(SystemExit) as excinfo:
+        benchmark.main(["--help"])
+    assert excinfo.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "dense" in help_text and "unimodal" in help_text
+    # a paper-only mode may be named only inside the scope note that says it is
+    # not shipped here, never in the scenario list the help advertises
+    advertised, _, scope = help_text.partition("Scope of the installed package")
+    assert "eiger_paper" in scope
+    for mode in benchmark.PAPER_ONLY_LAYOUTS + benchmark.PAPER_ONLY_MARGINALS:
+        assert mode not in advertised
+
+
+def test_supplied_locations_replace_the_generated_layout():
+    locations = _locations(
+        list(range(0, 4000, 2)) + list(range(100_000, 102_000, 2)),
+        chrom=["chr1"] * 2000 + ["chr2"] * 1000,
+    )
+    matrix, used, truth = simulate(
+        strata=[(0.25, 0.3)], replicates=2, seed=5, locations=locations,
+        layout="paper_layout",
+    )
+    assert matrix.shape == (len(locations), 80)
+    assert used["chr"].tolist() == locations["chr"].tolist()
+    assert used.attrs["layout"] == "paper_layout"
+    # planting still respects the layout's eligible runs
+    for start, end, _f, _d, run_start, run_end, _eff in truth:
+        assert run_start <= start and end <= run_end
+
+
+def test_supplied_marginal_sampler_hits_the_requested_per_cpg_total_sd():
+    baseline = None
+    target = None
+
+    def sampler(rng, n_cpg):
+        nonlocal baseline, target
+        baseline = rng.uniform(0.05, 0.95, n_cpg)
+        target = np.full(n_cpg, 0.02)
+        return baseline, target
+
+    matrix, locations, _truth = simulate(
+        strata=[], seed=6, spacing=1000, marginal="paper_marginal",
+        marginal_sampler=sampler,
+    )
+    assert locations.attrs["marginal"] == "paper_marginal"
+    interior = (baseline > 0.2) & (baseline < 0.8)  # away from the BETA_CLIP rails
+    realised = matrix[interior].std(axis=1, ddof=1)
+    assert realised.mean() == pytest.approx(target[0], rel=0.05)
+    assert np.corrcoef(matrix[interior].mean(axis=1), baseline[interior])[0, 1] > 0.99
+
+
+def test_supplied_marginal_sampler_does_not_disturb_the_unimodal_draw_order():
+    """The sampler branch is separate, so no shipped seed's matrix can move."""
+
+    import hashlib
+
+    def sampler(rng, n_cpg):
+        return np.full(n_cpg, 0.5), np.full(n_cpg, 0.04)
+
+    kwargs = {"strata": [(0.1, 0.3)], "replicates": 2, "seed": 42}
+    shipped, _locations_frame, _truth = simulate(**kwargs)
+    injected, _locations_frame, _truth = simulate(**kwargs, marginal_sampler=sampler)
+    # identical draw counts in identical order, but the sampler branch scales the
+    # noise and loading rows, so the matrices differ while both stay reproducible
+    assert injected.shape == shipped.shape
+    assert (
+        hashlib.sha256(injected.tobytes()).hexdigest()
+        == hashlib.sha256(
+            simulate(**kwargs, marginal_sampler=sampler)[0].tobytes()
+        ).hexdigest()
+    )
+
+
+# --- Advertised --scenario modes must run from an installed wheel ----------------
+#
+# call_dmrs returns rather than raises when a structural gate fails, and an
+# aborted run carries no manifest["null"] block and no decision column. The
+# scenario printers must report that refusal, not crash on a key the run never
+# earned -- exit code zero is not complete inference.
+
+
+def _aborted_manifest():
+    return {
+        "status": "inference_unreliable",
+        "latent_structure": {"n_components": 2},
+        "gates": {"structural": {
+            "numerical_failure": {"passed": False, "error": "no usable pairs"},
+        }},
+    }
+
+
+def test_summary_reports_a_refused_run_instead_of_raising():
+    from eiger2.benchmark import _summary
+
+    summary = _summary(_aborted_manifest())
+    assert "threshold=refused" in summary
+    assert "status=inference_unreliable" in summary
+    assert "K=2" in summary
+
+
+def test_summary_reports_the_threshold_of_a_completed_run():
+    from eiger2.benchmark import _summary
+
+    manifest = _aborted_manifest() | {
+        "status": "partial_inference", "null": {"threshold": 0.1234},
+    }
+    assert "threshold=0.1234" in _summary(manifest)
+    assert "status=partial_inference" in _summary(manifest)
+
+
+def test_refusal_reason_names_the_failed_structural_gate():
+    from eiger2.benchmark import _refusal_reason
+
+    assert _refusal_reason(_aborted_manifest()) == (
+        "numerical_failure: no usable pairs"
+    )
+
+
+def test_scenario_null_completes_and_reports_refusals(capsys):
+    """The historical 800-CpG null scenario aborts on the structural gates now.
+
+    It must say so per run rather than raise: the numbers in docs/EIGER2_DESIGN.md
+    were produced before the current gates, and rescaling the scenario to clear
+    them would move every one of them -- a results decision, not a bug fix.
+    """
+
+    from eiger2 import benchmark
+
+    assert benchmark.main(["--scenario", "null", "--null-replicates", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "significant at q<=0.05" in out
+    assert "status=" in out
+
+
+def test_refused_strata_are_reported_so_a_refusal_is_not_read_as_a_miss():
+    """evaluate() counts a refused region as not recovered; the scenario must say so."""
+
+    from eiger2.benchmark import _refused_strata
+
+    manifest = {"fdr": {"insufficient_null_opportunity_strata": [
+        {"stratum": "20-49", "null_opportunity": 0.0, "observed_regions": 48},
+    ]}}
+    assert _refused_strata(manifest) == ["20-49"]
+    assert _refused_strata({}) == []

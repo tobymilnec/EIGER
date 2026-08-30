@@ -1,21 +1,34 @@
-"""Operating-characteristic benchmark for EIGER 2.
+"""Operating-characteristic benchmark for the EIGER 2 simulator.
 
-Run with ``python -m eiger2.benchmark`` from the ``Python`` directory. Every
-number quoted in EIGER2_DESIGN.md is produced here, so the claims can be
-re-checked whenever the core changes.
+Run with ``python -m eiger2.benchmark`` from anywhere once ``eiger`` is
+installed: the scenarios below are self-contained and read no files.
 
 Scenarios
     null            DMR-free matrix with latent structure -> false-positive rate
     prevalence      planted DMRs across a grid of subgroup fraction and effect
     missingness     the same grid with structured dropout
     statistic       correlation vs covariance under a hard, low-SNR setting
+
+Scope of the installed package
+    ``simulate`` ships one layout, ``"dense"`` (uniformly spaced CpGs on one
+    synthetic chromosome), and one per-CpG value distribution,
+    ``"unimodal"`` (every CpG centred at 0.5 with a common ``noise_sd``).
+    Together they preserve the historical self-contained package scenarios and
+    their regression hashes, and they depend on nothing outside this package.
+
+    Real WGBS/EPIC-seq coordinate layouts and marginals fitted to real cohorts
+    are *paper* material: their fixtures, fits and provenance are maintained in
+    the separate ``eiger_paper`` repository and are deliberately not shipped in
+    the wheel. ``simulate`` does not load them, and naming one
+    (``layout="wgbs_real"``, ``marginal="bimodal_fitted"``, ...) is an error.
+    Paper code injects what it loaded through the ``locations`` and
+    ``marginal_sampler`` parameters instead; see ``simulate``.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
@@ -23,77 +36,60 @@ import pandas as pd
 from .core import Eiger2Config, call_dmrs
 from .layouts import eligible_run_spans
 
-LAYOUTS = ("dense", "wgbs_real", "epic_fitted")
+#: CpG coordinate layouts this package generates on its own. Real coordinate
+#: layouts are loaded by ``eiger_paper`` and passed in as ``locations``.
+LAYOUTS = ("dense",)
 
-#: Per-CpG value distributions ``simulate`` can draw from (master spec §6.2 /
-#: FIX_SPEC WP6, WP6b). ``"unimodal"`` is the marginal every prior EIGER number
-#: was produced on -- every CpG centred at 0.5 with a common ``noise_sd`` -- and
-#: stays the default, so no committed number moves. The two fitted marginals
-#: replace it with a real one measured by
-#: ``benchmarking/layouts/fit_beta_marginal.py``: per-CpG baselines drawn from a
-#: Beta mixture (bimodal, mass near 0 and 1) and per-CpG total sd targeted to the
-#: empirical sd(mu) curve (heteroscedastic, compressed at the boundaries). They
-#: differ only in whose sd(mu) they target, and together they bracket the truth:
-#:
-#: ``"bimodal_fitted"``
-#:     the ICGC cohort's *total* per-CpG sd. That total includes the real
-#:     between-sample biology a DMR caller exists to find, so it is an UPPER
-#:     bound on the nuisance level -- recall under it is a lower bound.
-#: ``"bimodal_atlas"``
-#:     within-cell-type between-donor sd across purified normal leukocytes, with
-#:     the binomial read-sampling component subtracted (FIX_SPEC WP6b). Purified
-#:     normal cell types carry no cohort substructure, so this is close to a pure
-#:     nuisance FLOOR -- recall under it is the other end of the bracket.
-MARGINALS = ("unimodal", "bimodal_fitted", "bimodal_atlas")
+#: Per-CpG value distributions this package draws on its own. Marginals fitted
+#: to real data are loaded by ``eiger_paper`` and passed in as a
+#: ``marginal_sampler``.
+MARGINALS = ("unimodal",)
 
-#: The vendored fit each fitted marginal reads. Same schema either way, so
-#: ``_marginal_params`` generalises by filename alone and no other code path
-#: distinguishes them (FIX_SPEC WP6b.6).
-MARGINAL_PARAM_FILES: dict[str, str] = {
-    "bimodal_fitted": "beta_marginal_params.json",
-    "bimodal_atlas": "beta_marginal_atlas_params.json",
-}
+#: Mode names that named a fixture maintained in ``eiger_paper`` when the
+#: benchmark harness and the software lived in one repository. They are rejected
+#: by name -- rather than falling through to a generic "unknown mode" message or
+#: to a search for a ``benchmarking/`` directory that an installed package does
+#: not have -- so the failure states where the fixture went and how to supply it.
+PAPER_ONLY_LAYOUTS = ("wgbs_real", "epic_fitted")
+PAPER_ONLY_MARGINALS = ("bimodal_fitted", "bimodal_atlas")
 
-#: Clip bounds applied to every simulated matrix, whatever the marginal. Also the
-#: interval ``fit_beta_marginal.py`` clamps its fitted mean support to, so the
-#: fitted and realisable supports are the same set.
+#: Clip bounds applied to every simulated matrix, whatever the marginal.
 BETA_CLIP: tuple[float, float] = (0.001, 0.999)
 
+#: What ``simulate`` expects of a caller-supplied marginal: given the run's
+#: generator and the CpG count, return ``(baseline_mu, total_sd)`` -- the
+#: per-CpG baseline mean and the per-CpG total standard deviation to hit. Both
+#: are length-``n_cpg`` float arrays. ``simulate`` scales each CpG's noise draw
+#: and latent-loading row by one common factor to realise ``total_sd``, which
+#: leaves the noise:latent energy ratio -- and so the meaning of ``n_latent`` --
+#: untouched. Draw from ``rng`` and nothing else, so a seed still determines the
+#: run: ``simulate`` draws the noise, latent and loading arrays after this
+#: returns, in that order.
+MarginalSampler = Callable[
+    [np.random.Generator, int], tuple[np.ndarray, np.ndarray]
+]
 
-def _fixture_dir() -> Path:
-    """``benchmarking/layouts/`` relative to a repo checkout.
 
-    Only ``eiger2*``/``functions*`` ship (``pyproject.toml``); the vendored fixture
-    data does not. ``layout="dense"`` (the default) never calls this, so an installed
-    wheel is unaffected -- ``wgbs_real``/``epic_fitted`` are repo-checkout-only, like
-    the rest of this benchmark module already is (see its module docstring).
-    """
+def _reject_paper_only(kind: str, name: str, paper_only: tuple[str, ...],
+                       supported: tuple[str, ...], injection: str) -> None:
+    """Raise the boundary message for a mode that ``eiger_paper`` owns."""
 
-    return Path(__file__).resolve().parents[2] / "benchmarking" / "layouts"
+    if name in paper_only:
+        raise ValueError(
+            f"{kind}={name!r} is maintained in the eiger_paper repository, not "
+            f"in the installed eiger2 package; the shipped simulator supports "
+            f"{kind} in {supported}. Load it with the eiger_paper helper and "
+            f"pass the result to simulate({injection}=...)."
+        )
 
 
-def _layout_locations(
-    layout: str,
-    n_cpg: int,
-    *,
-    seed: int,
-    layout_chrom: str | None,
-    layout_profile: str,
-    layout_offset: int | None,
-) -> pd.DataFrame:
+def _layout_locations(layout: str, n_cpg: int) -> pd.DataFrame:
     """Build the ``chr``/``start``/``end`` frame for one of ``LAYOUTS``.
 
-    ``dense`` (default): uniformly spaced CpGs on one synthetic chromosome -- the
-    layout every prior EIGER benchmark number used, unchanged. ``wgbs_real``: a
-    contiguous slice of real hg38 coordinates from the vendored fixture, at a varied
-    offset per seed unless ``layout_offset`` is given explicitly -- a fixed offset
-    would always sample the same (non-representative) stretch of the chromosome, see
-    ``benchmarking/layouts/README.md``. ``layout_chrom=None`` (``wgbs_real`` only,
-    spec §2b.5): every chromosome in the fixture at once, each proportioned to its
-    own real share of ``n_cpg`` (not a single random offset slice of the
-    concatenated array, which would not reliably span more than one chromosome).
-    ``epic_fitted``: a generated targeted-panel layout fitted to ``layout_profile``'s
-    empirical gap/run-length/depth structure.
+    ``dense`` (the only shipped layout, and the default): uniformly spaced CpGs
+    on one synthetic chromosome. Its retained regression outputs are unchanged.
+    A real coordinate layout is loaded by ``eiger_paper`` and passed to
+    ``simulate`` as ``locations``; it never arrives here.
     """
 
     if layout == "dense":
@@ -102,136 +98,10 @@ def _layout_locations(
             "start": np.arange(n_cpg) * 2,
             "end": np.arange(n_cpg) * 2 + 1,
         })
-    if layout not in LAYOUTS:
-        raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
-
-    fixtures = _fixture_dir()
-    root = str(fixtures.parents[1])
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from benchmarking.layouts.layouts import generate_epic_layout, load_wgbs_layout
-
-    if layout == "wgbs_real":
-        npz = fixtures / "wgbs_layout_hg38.npz"
-        if not npz.exists():
-            raise FileNotFoundError(
-                f"{npz} not found -- layout='wgbs_real' needs a full repo checkout "
-                f"with the vendored fixture, not an installed wheel"
-            )
-        if layout_chrom is None:
-            from benchmarking.layouts.layouts import wgbs_chromosome_sizes
-
-            sizes = wgbs_chromosome_sizes(npz)
-            total = sum(sizes.values())
-            rng = np.random.default_rng(seed)
-            names = list(sizes)
-            frames = []
-            allocated = 0
-            for i, name in enumerate(names):
-                if i == len(names) - 1:
-                    share = n_cpg - allocated  # remainder: exact total, no rounding gap
-                else:
-                    share = round(n_cpg * sizes[name] / total)
-                    allocated += share
-                share = max(1, min(share, sizes[name]))
-                max_offset = max(0, sizes[name] - share)
-                offset = int(rng.integers(0, max_offset + 1)) if max_offset else 0
-                chrom_locations, _depth = load_wgbs_layout(
-                    npz, chrom=name, n_cpg=share, offset=offset,
-                )
-                frames.append(chrom_locations)
-            return pd.concat(frames, ignore_index=True)
-        if layout_offset is None:
-            full, _ = load_wgbs_layout(npz, chrom=layout_chrom)
-            max_offset = max(0, len(full) - n_cpg)
-            layout_offset = (
-                int(np.random.default_rng(seed).integers(0, max_offset + 1))
-                if max_offset > 0 else 0
-            )
-        locations, _depth = load_wgbs_layout(
-            npz, chrom=layout_chrom, n_cpg=n_cpg, offset=layout_offset
-        )
-        return locations
-
-    params = fixtures / "epic_layout_params.json"
-    if not params.exists():
-        raise FileNotFoundError(
-            f"{params} not found -- layout='epic_fitted' needs a full repo checkout "
-            f"with the vendored fixture, not an installed wheel"
-        )
-    locations, _depth = generate_epic_layout(
-        params, n_cpg, seed=seed, profile=layout_profile, chrom=layout_chrom
-    )
-    return locations
-
-
-def _marginal_params(marginal: str) -> dict:
-    """The vendored beta-marginal fit behind one of the fitted marginals.
-
-    Same repo-checkout-only contract as the layout fixtures (see
-    ``_fixture_dir``): the JSONs are not shipped in the wheel and the default
-    ``marginal="unimodal"`` never reads one. The two fits share a schema, so the
-    only thing that varies here is the filename (FIX_SPEC WP6b.6).
-    """
-
-    import json
-
-    path = _fixture_dir() / MARGINAL_PARAM_FILES[marginal]
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found -- marginal={marginal!r} needs a full repo "
-            f"checkout with the vendored fit, not an installed wheel; produce it "
-            f"with benchmarking/layouts/fit_beta_marginal.py"
-        )
-    return json.loads(path.read_text())
-
-
-def _bimodal_baseline_mu(
-    rng: np.random.Generator, params: dict, n_cpg: int
-) -> np.ndarray:
-    """Per-CpG baseline means drawn from the fitted Beta mixture.
-
-    One component draw then one Beta draw per CpG, clamped to the fit's own
-    support (``mean_clamp``, which is ``BETA_CLIP``) so a baseline can never sit
-    outside the interval the matrix is clipped to.
-    """
-
-    mixture = params["mixture"]
-    weights = np.asarray(mixture["weights"], dtype=float)
-    a = np.asarray(mixture["a"], dtype=float)
-    b = np.asarray(mixture["b"], dtype=float)
-    component = rng.choice(len(weights), size=n_cpg, p=weights / weights.sum())
-    low, high = params.get("mean_clamp", BETA_CLIP)
-    return np.clip(rng.beta(a[component], b[component]), low, high)
-
-
-def _target_total_sd(mu: np.ndarray, params: dict) -> np.ndarray:
-    """The fitted empirical sd(mu) curve, evaluated at each CpG's baseline.
-
-    Piecewise-linear over the binned curve (``np.interp``), which is the
-    shape-preserving read of an arch-shaped, non-monotone curve -- it cannot
-    overshoot between bin centres the way an unconstrained cubic can, and needs
-    nothing beyond numpy at simulate time. Outside the fitted bin range
-    ``np.interp`` holds the end values flat, which is the intended behaviour:
-    the extreme-mu bins are exactly where the real curve is flattest.
-
-    ``sd_median`` is the binned median the fit reports, and is what the ICGC arm
-    targets. A fit MAY also publish ``sd_simulator``, and this prefers it when
-    present: the atlas arm's per-pair sd is a 3-donor variance with the binomial
-    term subtracted, so more than half its pairs clip to zero in the rail bins
-    and the median there is exactly zero -- a true statement about what 3 donors
-    resolve, and an impossible target for a simulator, which would draw those
-    CpGs as constant rows. See ``fit_beta_marginal.sd_curve`` for the estimator
-    and why it is the conservative one to have chosen. Selection is by key, not
-    by marginal name: ``beta_marginal_params.json`` carries no ``sd_simulator``
-    and is byte-identical under this branch.
-    """
-
-    curve = params["sd_curve"]
-    return np.interp(
-        mu,
-        np.asarray(curve["mu"], dtype=float),
-        np.asarray(curve.get("sd_simulator", curve["sd_median"]), dtype=float),
+    _reject_paper_only("layout", layout, PAPER_ONLY_LAYOUTS, LAYOUTS, "locations")
+    raise ValueError(
+        f"layout must be one of {LAYOUTS}, got {layout!r}; pass a coordinate "
+        f"frame as simulate(locations=...) to simulate any other layout"
     )
 
 
@@ -337,44 +207,44 @@ def simulate(
     seed: int = 4,
     layout: str = "dense",
     max_cpg_gap_bp: int | None = 300,
-    layout_chrom: str | None = "chr1",
-    layout_profile: str = "chr1",
-    layout_offset: int | None = None,
     marginal: str = "unimodal",
+    locations: pd.DataFrame | None = None,
+    marginal_sampler: MarginalSampler | None = None,
 ) -> tuple[
     np.ndarray, pd.DataFrame, list[tuple[int, int, float, float, int, int, float]]
 ]:
     """A CpG-by-sample matrix with latent structure and planted DMRs.
 
-    ``layout`` (master spec §6.1) selects the CpG coordinate structure: ``"dense"``
-    (default, unchanged from every prior EIGER benchmark) is uniformly spaced CpGs on
-    one synthetic chromosome, so every existing call is unaffected. ``"wgbs_real"`` and
-    ``"epic_fitted"`` draw from the vendored ``benchmarking/layouts/`` fixture -- real
-    hg38 coordinates and a fitted targeted-panel generator, respectively -- and require
-    a full repo checkout (see ``_fixture_dir``). Planted DMRs always respect the
-    layout's eligibility structure; see ``_plant_dmrs``.
+    ``layout`` (master spec §6.1) selects the CpG coordinate structure. The
+    installed package generates one, ``"dense"`` (the default): uniformly spaced
+    CpGs on one synthetic chromosome. To simulate on any other layout, load its
+    coordinates yourself and pass the ``chr``/``start``/``end`` frame as
+    ``locations``; ``layout`` then only labels what you passed, and ``n_cpg`` is
+    ``len(locations)`` rather than derived from ``spacing`` and ``strata``. Real
+    WGBS/EPIC-seq layouts and their fixtures live in ``eiger_paper``, which owns
+    the loading; naming one here without supplying ``locations`` is an error.
+    Planted DMRs always respect the layout's eligibility structure; see
+    ``_plant_dmrs``.
 
-    ``marginal`` (FIX_SPEC WP6, WP6b) selects the per-CpG VALUE distribution, the
-    other half of what the layouts replicate. ``"unimodal"`` (default) is
-    byte-identical to every prior EIGER benchmark at every seed: every CpG centred
-    at 0.5 with a common ``noise_sd``. ``"bimodal_fitted"`` and ``"bimodal_atlas"``
-    draw each CpG's baseline from a Beta mixture fitted to real data and scale
-    that CpG's noise draw and latent loading row together so its total sd matches
-    the fitted sd(mu) curve -- together, per-CpG scale factors, so the
-    noise:latent energy ratio and hence ``n_latent``'s meaning are preserved
-    exactly. The two differ only in which fit they read (see ``MARGINALS``): an
-    upper bound on the nuisance level from a cancer cohort's total sd, and a
-    nuisance floor from between-donor sd in purified normal cell types. Both need
-    the same full repo checkout the real layouts do, and both draw the same number
-    of values in the same order, so a seed's matrix depends on which fit is read
-    but never on this branch's shape.
+    ``marginal`` selects the per-CpG VALUE distribution, the other half of what a
+    layout replicates. The installed package draws one, ``"unimodal"`` (the
+    default): every CpG centred at 0.5 with a common ``noise_sd``. This keeps the
+    previous dense/unimodal draw path unchanged. To simulate under a fitted
+    marginal, pass a ``marginal_sampler`` returning per-CpG
+    ``(baseline_mu, total_sd)``; each CpG's noise draw and latent loading row are
+    then scaled together by one common factor so its total sd matches
+    ``total_sd``, preserving the noise:latent energy ratio and hence
+    ``n_latent``'s meaning exactly. See ``MarginalSampler`` for the draw order a
+    sampler must respect. Marginals fitted to real cohorts live in
+    ``eiger_paper``, which owns the fits; naming one here without supplying a
+    ``marginal_sampler`` is an error.
 
     Each truth entry is ``(start, end, fraction, delta, run_start, run_end,
     effective_delta)``. ``effective_delta`` is the mean absolute post-clip shift
     actually realised over the planted block's carrier entries: equal to ``delta``
     whenever the clip did not bite (always so under ``"unimodal"`` at the deltas
-    the benchmarks use), and below it where a bimodal baseline sat close enough to
-    a boundary that part of the shift was clipped away.
+    the benchmarks use), and below it where a supplied baseline sat close enough
+    to a boundary that part of the shift was clipped away.
     """
 
     rng = np.random.default_rng(seed)
@@ -382,20 +252,26 @@ def simulate(
     n_dmr = len(strata) * replicates
     n_cpg = spacing * max(n_dmr, 1) + 400
 
-    locations = _layout_locations(
-        layout, n_cpg, seed=seed, layout_chrom=layout_chrom,
-        layout_profile=layout_profile, layout_offset=layout_offset,
-    )
-    n_cpg = len(locations)  # real/fitted layouts return exactly n_cpg rows, but
-                             # this keeps the matrix and locations sizes provably tied
+    if locations is None:
+        locations = _layout_locations(layout, n_cpg)
+    else:
+        locations = locations.reset_index(drop=True)
+    n_cpg = len(locations)  # supplied layouts set the size; for ``dense`` this
+                             # keeps the matrix and locations sizes provably tied
 
-    if marginal not in MARGINALS:
-        raise ValueError(f"marginal must be one of {MARGINALS}, got {marginal!r}")
-
-    if marginal == "unimodal":
-        # Unchanged, draw for draw, from every prior EIGER benchmark -- the
-        # bimodal branch is separate rather than a generalisation of this one
-        # precisely so no existing seed's matrix can move (see MARGINALS).
+    if marginal_sampler is None:
+        _reject_paper_only(
+            "marginal", marginal, PAPER_ONLY_MARGINALS, MARGINALS, "marginal_sampler"
+        )
+        if marginal not in MARGINALS:
+            raise ValueError(
+                f"marginal must be one of {MARGINALS}, got {marginal!r}; pass a "
+                f"sampler as simulate(marginal_sampler=...) to simulate any other "
+                f"marginal"
+            )
+        # Unchanged, draw for draw, from the previous dense/unimodal path -- the
+        # sampler branch is separate rather than a generalisation of this one so
+        # retained regression seeds do not move (see MARGINALS).
         baseline_mu = np.full(n_cpg, 0.5)
         matrix = 0.5 + rng.normal(0, noise_sd, (n_cpg, n_samples))
         if n_latent:
@@ -403,8 +279,9 @@ def simulate(
             loading = rng.normal(0, latent_loading_sd, (n_cpg, n_latent))
             matrix += loading @ latent.T
     else:
-        params = _marginal_params(marginal)
-        baseline_mu = _bimodal_baseline_mu(rng, params, n_cpg)
+        baseline_mu, target_total_sd = marginal_sampler(rng, n_cpg)
+        baseline_mu = np.asarray(baseline_mu, dtype=float)
+        target_total_sd = np.asarray(target_total_sd, dtype=float)
         noise = rng.normal(0, noise_sd, (n_cpg, n_samples))
         latent = rng.normal(0, 1, (n_samples, n_latent)) if n_latent else None
         loading = (
@@ -413,14 +290,12 @@ def simulate(
         # The generative total sd of CpG i is sqrt(noise_sd^2 + ||loading_i||^2):
         # the latent factors are unit-variance and independent. Scaling the noise
         # draw and the loading ROW by one common per-CpG factor therefore hits the
-        # fitted sd(mu_i) exactly while leaving the noise:latent energy ratio --
+        # requested total sd exactly while leaving the noise:latent energy ratio --
         # and so the number and meaning of the latent factors -- untouched.
         nominal_sd = np.full(n_cpg, float(noise_sd))
         if loading is not None:
             nominal_sd = np.sqrt(noise_sd**2 + (loading**2).sum(axis=1))
-        scale = np.where(
-            nominal_sd > 0, _target_total_sd(baseline_mu, params) / nominal_sd, 1.0
-        )
+        scale = np.where(nominal_sd > 0, target_total_sd / nominal_sd, 1.0)
         matrix = baseline_mu[:, None] + scale[:, None] * noise
         if n_latent:
             matrix += (scale[:, None] * loading) @ latent.T
@@ -493,6 +368,56 @@ def evaluate(
     return recovered, false_regions
 
 
+def _run(matrix, locations, config) -> tuple:
+    """One ``call_dmrs`` run, plus what a scenario is allowed to assume about it.
+
+    ``call_dmrs`` returns rather than raises when a structural gate fails, and an
+    aborted run carries no ``null`` block and no decision column -- so exit code
+    zero is not complete inference (plan section 3.1 rule 8). Every scenario
+    reads the run through here so a refusal is reported as a refusal instead of
+    surfacing as a ``KeyError`` on a manifest key the run never earned.
+    """
+
+    regions, _, manifest = call_dmrs(matrix, locations, config=config)
+    decided = bool(len(regions)) and "significant" in regions.columns
+    return regions, manifest, manifest.get("status", "unknown"), decided
+
+
+def _summary(manifest: dict) -> str:
+    """``K``, the edge threshold and the run status, refusal-tolerant."""
+
+    n_components = manifest.get("latent_structure", {}).get("n_components", "?")
+    null = manifest.get("null")
+    threshold = f"{null['threshold']:.4f}" if null else "refused"
+    return (
+        f"K={n_components} threshold={threshold} "
+        f"status={manifest.get('status', 'unknown')}"
+    )
+
+
+def _refused_strata(manifest: dict) -> list[str]:
+    """Length strata whose q-values were refused for want of null opportunity.
+
+    ``evaluate`` filters on a boolean column in which a refused region is ``pd.NA``,
+    so a refused truth region is silently counted as not recovered. Reporting the
+    refused strata beside the recall line keeps a refusal from reading as a miss
+    (plan section 3.1 rule 8).
+    """
+
+    strata = manifest.get("fdr", {}).get("insufficient_null_opportunity_strata", [])
+    return [entry["stratum"] for entry in strata]
+
+
+def _refusal_reason(manifest: dict) -> str:
+    """The first failed structural gate, for a one-line refusal report."""
+
+    gates = manifest.get("gates", {}).get("structural", {})
+    for name, gate in gates.items():
+        if not gate.get("passed", True):
+            return f"{name}: {gate.get('error', 'gate failed')}"
+    return "no decisions reported"
+
+
 def scenario_null(config_kwargs: dict) -> None:
     print("=" * 78)
     print("NULL: no DMRs, two latent factors. Nothing should be called.")
@@ -501,15 +426,17 @@ def scenario_null(config_kwargs: dict) -> None:
         matrix, locations, _ = simulate(strata=[], seed=100 + seed)
         for statistic in ("correlation", "covariance"):
             config = Eiger2Config(statistic=statistic, **config_kwargs)
-            regions, _, manifest = call_dmrs(matrix, locations, config=config)
-            significant = int(regions["significant"].sum()) if len(regions) else 0
+            regions, manifest, _status, decided = _run(matrix, locations, config)
+            significant = (
+                str(int(regions["significant"].sum())) if decided else "refused"
+            )
             print(
-                f"  seed={100 + seed} {statistic:>11}: "
-                f"K={manifest['latent_structure']['n_components']} "
-                f"threshold={manifest['null']['threshold']:.4f} "
+                f"  seed={100 + seed} {statistic:>11}: {_summary(manifest)} "
                 f"regions={manifest.get('n_regions', 0):>3} "
                 f"significant at q<=0.05 = {significant}"
             )
+            if not decided:
+                print(f"      {_refusal_reason(manifest)}")
 
 
 def scenario_prevalence(config_kwargs: dict, missing_rate: float = 0.0) -> None:
@@ -533,14 +460,21 @@ def scenario_prevalence(config_kwargs: dict, missing_rate: float = 0.0) -> None:
     results = {}
     for statistic in ("correlation", "covariance"):
         config = Eiger2Config(statistic=statistic, **config_kwargs)
-        regions, _, manifest = call_dmrs(matrix, locations, config=config)
-        recovered, false_regions = evaluate(regions, truth)
+        regions, manifest, _status, decided = _run(matrix, locations, config)
+        recovered, false_regions = evaluate(regions, truth) if decided else (set(), 0)
         results[statistic] = recovered
-        print(
-            f"  {statistic:>11}: K={manifest['latent_structure']['n_components']} "
-            f"threshold={manifest['null']['threshold']:.4f} -> "
+        outcome = (
             f"{len(recovered):>2}/{len(truth)} recovered, {false_regions} false regions"
+            if decided else _refusal_reason(manifest)
         )
+        print(f"  {statistic:>11}: {_summary(manifest)} -> {outcome}")
+        refused = _refused_strata(manifest)
+        if refused:
+            print(
+                f"      refused length strata {refused}: their regions carry no "
+                f"decision, so they count as not recovered above -- a refusal, "
+                f"not a miss"
+            )
     print(f"    {'f':>6} {'delta':>6} | {'correlation':>12} {'covariance':>11}")
     for fraction, delta in strata:
         index = [
@@ -576,17 +510,30 @@ def scenario_statistic(config_kwargs: dict) -> None:
                 config = Eiger2Config(
                     statistic=statistic, window=window, **config_kwargs
                 )
-                regions, _, _ = call_dmrs(matrix, locations, config=config)
-                recovered, false_regions = evaluate(regions, truth)
+                regions, manifest, _status, decided = _run(
+                    matrix, locations, config
+                )
+                if decided:
+                    recovered, false_regions = evaluate(regions, truth)
+                    outcome = (
+                        f"{len(recovered):>2}/{len(truth)} recovered, "
+                        f"{false_regions} false regions"
+                    )
+                else:
+                    outcome = _refusal_reason(manifest)
+                refused = _refused_strata(manifest)
+                suffix = f"; refused strata {refused}" if refused else ""
                 print(
                     f"  n={n_samples:>3} {statistic:>11} window={window}: "
-                    f"{len(recovered):>2}/{len(truth)} recovered, "
-                    f"{false_regions} false regions"
+                    f"{outcome}{suffix}"
                 )
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--scenario",
         default="all",
