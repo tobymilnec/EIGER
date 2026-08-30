@@ -9,6 +9,8 @@ deflation, and uncalibrated discovery on DMR-free data.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -18,11 +20,26 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "Python"))
-# benchmarking/ is not an installed package (see pyproject.toml's setuptools
-# packages.find scope); add the repo root so `from benchmarking.benchmark_suite
-# import SCENARIOS` resolves under pytest, matching how it already resolves when
-# run as a plain script from the repo root.
-sys.path.insert(0, str(_REPO_ROOT))
+
+# Compact copies of the simulator scenarios used by the software regression
+# tests. The paper repository owns the full benchmark harness and grids.
+SCENARIOS: dict[str, dict] = {
+    "clean": {"n_samples": 80, "n_latent": 0, "noise_sd": 0.04,
+              "missing_rate": 0.0},
+    "nuisance": {"n_samples": 80, "n_latent": 2,
+                 "latent_loading_sd": 0.07, "noise_sd": 0.04,
+                 "missing_rate": 0.0},
+    "missingness": {"n_samples": 80, "n_latent": 2,
+                    "latent_loading_sd": 0.07, "noise_sd": 0.04,
+                    "missing_rate": 0.25},
+    "small_n": {"n_samples": 12, "n_latent": 1,
+                "latent_loading_sd": 0.07, "noise_sd": 0.04,
+                "missing_rate": 0.0},
+    "high_noise": {"n_samples": 40, "n_latent": 2,
+                   "latent_loading_sd": 0.10, "noise_sd": 0.08,
+                   "missing_rate": 0.0},
+}
+DEFAULT_STRATA = [(0.05, 0.35), (0.10, 0.30), (0.25, 0.25), (0.50, 0.20)]
 
 import eiger2.core as _core_mod  # noqa: E402
 from eiger2 import (  # noqa: E402
@@ -39,6 +56,7 @@ from eiger2 import (  # noqa: E402
 from eiger2.benchmark import evaluate, simulate  # noqa: E402
 from eiger2.core import (  # noqa: E402
     _HAS_NUMBA,
+    DEFLATION_NEAR_CUTOFF_MARGIN,
     RegionFdrResult,
     _assign_support_bin,
     _diagnostic_status,
@@ -438,6 +456,303 @@ def test_biological_components_are_kept_and_nuisance_components_deflated():
     )
     assert mixed["n_components"] == 1
     assert mixed["component_verdict"].count("biological_kept") >= 4
+
+
+def _near_cutoff_diagnostics(loading: np.ndarray, seed: int) -> dict:
+    """``estimate_latent_basis`` diagnostics for one planted component.
+
+    One latent factor with the given per-CpG loading, on the same 0.5-centred
+    noise floor the benchmarks use. The loading's genomic *shape* is the only
+    thing that moves the concentration, which is what these two tests vary.
+    """
+
+    rng = np.random.default_rng(seed)
+    n_cpg, n_samples = len(loading), 20
+    latent = rng.normal(0, 1, n_samples)
+    matrix = (
+        0.5
+        + rng.normal(0, 0.04, (n_cpg, n_samples))
+        + np.outer(loading, latent)
+    )
+    _, diagnostics = estimate_latent_basis(
+        centre_cpgs(np.clip(matrix, 0.001, 0.999)),
+        Eiger2Config(deflation_thin=1, random_seed=seed),
+    )
+    return diagnostics
+
+
+def test_near_cutoff_note_fires_when_a_component_lands_in_the_band():
+    # FIX_SPEC WP6b item 2 (WP6 disposition option E). A diffuse factor --
+    # loading spread over every CpG, the nuisance shape -- lands this matrix's
+    # single candidate at 0.1123, inside the 0.02 margin either side of the
+    # shipped 0.10 cutoff. That is the measured n = 12 signature WP6 found under
+    # a realistic marginal (band 0.0880-0.1095), and the run says so.
+    rng = np.random.default_rng(0)
+    diagnostics = _near_cutoff_diagnostics(rng.normal(0, 0.07, 600), seed=0)
+
+    assert diagnostics["n_candidates"] == 1
+    concentration = diagnostics["loading_concentration"][0]
+    cutoff = diagnostics["deflation_max_concentration"]
+    assert abs(concentration - cutoff) <= DEFLATION_NEAR_CUTOFF_MARGIN
+    assert diagnostics["deflation_near_cutoff_margin"] == DEFLATION_NEAR_CUTOFF_MARGIN
+    assert diagnostics["near_cutoff_components"] == [{
+        "component": 0,
+        "loading_concentration": concentration,
+        # the verdict travels with the entry: the note is about the decision
+        # being marginal, not about which way this particular run went
+        "verdict": diagnostics["component_verdict"][0],
+    }]
+    # a NOTE, not a gate: the verdict is whatever the cutoff already said
+    assert diagnostics["n_components"] == int(concentration <= cutoff)
+
+
+def test_near_cutoff_note_is_silent_when_the_decision_is_clear():
+    # FIX_SPEC WP6b item 2: the same machinery on a focal factor -- loading
+    # concentrated in 2% of CpGs, the biological shape -- scores far above the
+    # cutoff, so nothing is near it and the list is empty rather than absent.
+    rng = np.random.default_rng(0)
+    loading = np.zeros(600)
+    loading[rng.choice(600, 12, replace=False)] = 0.5
+    diagnostics = _near_cutoff_diagnostics(loading, seed=0)
+
+    assert diagnostics["n_candidates"] == 1
+    cutoff = diagnostics["deflation_max_concentration"]
+    assert (
+        diagnostics["loading_concentration"][0] - cutoff
+        > DEFLATION_NEAR_CUTOFF_MARGIN
+    )
+    assert diagnostics["near_cutoff_components"] == []
+
+
+# --------------------------------------------------------------------------
+# the self-referenced deflation boundary (FIX_SPEC WP7a item 2)
+# --------------------------------------------------------------------------
+
+
+def _wp7a_matrix(seed: int, *, diffuse_sd: float, focal_sd: float) -> np.ndarray:
+    """Residuals carrying a diffuse factor, a focal factor, or both.
+
+    4000 CpGs of which 40 (1%, the ``deflation_concentration_quantile`` window)
+    carry the focal factor: the shape of the real thing, where marker regions
+    are a small fraction of the genome and the energy profile is dominated by
+    noise. The diffuse factor is the nuisance shape -- a loading on every CpG.
+    Which factors are present is the only thing these tests vary.
+    """
+
+    rng = np.random.default_rng(seed)
+    n_cpg, n_samples, block = 4000, 20, 20
+    matrix = 0.5 + rng.normal(0, 0.04, (n_cpg, n_samples))
+    if diffuse_sd:
+        matrix += np.outer(
+            rng.normal(0, diffuse_sd, n_cpg), rng.normal(0, 1, n_samples)
+        )
+    if focal_sd:
+        loading = np.zeros(n_cpg)
+        for index in range(2):
+            loading[200 + index * 400 : 200 + index * 400 + block] = focal_sd
+        matrix += np.outer(loading, rng.normal(0, 1, n_samples))
+    return centre_cpgs(np.clip(matrix, 0.001, 0.999))
+
+
+def test_the_shipped_deflation_rule_is_absolute_and_records_its_own_boundary():
+    """FIX_SPEC WP7a item 2: the default path is the pre-WP7a path.
+
+    ``deflation_boundary`` is the shipped constant, its source names the
+    constant, and no permutation-null band is recorded -- so a consumer can tell
+    an absolute run from a relative one without being told, and the two
+    manifests differ only where the runs genuinely do.
+    """
+
+    _, diagnostics = estimate_latent_basis(
+        _wp7a_matrix(5, diffuse_sd=0.07, focal_sd=0.5),
+        Eiger2Config(deflation_thin=1, random_seed=5),
+    )
+    config = Eiger2Config()
+    assert config.deflation_rule == "absolute"
+    assert diagnostics["deflation_rule"] == "absolute"
+    assert diagnostics["deflation_boundary"] == config.deflation_max_concentration
+    assert diagnostics["deflation_boundary_source"] == "deflation_max_concentration"
+    assert "deflation_null_concentration" not in diagnostics
+
+
+#: FIX_SPEC WP7b second disposition item 5: the WP7a byte-identity pin is
+#: path-aware. A SHA-256 of a numeric table cannot survive a different
+#: summation order, so one digest is a pin on one execution path; both are
+#: pinned and the active one is asserted. Region-table digest per path, then
+#: the per-sample value table, which is bit-identical on both.
+WP7A_REGION_DIGEST = {
+    "numpy": "4b6baf1edee4b28a",
+    "numba": "eb53d12bf391def9",
+}
+WP7A_VALUE_DIGEST = "d09c8b4942831e3b"
+
+
+def test_the_default_path_is_byte_identical_after_wp7a():
+    """FIX_SPEC WP7a: "no default flips, no number in docs/FDR.md moves".
+
+    The digest is of the full numeric region table and the per-sample value
+    table of one deterministic run, and it was taken from ``git show
+    HEAD:Python/eiger2/core.py`` *before* the WP7a change and confirmed
+    unchanged after it -- the shipped path's arithmetic, not merely its
+    verdicts. Anything that moves a q-value, a boundary or a region edge on the
+    default rule fails here.
+
+    Re-verified on WP7b's adjudicated cutoff: this run's candidates score
+    0.0857 and 0.079, below 0.10 and below 0.12, so both were already deflated
+    at the old default and both digests are unchanged by the flip. That is the
+    no-op property this pin exists to guard.
+
+    **Two digests, because there are two execution paths.** With numba
+    installed and ``EIGER2_USE_NUMBA=1`` set -- the environment the sweeps run
+    under -- ``_pair_statistic`` accumulates in a different order and the
+    region table differs at the last bit: max abs 3.3e-16 on
+    ``statistic_mean``, 5.6e-16 on ``statistic_min``, 2.7e-15 on
+    ``region_area``, every other column, q-value and region edge bit-identical
+    (float associativity, <= 3e-15). The verdicts, the region count and the
+    per-sample value table are the same on both paths. Pinning one digest and
+    forcing its path would test an environment the sweeps do not use; comparing
+    at a tolerance would give up bit-identity where it does hold. So each path
+    is pinned against its own digest and the test asserts the active one.
+    """
+
+    matrix, locations, _truth = simulate(
+        seed=11, strata=[(0.25, 0.30), (0.10, 0.35)], replicates=2,
+        spacing=1200, dmr_length=12, n_samples=40, n_latent=2,
+        latent_loading_sd=0.07, noise_sd=0.04, layout="dense",
+    )
+    regions, values, manifest = call_dmrs(
+        matrix, locations,
+        config=Eiger2Config(window=4, null_min_lag=100, random_seed=11),
+    )
+    numeric = np.ascontiguousarray(
+        regions.select_dtypes(include=[np.number]).to_numpy(dtype=float)
+    )
+    path = (
+        "numba"
+        if _HAS_NUMBA and os.environ.get("EIGER2_USE_NUMBA") == "1"
+        else "numpy"
+    )
+    assert len(regions) == 4
+    assert int(regions["significant"].sum()) == 4
+    assert (
+        hashlib.sha256(numeric.tobytes()).hexdigest()[:16]
+        == WP7A_REGION_DIGEST[path]
+    )
+    assert hashlib.sha256(
+        np.ascontiguousarray(
+            values.select_dtypes(include=[np.number]).to_numpy(dtype=float)
+        ).tobytes()
+    ).hexdigest()[:16] == WP7A_VALUE_DIGEST
+    latent = manifest["latent_structure"]
+    assert latent["loading_concentration"] == [0.0857, 0.079]
+    assert latent["component_verdict"] == ["nuisance_deflated"] * 2
+
+
+def test_relative_rule_keeps_a_clearly_concentrated_component():
+    """A focal factor scores above the permutation-null band and is kept.
+
+    The biological shape: 1% of CpGs carry the whole loading. Its concentration
+    has to clear the concentration a direction with no structure to load on
+    reaches on the same matrix, and it does.
+    """
+
+    _, diagnostics = estimate_latent_basis(
+        _wp7a_matrix(5, diffuse_sd=0.0, focal_sd=0.5),
+        Eiger2Config(
+            deflation_rule="relative", deflation_thin=1, random_seed=5
+        ),
+    )
+    band = diagnostics["deflation_null_concentration"]
+    assert diagnostics["deflation_boundary_source"] == "permutation_null_quantile"
+    assert band["n_replicates"] == Eiger2Config().parallel_analysis_replicates
+    assert diagnostics["loading_concentration"][0] > diagnostics["deflation_boundary"]
+    assert diagnostics["component_verdict"] == ["biological_kept"]
+    assert diagnostics["n_components"] == 0
+
+
+def test_relative_rule_deflates_a_component_no_more_concentrated_than_the_null():
+    """The nuisance shape, on the same matrix, at the shipped quantile.
+
+    The component's loading is spread over every CpG, so it is not more
+    concentrated than the null quantile the run derives from its own data, and
+    it is projected out.
+    """
+
+    _, diagnostics = estimate_latent_basis(
+        _wp7a_matrix(5, diffuse_sd=0.07, focal_sd=0.5),
+        Eiger2Config(
+            deflation_rule="relative", deflation_thin=1, random_seed=5
+        ),
+    )
+    assert diagnostics["loading_concentration"][0] <= diagnostics["deflation_boundary"]
+    assert diagnostics["component_verdict"] == ["nuisance_deflated"]
+    assert diagnostics["n_components"] == 1
+
+
+def test_a_component_straddling_the_null_band_follows_the_quantile():
+    """The straddling case, and the only free parameter the rule has.
+
+    The same matrix, the same candidate: its concentration lies INSIDE the null
+    band, so the verdict is decided by where in that band the boundary is drawn.
+    That is the quantity FIX_SPEC WP7b has to choose, and it is a config field
+    rather than a constant so the choice can be re-read from the recorded band
+    without re-running.
+    """
+
+    residuals = _wp7a_matrix(5, diffuse_sd=0.07, focal_sd=0.5)
+
+    def _diagnostics(quantile: float) -> dict:
+        _, diagnostics = estimate_latent_basis(
+            residuals,
+            Eiger2Config(
+                deflation_rule="relative", deflation_thin=1, random_seed=5,
+                deflation_null_quantile=quantile,
+            ),
+        )
+        return diagnostics
+
+    high, low = _diagnostics(0.95), _diagnostics(0.05)
+    band = high["deflation_null_concentration"]
+    concentration = high["loading_concentration"][0]
+    assert band["min"] < concentration < band["max"]
+    # same concentration, same null band, opposite verdicts
+    assert low["loading_concentration"] == high["loading_concentration"]
+    assert low["deflation_null_concentration"] == band
+    assert high["component_verdict"] == ["nuisance_deflated"]
+    assert low["component_verdict"] == ["biological_kept"]
+    assert low["deflation_boundary"] < concentration < high["deflation_boundary"]
+    # the near-boundary note follows the boundary, not the shipped constant
+    assert low["near_cutoff_components"] == [{
+        "component": 0,
+        "loading_concentration": concentration,
+        "verdict": "biological_kept",
+    }]
+
+
+def test_an_explicit_component_count_overrides_either_rule():
+    """``deflate_components`` is a user override; the rule does not reopen it."""
+
+    _, diagnostics = estimate_latent_basis(
+        _wp7a_matrix(5, diffuse_sd=0.07, focal_sd=0.5),
+        Eiger2Config(
+            deflation_rule="relative", deflation_thin=1, random_seed=5,
+            deflate_components=1,
+        ),
+    )
+    assert diagnostics["method"] == "fixed"
+    assert diagnostics["n_components"] == 1
+    assert diagnostics["deflation_boundary_source"] == "deflation_max_concentration"
+    assert "deflation_null_concentration" not in diagnostics
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"deflation_rule": "self_referenced"},
+    {"deflation_null_quantile": 0.0},
+    {"deflation_null_quantile": 1.5},
+])
+def test_the_relative_rule_settings_are_validated(kwargs):
+    with pytest.raises(ValueError):
+        Eiger2Config(**kwargs)
 
 
 def test_deflation_preserves_the_missing_mask():
@@ -3727,8 +4042,6 @@ def test_scale_refusal_status_survives_call_and_csv_round_trip(
 def test_exchangeability_ratio_at_most_1_25_on_dmr_free_scenarios():
     # spec §1b.5 item 4: all five scenarios, 10 seeds. This is a correctness gate,
     # not an exploratory check -- do not reduce scenario/seed coverage for speed.
-    from benchmarking.benchmark_suite import SCENARIOS
-
     from eiger2.benchmark import simulate
     from eiger2.core import (
         centre_cpgs,
@@ -4367,8 +4680,6 @@ def test_auto_enable_fires_only_on_missingness_at_calibrated_cut():
     # script itself, not this suite, is the full 10-seed record) with
     # support_binned_threshold="auto" (the calibrated default) and asserts
     # the auto-enable decision lands correctly for every scenario x seed.
-    from benchmarking.benchmark_suite import DEFAULT_STRATA, SCENARIOS
-
     scenario_names = ["clean", "nuisance", "missingness", "small_n", "high_noise"]
     for name in scenario_names:
         params = SCENARIOS[name]
@@ -4741,8 +5052,6 @@ def test_exchangeability_ratio_at_most_1_25_under_missingness_with_binning_on():
     # 0.993, 0.887, 1.206, 0.883, median 0.993 -- also passing; that
     # configuration is ~13x slower per seed, so it is recorded in
     # task-11-report.md rather than run here.
-    from benchmarking.benchmark_suite import SCENARIOS
-
     params = {**SCENARIOS["missingness"], "missing_rate": 0.5}
     ratios = []
     for seed in range(5):
@@ -4775,8 +5084,6 @@ def test_support_stratified_fdr_reports_zero_exceedance_when_opportunity_is_real
     # not NaN), and nothing is refused. The Stage 1e aggregate floor this test
     # used to pin checked the wrong quantity (region COUNT, not OPPORTUNITY)
     # and is retired; this is the corrected outcome on the identical input.
-    from benchmarking.benchmark_suite import DEFAULT_STRATA, SCENARIOS
-
     matrix, locs, _ = simulate(
         seed=0, strata=DEFAULT_STRATA, replicates=6, spacing=400,
         **SCENARIOS["missingness"],
@@ -4825,3 +5132,68 @@ def test_support_stratified_fdr_reports_zero_exceedance_when_opportunity_is_real
     assert (regions["region_qvalue_cutoff_rank"] >= 0).all()
     assert (regions["significant"] == True).all()  # noqa: E712
     assert manifest["n_significant"] == len(regions)
+
+
+# --------------------------------------------------------------------------
+# WP2: bottom-length-stratum calibration note (FIX_SPEC §WP2)
+# --------------------------------------------------------------------------
+
+
+def _bottom_stratum_run(dmr_length: int):
+    """One calling run whose significant regions are all ``dmr_length``-ish.
+
+    A strong (0.25 prevalence, 0.4 delta) signal so every planted DMR is called
+    and significant; the only thing that varies between the two uses below is
+    the planted length, which is what decides the length stratum.
+    """
+
+    matrix, locs, _ = simulate(
+        n_samples=60, strata=[(0.25, 0.4)], replicates=15,
+        spacing=300, dmr_length=dmr_length, seed=11,
+    )
+    config = Eiger2Config(
+        window=4, null_replicates=200, random_seed=11, min_cpgs=4,
+        region_null_mode="lag", min_null_regions_for_fdr=0, m_opportunity=0,
+    )
+    return call_dmrs(matrix, locs, config=config)
+
+
+def test_bottom_stratum_counter_counts_only_short_significant_regions():
+    # FIX_SPEC §WP2: measured 6.9-15.4% realised FDR in weak-effect 4-CpG
+    # cells (docs/FDR.md, Stage 2e signal_grid). The manifest counter is what
+    # the CLI's one-per-run note reads; it must count significant regions in
+    # the "4-5" stratum and nothing else.
+    short_regions, _, short_manifest = _bottom_stratum_run(dmr_length=4)
+    long_regions, _, long_manifest = _bottom_stratum_run(dmr_length=12)
+
+    short_significant = short_regions[
+        short_regions["significant"].fillna(False)
+    ]
+    long_significant = long_regions[long_regions["significant"].fillna(False)]
+    assert len(short_significant) and len(long_significant)
+
+    # The 12-CpG run calls nothing in the bottom stratum, so the counter is
+    # recorded as zero -- present, not absent: a consumer must be able to tell
+    # "no short calls" from "never computed".
+    assert (long_significant["n_cpg"] >= 6).all()
+    assert long_manifest["fdr"]["n_significant_bottom_stratum"] == 0
+
+    assert short_manifest["fdr"]["n_significant_bottom_stratum"] == int(
+        (short_significant["n_cpg"] <= 5).sum()
+    )
+    assert short_manifest["fdr"]["n_significant_bottom_stratum"] > 0
+
+
+def test_bottom_stratum_note_changes_no_inferential_column_or_status():
+    # FIX_SPEC §WP2: this is a note, not a gate. Nothing about q-values,
+    # `significant`, or run status may depend on the counter.
+    regions, _, manifest = _bottom_stratum_run(dmr_length=4)
+    assert manifest["fdr"]["n_significant_bottom_stratum"] > 0
+    assert manifest["status"] in ("ok", "ok_with_warnings")
+    assert (
+        regions["significant"].fillna(False)
+        == (
+            (regions["region_qvalue"] <= 0.05)
+            & regions["passes_prevalence"]
+        )
+    ).all()

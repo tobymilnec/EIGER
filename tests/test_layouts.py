@@ -178,36 +178,6 @@ def test_window_eligibility_fraction_empty_input_is_nan():
     )
 
 
-def test_window_eligibility_fraction_matches_master_spec_7_corrected_numbers():
-    # Regression pin for the corrected master spec §7 / docs/MULTISCALE_BLOCKED.md
-    # figures, on the real vendored fixture (max_cpg_gap_bp=300). The original
-    # ("shelved") version of this module used a looser "run has enough CpGs
-    # somewhere" criterion that overstated eligibility (chr1 w=4: 97.2%); this
-    # pins the alignment-aware numbers that superseded it.
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parents[1] / "benchmarking" / "layouts")
-    )
-    from layouts import load_wgbs_layout
-
-    fixture = str(
-        Path(__file__).resolve().parents[1]
-        / "benchmarking" / "layouts" / "wgbs_layout_hg38.npz"
-    )
-    chr1, _ = load_wgbs_layout(fixture, chrom="chr1")
-    chr19, _ = load_wgbs_layout(fixture, chrom="chr19")
-
-    expected_chr1 = {4: 0.875, 8: 0.713, 12: 0.610}
-    expected_chr19 = {4: 0.964, 8: 0.907, 12: 0.863}
-    for w, expected in expected_chr1.items():
-        assert window_eligibility_fraction(chr1, 300, w) == pytest.approx(
-            expected, abs=5e-4
-        )
-    for w, expected in expected_chr19.items():
-        assert window_eligibility_fraction(chr19, 300, w) == pytest.approx(
-            expected, abs=5e-4
-        )
-
-
 def test_describe_layout_matches_hand_derived_numbers():
     # two runs of eligible length 3 and 1 edge (chr1: 0-2-4-6 is 3 edges; chr1
     # after a big gap: 5000-5002 is 1 edge), max_cpg_gap_bp=300
@@ -288,30 +258,3 @@ def test_realised_length_strata_exactly_at_a_boundary_includes_it():
 def test_realised_length_strata_empty_when_ceiling_below_smallest_stratum():
     assert realised_length_strata(3) == ()
     assert realised_length_strata(0) == ()
-
-
-# --------------------------------------------------------------------------
-# Stage 1d-C §2 — C.1 block permutation: real-layout run-length confirmation
-# --------------------------------------------------------------------------
-
-
-def test_c1_block_permutation_b11_applies_to_roughly_the_top_decile_of_runs():
-    # STAGE1D_C_COMPRESSED_SPEC.md §2: at the measured rho=0.503 and
-    # tolerance=0.05, Gate 1 needs b >~ 11, i.e. runs of >= 22 edges (two
-    # blocks). Pin that this is "roughly the top decile" on the real WGBS
-    # fixture, not a looser or tighter fraction.
-    import sys
-    from pathlib import Path
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parents[1] / "benchmarking" / "layouts")
-    )
-    from layouts import load_wgbs_layout
-
-    fixture = str(
-        Path(__file__).resolve().parents[1]
-        / "benchmarking" / "layouts" / "wgbs_layout_hg38.npz"
-    )
-    chr1, _ = load_wgbs_layout(fixture, chrom="chr1")
-    lengths = eligible_run_lengths(chr1, max_cpg_gap_bp=300)
-    fraction_ge_22 = float(np.mean(lengths >= 22))
-    assert 0.08 <= fraction_ge_22 <= 0.13  # "roughly the top decile"

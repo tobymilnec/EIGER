@@ -1,3 +1,14 @@
+# Content maintained in the separate eiger_paper repository
+/analysis/
+/benchmarking/
+/old_code/
+/output/
+/paper/
+/results_v201/
+/scripts/
+/specs/publication/
+/external/
+
 # Python
 __pycache__/
 *.py[cod]

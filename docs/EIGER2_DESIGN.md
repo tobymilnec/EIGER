@@ -281,7 +281,7 @@ separates them cleanly:
 | both at once | 0 | 0.081 | diffuse → deflate |
 | | 1–5 | 0.181–0.400 | concentrated → keep |
 
-`deflation_max_concentration = 0.10` implements the cut. Results with it:
+`deflation_max_concentration = 0.12` implements the cut. Results with it:
 
 | cohort | method | cell type | tumour | rare | false | K |
 |---|---|---|---|---|---|---|
@@ -296,6 +296,39 @@ original's behaviour plus the rare-subgroup gain. With a nuisance factor
 present, exactly one of five candidates is removed. Note also that the rare
 subgroup is recovered only by the *correlation* statistic — covariance misses it
 either way, which is §2.1 showing up in a realistic cohort.
+
+**Where 0.12 comes from, and what the cut is sensitive to.** The table above is
+measured on the synthetic marginal, where the two bands are far apart and the
+cutoff can sit anywhere between them. Real beta values are bimodal, and on a
+realistic marginal the *nuisance* band rises: fitted to purified leukocyte
+cell types it runs to 0.145 with a 95th percentile of 0.1146, so the original
+0.10 kept a nuisance component in 158 of 280 simulated runs and the deflation
+stage was half switched off on exactly the data type the method is for. 0.12 is
+set from both sides and nothing else (`specs/publication/FIX_SPEC.md` §WP7b):
+
+| side | measurement |
+|---|---|
+| nuisance bands it must cover | 98.6% of atlas-marginal candidates, 100% of ICGC-fitted (max 0.1095), 100% of synthetic (max 0.0850) |
+| recall it recovers | small-cohort (n = 12) recall 0.46–0.56 → 0.72–0.83 |
+| real cohorts it must not touch | immune atlas 0.1258 genome-wide (26.3 M CpGs × 36 samples), ICGC 0.1335 — both kept |
+| ruled out from above | 0.15 deflates both, and churns the ICGC significant set (Jaccard 0.328) |
+
+Two real cohorts at 0.1258 and 0.1335 is the evidence there is. It is a
+measurement on two datasets, not a guarantee about WGBS in general, and the
+margin at 0.12 is 0.0058 on the tighter of the two.
+
+**Deflation verdicts have the scope of the basis estimation.** The
+concentration is the top-1% energy share of a component fitted to the matrix in
+front of it, so the same nuisance factor scored one chromosome at a time
+scatters about ±0.05 around its genome-wide value — the immune atlas scores
+0.1074–0.1802 per chromosome against 0.1258 pooled. Estimate the basis
+genome-wide where you can; per-chromosome runs are a memory workaround, and
+their deflation verdicts carry that scatter. Either way the run tells you when
+it was close: a candidate within `DEFLATION_NEAR_CUTOFF_MARGIN` (0.02) of the
+cutoff is named in `manifest["latent_structure"]["near_cutoff_components"]` and
+in one stderr note. At 0.12 that band is (0.10, 0.14), which both real cohorts
+above sit inside — they are kept, and kept by a margin another cohort could
+close.
 
 **Why the basis is estimated on a thinned CpG set.** A second, complementary
 protection. The concentration filter stops *many* focal regions from being

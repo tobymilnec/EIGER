@@ -77,6 +77,17 @@ substantially exceeded the nominal 5% target, in genuinely null (DMR-free) data,
 | small_n | ~55–71% |
 | missingness | **~99%** |
 
+> **Not moved by the v2.2.0 deflation-cutoff change.** `deflation_max_concentration`
+> moved 0.10 -> 0.12 (FIX_SPEC §WP7b). Every number in this document is measured on
+> the synthetic marginal, whose loading-concentration band maxes at 0.0850 -- below
+> both cutoffs, so every component these runs deflated at 0.10 is deflated at 0.12
+> and none is added. This is checked rather than assumed: `tests/test_wp7b_cutoff.py`
+> asserts, over every committed artefact that records a loading concentration, that
+> only one arm (Table S2's M values, re-measured separately) has a candidate in
+> `(0.10, 0.12]`.
+> The `nuisance` scenario's name refers to a planted latent factor, not to this
+> constant.
+
 These numbers come from three mechanically independent measurement paths, all run on
 this release's code (branch `fix/region-fdr`, commit `46327e7`):
 
@@ -298,6 +309,12 @@ is above target. The `n=12` cell makes calls in only 5 of 40 runs, so its
 estimate is imprecise; the `n=20` and `n=80` results show that the limitation is
 not confined to that sparse cell. **Treat weak regions at or near `min_cpgs` as
 not yet demonstrated to be FDR-controlled, especially in small cohorts.**
+
+This is surfaced at point of use, not only here (FIX_SPEC §WP2): any run that calls a
+significant region in the bottom length stratum (`"4-5"`) records the count as
+`manifest["fdr"]["n_significant_bottom_stratum"]` and `eiger2 call` prints ONE stderr
+note per run carrying the measured range above. It is a note, not a gate --
+`region_qvalue`, `significant` and the run status are untouched by it.
 
 **Power.** `power_curve` (10 seeds x effect size 0.05-0.35 at fixed 25%
 prevalence): recall 99.4-100% and realised FDR 0-0.6% across the entire swept

@@ -28,7 +28,7 @@ Check it:
 ```bash
 eiger2 --version
 python -c "import eiger2; print(eiger2.__version__)"
-pytest -q                               # 86 tests, ~9 s
+pytest -q
 ```
 
 ### Alternative: pip only

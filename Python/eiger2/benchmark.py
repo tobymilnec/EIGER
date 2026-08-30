@@ -25,6 +25,40 @@ from .layouts import eligible_run_spans
 
 LAYOUTS = ("dense", "wgbs_real", "epic_fitted")
 
+#: Per-CpG value distributions ``simulate`` can draw from (master spec §6.2 /
+#: FIX_SPEC WP6, WP6b). ``"unimodal"`` is the marginal every prior EIGER number
+#: was produced on -- every CpG centred at 0.5 with a common ``noise_sd`` -- and
+#: stays the default, so no committed number moves. The two fitted marginals
+#: replace it with a real one measured by
+#: ``benchmarking/layouts/fit_beta_marginal.py``: per-CpG baselines drawn from a
+#: Beta mixture (bimodal, mass near 0 and 1) and per-CpG total sd targeted to the
+#: empirical sd(mu) curve (heteroscedastic, compressed at the boundaries). They
+#: differ only in whose sd(mu) they target, and together they bracket the truth:
+#:
+#: ``"bimodal_fitted"``
+#:     the ICGC cohort's *total* per-CpG sd. That total includes the real
+#:     between-sample biology a DMR caller exists to find, so it is an UPPER
+#:     bound on the nuisance level -- recall under it is a lower bound.
+#: ``"bimodal_atlas"``
+#:     within-cell-type between-donor sd across purified normal leukocytes, with
+#:     the binomial read-sampling component subtracted (FIX_SPEC WP6b). Purified
+#:     normal cell types carry no cohort substructure, so this is close to a pure
+#:     nuisance FLOOR -- recall under it is the other end of the bracket.
+MARGINALS = ("unimodal", "bimodal_fitted", "bimodal_atlas")
+
+#: The vendored fit each fitted marginal reads. Same schema either way, so
+#: ``_marginal_params`` generalises by filename alone and no other code path
+#: distinguishes them (FIX_SPEC WP6b.6).
+MARGINAL_PARAM_FILES: dict[str, str] = {
+    "bimodal_fitted": "beta_marginal_params.json",
+    "bimodal_atlas": "beta_marginal_atlas_params.json",
+}
+
+#: Clip bounds applied to every simulated matrix, whatever the marginal. Also the
+#: interval ``fit_beta_marginal.py`` clamps its fitted mean support to, so the
+#: fitted and realisable supports are the same set.
+BETA_CLIP: tuple[float, float] = (0.001, 0.999)
+
 
 def _fixture_dir() -> Path:
     """``benchmarking/layouts/`` relative to a repo checkout.
@@ -131,6 +165,76 @@ def _layout_locations(
     return locations
 
 
+def _marginal_params(marginal: str) -> dict:
+    """The vendored beta-marginal fit behind one of the fitted marginals.
+
+    Same repo-checkout-only contract as the layout fixtures (see
+    ``_fixture_dir``): the JSONs are not shipped in the wheel and the default
+    ``marginal="unimodal"`` never reads one. The two fits share a schema, so the
+    only thing that varies here is the filename (FIX_SPEC WP6b.6).
+    """
+
+    import json
+
+    path = _fixture_dir() / MARGINAL_PARAM_FILES[marginal]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found -- marginal={marginal!r} needs a full repo "
+            f"checkout with the vendored fit, not an installed wheel; produce it "
+            f"with benchmarking/layouts/fit_beta_marginal.py"
+        )
+    return json.loads(path.read_text())
+
+
+def _bimodal_baseline_mu(
+    rng: np.random.Generator, params: dict, n_cpg: int
+) -> np.ndarray:
+    """Per-CpG baseline means drawn from the fitted Beta mixture.
+
+    One component draw then one Beta draw per CpG, clamped to the fit's own
+    support (``mean_clamp``, which is ``BETA_CLIP``) so a baseline can never sit
+    outside the interval the matrix is clipped to.
+    """
+
+    mixture = params["mixture"]
+    weights = np.asarray(mixture["weights"], dtype=float)
+    a = np.asarray(mixture["a"], dtype=float)
+    b = np.asarray(mixture["b"], dtype=float)
+    component = rng.choice(len(weights), size=n_cpg, p=weights / weights.sum())
+    low, high = params.get("mean_clamp", BETA_CLIP)
+    return np.clip(rng.beta(a[component], b[component]), low, high)
+
+
+def _target_total_sd(mu: np.ndarray, params: dict) -> np.ndarray:
+    """The fitted empirical sd(mu) curve, evaluated at each CpG's baseline.
+
+    Piecewise-linear over the binned curve (``np.interp``), which is the
+    shape-preserving read of an arch-shaped, non-monotone curve -- it cannot
+    overshoot between bin centres the way an unconstrained cubic can, and needs
+    nothing beyond numpy at simulate time. Outside the fitted bin range
+    ``np.interp`` holds the end values flat, which is the intended behaviour:
+    the extreme-mu bins are exactly where the real curve is flattest.
+
+    ``sd_median`` is the binned median the fit reports, and is what the ICGC arm
+    targets. A fit MAY also publish ``sd_simulator``, and this prefers it when
+    present: the atlas arm's per-pair sd is a 3-donor variance with the binomial
+    term subtracted, so more than half its pairs clip to zero in the rail bins
+    and the median there is exactly zero -- a true statement about what 3 donors
+    resolve, and an impossible target for a simulator, which would draw those
+    CpGs as constant rows. See ``fit_beta_marginal.sd_curve`` for the estimator
+    and why it is the conservative one to have chosen. Selection is by key, not
+    by marginal name: ``beta_marginal_params.json`` carries no ``sd_simulator``
+    and is byte-identical under this branch.
+    """
+
+    curve = params["sd_curve"]
+    return np.interp(
+        mu,
+        np.asarray(curve["mu"], dtype=float),
+        np.asarray(curve.get("sd_simulator", curve["sd_median"]), dtype=float),
+    )
+
+
 def _plant_dmrs(
     matrix: np.ndarray,
     locations: pd.DataFrame,
@@ -142,8 +246,9 @@ def _plant_dmrs(
     max_cpg_gap_bp: int | None,
     rng: np.random.Generator,
     n_samples: int,
+    baseline_mu: np.ndarray,
     start_position: int = 200,
-) -> tuple[list[tuple[int, int, float, float, int, int]], int]:
+) -> tuple[list[tuple[int, int, float, float, int, int]], int, list[tuple]]:
     """Plant DMRs on the sequential (position += spacing) grid used since EIGER 2's
     first benchmark, but respecting the layout (master spec §6.1): a DMR cannot span
     an ineligible edge, so each grid position is planted inside whichever eligible run
@@ -156,6 +261,21 @@ def _plant_dmrs(
     Under ``layout="dense"`` the whole track is one eligible run at least as long as
     the grid needs, so every candidate is always plantable at its nominal
     position -- this reduces exactly to the pre-§6.1 behaviour.
+
+    **Direction (FIX_SPEC WP6.3, option (a), architect-confirmed).** The shift is
+    applied toward whichever side of the CpG's baseline has more headroom
+    (``sign = -1 if baseline_mu > 0.5 else +1``), per CpG. Under a realistic
+    bimodal marginal a ``delta = 0.35`` planted upward at a baseline of 0.9 is
+    not plantable -- the clip would silently eat most of it and recall-vs-delta
+    would stop comparing like with like across marginals. Under
+    ``marginal="unimodal"`` every baseline is exactly 0.5, so the sign is ``+1``
+    everywhere and this reduces to the previous unsigned ``+= delta * group``.
+
+    The third return value is one ``(start, end, carriers, pre_block)`` entry per
+    planted DMR, in ``truth`` order, carrying the pre-plant values of the rows it
+    touched. ``simulate`` uses it after clipping to measure what was *actually*
+    planted (``effective_delta``), which is the only honest x-axis for a
+    recall-vs-effect curve once the clip is in play.
     """
 
     spans = eligible_run_spans(locations, max_cpg_gap_bp)
@@ -164,6 +284,7 @@ def _plant_dmrs(
     n_cpg = len(locations)
 
     truth: list[tuple[int, int, float, float, int, int]] = []
+    plants: list[tuple] = []
     n_not_plantable = 0
     position = start_position
     for fraction, delta in strata:
@@ -184,13 +305,22 @@ def _plant_dmrs(
             size = max(1, int(round(fraction * n_samples)))
             group = np.zeros(n_samples)
             group[rng.choice(n_samples, size, replace=False)] = 1
-            matrix[actual_start : actual_start + dmr_length] += delta * group
+            block = slice(actual_start, actual_start + dmr_length)
+            # -1 where the baseline sits above 0.5, +1 otherwise: the shift goes
+            # toward the side with headroom. Column vector so it broadcasts per
+            # CpG against the per-sample carrier row.
+            sign = np.where(baseline_mu[block] > 0.5, -1.0, 1.0)[:, None]
+            plants.append((
+                actual_start, actual_start + dmr_length - 1,
+                group > 0, matrix[block].copy(),
+            ))
+            matrix[block] += sign * delta * group
             truth.append((
                 actual_start, actual_start + dmr_length - 1, fraction, delta,
                 run_start, run_end,
             ))
             position += spacing
-    return truth, n_not_plantable
+    return truth, n_not_plantable, plants
 
 
 def simulate(
@@ -210,7 +340,10 @@ def simulate(
     layout_chrom: str | None = "chr1",
     layout_profile: str = "chr1",
     layout_offset: int | None = None,
-) -> tuple[np.ndarray, pd.DataFrame, list[tuple[int, int, float, float, int, int]]]:
+    marginal: str = "unimodal",
+) -> tuple[
+    np.ndarray, pd.DataFrame, list[tuple[int, int, float, float, int, int, float]]
+]:
     """A CpG-by-sample matrix with latent structure and planted DMRs.
 
     ``layout`` (master spec §6.1) selects the CpG coordinate structure: ``"dense"``
@@ -220,6 +353,28 @@ def simulate(
     hg38 coordinates and a fitted targeted-panel generator, respectively -- and require
     a full repo checkout (see ``_fixture_dir``). Planted DMRs always respect the
     layout's eligibility structure; see ``_plant_dmrs``.
+
+    ``marginal`` (FIX_SPEC WP6, WP6b) selects the per-CpG VALUE distribution, the
+    other half of what the layouts replicate. ``"unimodal"`` (default) is
+    byte-identical to every prior EIGER benchmark at every seed: every CpG centred
+    at 0.5 with a common ``noise_sd``. ``"bimodal_fitted"`` and ``"bimodal_atlas"``
+    draw each CpG's baseline from a Beta mixture fitted to real data and scale
+    that CpG's noise draw and latent loading row together so its total sd matches
+    the fitted sd(mu) curve -- together, per-CpG scale factors, so the
+    noise:latent energy ratio and hence ``n_latent``'s meaning are preserved
+    exactly. The two differ only in which fit they read (see ``MARGINALS``): an
+    upper bound on the nuisance level from a cancer cohort's total sd, and a
+    nuisance floor from between-donor sd in purified normal cell types. Both need
+    the same full repo checkout the real layouts do, and both draw the same number
+    of values in the same order, so a seed's matrix depends on which fit is read
+    but never on this branch's shape.
+
+    Each truth entry is ``(start, end, fraction, delta, run_start, run_end,
+    effective_delta)``. ``effective_delta`` is the mean absolute post-clip shift
+    actually realised over the planted block's carrier entries: equal to ``delta``
+    whenever the clip did not bite (always so under ``"unimodal"`` at the deltas
+    the benchmarks use), and below it where a bimodal baseline sat close enough to
+    a boundary that part of the shift was clipped away.
     """
 
     rng = np.random.default_rng(seed)
@@ -234,19 +389,66 @@ def simulate(
     n_cpg = len(locations)  # real/fitted layouts return exactly n_cpg rows, but
                              # this keeps the matrix and locations sizes provably tied
 
-    matrix = 0.5 + rng.normal(0, noise_sd, (n_cpg, n_samples))
-    if n_latent:
-        latent = rng.normal(0, 1, (n_samples, n_latent))
-        loading = rng.normal(0, latent_loading_sd, (n_cpg, n_latent))
-        matrix += loading @ latent.T
+    if marginal not in MARGINALS:
+        raise ValueError(f"marginal must be one of {MARGINALS}, got {marginal!r}")
 
-    truth, n_not_plantable = _plant_dmrs(
+    if marginal == "unimodal":
+        # Unchanged, draw for draw, from every prior EIGER benchmark -- the
+        # bimodal branch is separate rather than a generalisation of this one
+        # precisely so no existing seed's matrix can move (see MARGINALS).
+        baseline_mu = np.full(n_cpg, 0.5)
+        matrix = 0.5 + rng.normal(0, noise_sd, (n_cpg, n_samples))
+        if n_latent:
+            latent = rng.normal(0, 1, (n_samples, n_latent))
+            loading = rng.normal(0, latent_loading_sd, (n_cpg, n_latent))
+            matrix += loading @ latent.T
+    else:
+        params = _marginal_params(marginal)
+        baseline_mu = _bimodal_baseline_mu(rng, params, n_cpg)
+        noise = rng.normal(0, noise_sd, (n_cpg, n_samples))
+        latent = rng.normal(0, 1, (n_samples, n_latent)) if n_latent else None
+        loading = (
+            rng.normal(0, latent_loading_sd, (n_cpg, n_latent)) if n_latent else None
+        )
+        # The generative total sd of CpG i is sqrt(noise_sd^2 + ||loading_i||^2):
+        # the latent factors are unit-variance and independent. Scaling the noise
+        # draw and the loading ROW by one common per-CpG factor therefore hits the
+        # fitted sd(mu_i) exactly while leaving the noise:latent energy ratio --
+        # and so the number and meaning of the latent factors -- untouched.
+        nominal_sd = np.full(n_cpg, float(noise_sd))
+        if loading is not None:
+            nominal_sd = np.sqrt(noise_sd**2 + (loading**2).sum(axis=1))
+        scale = np.where(
+            nominal_sd > 0, _target_total_sd(baseline_mu, params) / nominal_sd, 1.0
+        )
+        matrix = baseline_mu[:, None] + scale[:, None] * noise
+        if n_latent:
+            matrix += (scale[:, None] * loading) @ latent.T
+
+    truth, n_not_plantable, plants = _plant_dmrs(
         matrix, locations, strata=strata, replicates=replicates, spacing=spacing,
         dmr_length=dmr_length, max_cpg_gap_bp=max_cpg_gap_bp, rng=rng,
-        n_samples=n_samples,
+        n_samples=n_samples, baseline_mu=baseline_mu,
     )
 
-    matrix = np.clip(matrix, 0.001, 0.999)
+    matrix = np.clip(matrix, *BETA_CLIP)
+
+    # What the plant actually achieved, measured on the clipped matrix against the
+    # clipped counterfactual: |clip(pre + shift) - clip(pre)|, averaged over the
+    # block's carrier entries. Recorded per truth entry (FIX_SPEC WP6.3) so a
+    # recall-vs-effect curve can be plotted against the realised effect rather
+    # than a nominal delta the boundary may have eaten.
+    truth = [
+        entry + (
+            float(np.mean(np.abs(
+                matrix[start : end + 1][:, carriers]
+                - np.clip(pre_block[:, carriers], *BETA_CLIP)
+            ))),
+        )
+        for entry, (start, end, carriers, pre_block) in zip(
+            truth, plants, strict=True
+        )
+    ]
     if missing_rate > 0:
         # structured dropout: a per-CpG propensity, so missingness clusters
         propensity = np.clip(
@@ -258,6 +460,7 @@ def simulate(
     # (`matrix, locations, truth = simulate(...)`) stays valid. Records how often
     # the layout constrained the planting grid (master spec §6.1).
     locations.attrs["layout"] = layout
+    locations.attrs["marginal"] = marginal
     locations.attrs["n_dmrs_requested"] = n_dmr
     locations.attrs["n_dmrs_not_plantable"] = n_not_plantable
     return matrix, locations, truth

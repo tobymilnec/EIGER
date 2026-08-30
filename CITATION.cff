@@ -15,15 +15,16 @@ abstract: >-
   observed statistic's autocorrelation by construction, corrects the
   null-adequacy floor from a per-stratum to an aggregate check, exposes the
   region-level null as a command-line option with an automatic small-input
-  fallback, and removes the broken permutation null mode. Pooled realised
-  false discovery rate across measured planted-signal data is conservative
-  relative to the 5% nominal target (95% upper bound 1.6%), not evidence of
-  exact calibration.
+  fallback, and removes the broken permutation null mode. Version 2.2.0 adds
+  chromosome-aware null construction, explicit opportunity and structural
+  status reporting, prevalence diagnostics, and the revised component-
+  deflation rule. Calibration claims are conditional on the evaluated regimes;
+  refusal and partial-inference states remain explicit outputs.
 type: software
 authors:
   - family-names: Milne-Clark
     given-names: Toby
-version: "2.1.0"
+version: "2.2.0"
 license: MIT
 repository-code: "https://github.com/tobymilnec/EIGER"
 keywords:

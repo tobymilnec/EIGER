@@ -79,6 +79,99 @@ CALIBRATION_DIAGNOSTIC_NOTE = (
     "evidence of a broken null."
 )
 
+# FIX_SPEC §WP2: the label attached to a run that calls a significant region
+# in the bottom length stratum ("4-5" CpGs). Measured (docs/FDR.md, Stage 2e
+# `signal_grid`): weak-effect 4-CpG cells realise 6.9-15.4% per-run FDP
+# against a 5% nominal target -- 6.9% at n=80, 15.4% at n=20, so the gap
+# widens as the cohort shrinks. This is a NOTE, not a gate: it changes no
+# q-value, no `significant` call and no run status, it only says out loud at
+# point of use what the docs already say. Shared with cli.py so the wording
+# has one source.
+BOTTOM_STRATUM_FDR_NOTE = (
+    "Short-region calibration limitation. Regions of 4-5 CpGs carrying weak "
+    "effects realised 6.9-15.4% FDR against the 5% nominal target in the "
+    "Stage 2e signal_grid measurement (worst in small cohorts). Regions at "
+    "or near min_cpgs are not demonstrated to be FDR-controlled -- treat "
+    "them as ranked candidates. See docs/FDR.md."
+)
+
+# FIX_SPEC §WP4: the label attached to a run whose significant list contains
+# regions carried by only one or two samples. A single aberrant sample
+# deviating across a run of CpGs produces genuine adjacent correlation, so
+# such a region is not a false positive under any null -- it is simply not a
+# differentially methylated *region* in the sense usually intended. The
+# shipped `min_prevalence_samples` stays 0 (see that field's docstring for
+# the measurement that decided it), so this count is REPORTED rather than
+# filtered: a NOTE, not a gate. It changes no q-value, no `significant` call
+# and no run status. Shared with cli.py so the wording has one source.
+LOW_PREVALENCE_SAMPLE_CEILING = 2
+LOW_PREVALENCE_NOTE = (
+    "Low-prevalence regions. Some significant regions are carried by one or "
+    "two samples. Their coordination is real, but a one- or two-sample "
+    "deviation is usually an outlier or an epivariant rather than a "
+    "subgroup-defining DMR. min_prevalence_samples defaults to 0 so nothing "
+    "is hidden; pass --min-prevalence-samples 3 to drop them from "
+    "`significant` (region_qvalue is calibrated on the unfiltered set either "
+    "way, so the filter changes no q-value)."
+)
+
+# FIX_SPEC §WP6b item 2 (WP6 disposition option E): how close a candidate
+# component's loading concentration has to sit to `deflation_max_concentration`
+# before the run says so out loud. 0.02 is not a round number chosen for
+# tidiness -- it is set from the measurement that motivated the note. WP6's
+# realistic-marginal sweep found the concentration band flat in cohort size
+# under the synthetic marginal (0.084 at n = 12, 20 and 80) but cohort-size
+# dependent under a fitted one, where the n = 12 band runs 0.0880-0.1095 against
+# the shipped 0.10 cutoff and 20 of 80 runs cross it
+# (benchmarking/results_v220/bimodal_marginal/README.md). A margin of 0.02 spans
+# that band, so the one configuration where the filter was measured changing its
+# mind is caught at point of use. Like WP2's and WP4's notes this is a NOTE, not
+# a gate: it changes no verdict, no component is deflated or retained
+# differently because of it, and no run status depends on it. Shared with cli.py
+# so the wording has one source.
+#
+# WP7b moved the cutoff to 0.12 and the margin stays 0.02, so the watch band is
+# now (0.10, 0.14). That is the right window for a note whose job is to say the
+# decision was close, and it was: (0.10, 0.14) brackets every number the flip
+# was argued over -- Table S2's M arm at 0.1144-0.1199, knowingly crossed and
+# below the cutoff now; the immune atlas's genome-wide leading component at
+# 0.1258, kept with 0.0058 of headroom; ICGC's smallest at 0.1335, kept with
+# 0.0135. Both real cohorts therefore now emit this note, which is the intended
+# reading: they are kept, and they are kept by a margin a different cohort could
+# close. A run inside the band is one whose deflation verdict WP7b's evidence
+# pack could not settle from the outside.
+DEFLATION_NEAR_CUTOFF_MARGIN = 0.02
+NEAR_CUTOFF_CONCENTRATION_NOTE = (
+    "Deflation decision near its cutoff. One or more candidate components have "
+    "a loading concentration within "
+    f"{DEFLATION_NEAR_CUTOFF_MARGIN} of deflation_max_concentration, so a small "
+    "change in the data would flip whether they are treated as nuisance and "
+    "projected out. The concentration is an absolute cutoff on a quantity whose "
+    "scale depends on the data's marginal, its units and the cohort size, and "
+    "the measured near-cutoff band is a small-cohort effect (n = 12). Nothing "
+    "is wrong with this run; check the reported concentrations against "
+    "deflation_max_concentration before treating the deflation verdict as "
+    "settled."
+)
+
+# FIX_SPEC §WP7a item 2: the same note under `deflation_rule="relative"`, where
+# the boundary is the run's own permutation-null quantile rather than the
+# shipped constant, so the absolute wording ("an absolute cutoff", the constant
+# named) would be wrong. Same margin, same NOTE-not-gate contract, separate
+# wording so the absolute path's stderr text is unchanged to the byte.
+NEAR_BOUNDARY_CONCENTRATION_NOTE = (
+    "Deflation decision near its boundary. One or more candidate components "
+    "have a loading concentration within "
+    f"{DEFLATION_NEAR_CUTOFF_MARGIN} of the permutation-null boundary this run "
+    "derived (deflation_rule='relative'), so a small change in the data would "
+    "flip whether they are treated as nuisance and projected out. The boundary "
+    "moves with the data's marginal, its units and the cohort size by "
+    "construction, so a near-boundary component is a genuinely marginal "
+    "component rather than a scale artefact. Nothing is wrong with this run; "
+    "check the reported concentrations against the recorded boundary and its "
+    "null band before treating the deflation verdict as settled."
+)
+
 _DEFAULT_SUPPORT_DISPERSION_CUT = 0.5
 # Measured across standard benchmark scenarios: with no missingness, support
 # dispersion is structurally 0 (every eligible window has full support, so the
@@ -123,19 +216,122 @@ class Eiger2Config:
     represented. Estimating the basis on *all* CpGs deletes focal signal.
     """
 
-    deflation_max_concentration: float = 0.10
+    deflation_max_concentration: float = 0.12
     """Only project out components whose genomic loading is DIFFUSE.
 
     A nuisance factor (purity, composition, batch) loads on the whole genome;
     a biological subgroup (cell type, tumour status, a rare clone) loads on
     marker regions. The fraction of a component's loading energy in the top
-    1% of CpGs separates them cleanly: nuisance components score 0.08-0.09,
-    biological components 0.15-0.40. Without this filter, blind deflation
-    deletes exactly the signal EIGER exists to find -- on a cohort of 4 cell
-    types plus tumour status plus a rare subgroup, parallel analysis selects
-    K=5 and recovery collapses from 70/70 regions to 0/70. Set to 1.0 to
-    disable the filter and deflate every component.
+    1% of CpGs separates them cleanly: on the synthetic marginal nuisance
+    components score 0.08-0.09 and biological components 0.15-0.40. Without
+    this filter, blind deflation deletes exactly the signal EIGER exists to
+    find -- on a cohort of 4 cell types plus tumour status plus a rare
+    subgroup, parallel analysis selects K=5 and recovery collapses from 70/70
+    regions to 0/70. Set to 1.0 to disable the filter and deflate every
+    component.
+
+    **0.12, and it is a measured sandwich rather than a round number**
+    (FIX_SPEC WP7b, adjudicated 2026-08-28). The separation above is a
+    synthetic-marginal statement; on a realistic bimodal marginal the nuisance
+    band rises into the old 0.10 cutoff and the filter half-fires -- median
+    0.0996 on the atlas marginal, 158 of 280 runs with a nuisance component
+    the cutoff kept -- which is a deflation stage switched off on exactly the
+    data the tool is for. The constant is set from both sides:
+
+    - *From below, the simulated nuisance bands it has to cover:* 0.12 covers
+      98.6% of the atlas-marginal candidates (max 0.1450, q95 0.1146), 100% of
+      ``bimodal_fitted`` (max 0.1095) and 100% of ``unimodal`` (max 0.0850).
+      At 0.10 the atlas figure is 51.6%, with 117 of 280 runs deflating
+      nothing at all; at 0.12 no run deflates nothing, and small-cohort recall
+      recovers from 0.46-0.56 to 0.72-0.83
+      (``benchmarking/results_v220/bimodal_marginal/``).
+    - *From above, the real cohorts it must not touch:* measured at deployment
+      scope -- one whole-genome basis -- the immune atlas scores its leading
+      component at 0.1258 (26.3 M CpGs x 36 samples,
+      ``benchmarking/atlas_genome_deflation.py``) and ICGC at 0.1335 (WP3).
+      Neither deflates at 0.12. A cutoff that reaches them (0.15) churns the
+      ICGC significant set (Jaccard 0.328), which brackets the range from
+      above. Two cohorts is the evidence there is; it is a measurement, not a
+      guarantee about WGBS in general.
+    - *Knowingly crossed:* one committed synthetic artefact sits inside the
+      move -- Table S2's M-value arm, candidates 0.1144-0.1199, whose
+      recall collapse *is* its deflation column. The beta-vs-M comparison is
+      therefore cutoff-conditional and was re-measured at 0.12, with the 0.10
+      generation kept as the record of why the constant moved (WP7b item 3).
+      An audit of all committed artefacts recording a concentration found no
+      other crossing (``benchmarking/cutoff_audit.py``,
+      ``tests/test_wp7b_cutoff.py``).
+
+    **Deflation verdicts have the scope of the basis estimation.** The
+    concentration is the top-1% energy share of a component fitted to the
+    matrix in front of it, so the same nuisance factor scored per chromosome
+    scatters about +/-0.05 around its genome-wide value (the atlas cohort:
+    0.1074-0.1802 per chromosome, 0.1258 pooled). Genome-scope basis
+    estimation is the recommended deployment; chromosome-scope runs are a
+    memory workaround whose verdicts carry that scatter, and
+    ``DEFLATION_NEAR_CUTOFF_MARGIN`` is the point-of-use guard either way.
     """
+
+    deflation_rule: str = "absolute"
+    """Where the nuisance/biology boundary comes from (FIX_SPEC WP7a).
+
+    ``"absolute"`` (default, and the only rule any committed number was
+    produced under): the boundary is the constant ``deflation_max_concentration``
+    above. ``"relative"``: the boundary is the
+    ``deflation_null_quantile``-th quantile of the loading concentration of
+    components fitted to the SAME permutation ensemble parallel analysis
+    already draws for its rank test -- so it is referenced to the run's own
+    data rather than to a constant.
+
+    The option exists because the constant was measured non-invariant from four
+    independent directions. On the ICGC cohort every candidate component scores
+    0.1335-0.2707, so the shipped cutoff deflates nothing on the paper's own
+    real-data application (WP3); the concentration is not invariant to a
+    monotone rescaling of the input (WP5, the logit); not invariant to the
+    data's marginal, and under a realistic marginal not invariant to cohort
+    size (WP6); and on the atlas marginal the nuisance band straddles the
+    cutoff -- median 0.0996, 158 of 280 runs crossing -- so the filter
+    half-fires, and holding it on recovers small-cohort recall from 0.46-0.56
+    to 0.72-0.83 (WP6b,
+    ``benchmarking/results_v220/bimodal_marginal/atlas/README.md``). A
+    permutation-null boundary moves with the marginal, the units and the cohort
+    size because the candidates and the null are fitted on the same matrix.
+
+    ``"relative"`` is measure-only in v2.2.0: the default is unchanged, every
+    committed number stands, and whether the default should flip is a separate
+    decision taken on WP7a's evidence pack (FIX_SPEC WP7b). The rule is inert
+    when ``deflate_components`` is set explicitly, which overrides the filter
+    entirely under either rule.
+
+    **Measured, and not currently usable as a default.** On the signal grid the
+    rule deflates almost nothing and recall collapses
+    (``benchmarking/results_v220/deflation_rule/README.md``). The reason is
+    structural rather than a matter of tuning ``deflation_null_quantile``: a
+    candidate is the maximiser of loading concentration on the matrix it is
+    scored on, while a null component is fitted where locality is broken and is,
+    on that matrix, an arbitrary direction -- which cannot reach the maximiser's
+    concentration. The candidate therefore sits above its own null at every
+    rank, and a quantile of the null cannot rise above the candidates it is
+    meant to classify. Measured on a grid-shaped matrix: two genuine
+    genome-wide nuisance factors at 0.0807 and 0.0833 against a null q0.95 of
+    0.0782, both deflated by the shipped 0.10 cutoff and neither by this rule.
+    Kept as a measured negative result and as the scaffolding for whatever
+    boundary WP7b settles on, not as a recommendation.
+    """
+
+    deflation_null_quantile: float = 0.95
+    """Quantile of the permutation-null concentration distribution that becomes
+    the boundary under ``deflation_rule="relative"``. Inert under
+    ``"absolute"``.
+
+    A candidate is classified nuisance when it is no more concentrated than
+    this quantile of components fitted where locality is broken -- i.e. when its
+    genomic loading is not distinguishable from a direction with no structure to
+    load on. 0.95 is the starting value FIX_SPEC WP7a specifies; the ensemble it
+    is read on is ``parallel_analysis_replicates`` permutations x the candidate
+    rank, so at the shipped 5 replicates it sits near the top of a small band,
+    and the whole band is recorded in the manifest so the choice can be re-read
+    without re-running."""
 
     deflation_concentration_quantile: float = 0.01
     deflation_max_components: int = 20
@@ -325,9 +521,33 @@ class Eiger2Config:
     applied after calibration and reported separately: ``region_qvalue`` is
     calibrated on the unfiltered set, ``minority_size_descriptive`` records the
     size of the deviating group, and ``significant`` requires both the q-value
-    and this floor. Setting it to 0 disables the filter. Three is a reasonable
-    starting value; it is exactly analogous to requiring a fold-change floor
-    alongside a p-value in differential expression.
+    and this floor. Setting it to 0 disables the filter. It is exactly analogous
+    to requiring a fold-change floor alongside a p-value in differential
+    expression.
+
+    **0, not 3, and measured** (FIX_SPEC WP4;
+    ``benchmarking/results_v220/prevalence_default/``). Both settings were run
+    over the full 280-cell ``signal_grid`` and over the ICGC cohort. In 10 of
+    the 14 cells a floor of 3 costs exactly nothing -- mean recall is identical
+    to the last decimal, because their planted subgroups are 4 samples or
+    larger. In the four two-carrier-floor cells (prevalence 2/n, the smallest
+    prevalence the grid plants) it costs 91.4-94.3 recall POINTS: mean recall
+    0.99-1.00 falls to 0.05-0.09. Pooled over all 280 runs the floor removes
+    641 of 2,051 significant calls but only 3 of the 90 false ones -- 638 true
+    calls per 3 false -- so the mean per-run false discovery proportion RISES
+    from 6.2% to 11.7%.
+
+    On ICGC the same floor drops 1,980 of 81,979 significant regions (2.4%),
+    and 1,973 of those 1,980 already carry ``biological_class ==
+    "rare_epivariant"`` under ``biological_support_policy="five_class_v1"`` --
+    the descriptive policy already labels them, at higher resolution than a hard
+    floor and without removing anything.
+
+    So the default stays 0 and ``eiger2 call`` instead reports how many
+    significant regions are carried by one or two samples (see
+    ``LOW_PREVALENCE_NOTE``). Set this to 3 when the analysis genuinely
+    concerns subgroup-defining regions and rare epivariants are noise; do not
+    set it on a cohort whose minority groups may be at the two-carrier floor.
     """
 
     min_sample_fraction: float = 0.0
@@ -504,6 +724,10 @@ class Eiger2Config:
             raise ValueError("deflation_thin must be at least 1")
         if self.deflation_missing not in {"impute", "exact"}:
             raise ValueError("deflation_missing must be 'impute' or 'exact'")
+        if self.deflation_rule not in {"absolute", "relative"}:
+            raise ValueError("deflation_rule must be 'absolute' or 'relative'")
+        if not 0.0 < self.deflation_null_quantile <= 1.0:
+            raise ValueError("deflation_null_quantile must lie in (0, 1]")
         if not 0.5 < self.null_quantile < 1.0:
             raise ValueError("null_quantile must lie in (0.5, 1)")
         if self.null_replicates < 1:
@@ -595,6 +819,38 @@ def _fill_rows(residuals: np.ndarray) -> np.ndarray:
     return filled
 
 
+def _loading_concentration(
+    filled: np.ndarray, directions: np.ndarray, quantile: float
+) -> np.ndarray:
+    """Share of each direction's genomic loading energy in its top CpGs.
+
+    ``filled`` is the mean-filled residual matrix, ``directions`` a ``(K,
+    n_samples)`` block of orthonormal sample-space rows. A nuisance factor
+    (purity, composition, batch) spreads its loading over the whole genome and
+    scores low; a biological subgroup concentrates it in marker regions and
+    scores high. See ``Eiger2Config.deflation_max_concentration`` for the
+    measured separation.
+
+    Factored out of ``estimate_latent_basis`` for FIX_SPEC WP7a: the relative
+    rule's boundary is only meaningful if the permutation-null directions are
+    scored by exactly the routine that scores the candidates, on exactly the
+    same matrix. Sharing the code is the guarantee; the arithmetic is unchanged
+    from the pre-WP7a inline loop, so the absolute path's concentrations are
+    identical to the bit.
+    """
+
+    loadings = filled @ directions.T
+    top_n = max(1, int(round(quantile * loadings.shape[0])))
+    concentration = np.empty(directions.shape[0], dtype=float)
+    for component in range(directions.shape[0]):
+        energy = loadings[:, component] ** 2
+        total = energy.sum()
+        concentration[component] = (
+            float(np.sort(energy)[-top_n:].sum() / total) if total > 0 else 1.0
+        )
+    return concentration
+
+
 def estimate_latent_basis(
     residuals: np.ndarray, config: Eiger2Config
 ) -> tuple[np.ndarray, dict]:
@@ -667,6 +923,15 @@ def estimate_latent_basis(
 
     _, singular, right = np.linalg.svd(thinned, full_matrices=False)
 
+    # FIX_SPEC §WP7a item 2: under deflation_rule="relative" the boundary is read
+    # off the SAME permutation ensemble the rank test already draws, so the null
+    # components' directions have to be kept as well as their singular values.
+    # Kept only when that rule is in force: under "absolute" the SVD call, its
+    # LAPACK driver and therefore every committed number are untouched, and the
+    # rng is consumed identically either way (the permutations are drawn before
+    # the branch, in the same order, whatever is done with them afterwards).
+    relative = config.deflation_rule == "relative"
+    null_directions: list[np.ndarray] = []
     if config.deflate_components is not None:
         n_components = int(min(config.deflate_components, max_components))
         diagnostics["method"] = "fixed"
@@ -679,7 +944,14 @@ def estimate_latent_basis(
             permuted = np.empty_like(thinned)
             for column in range(n_samples):
                 permuted[:, column] = rng.permutation(thinned[:, column])
-            null_singular[replicate] = np.linalg.svd(permuted, compute_uv=False)
+            if relative:
+                _, null_values, null_right = np.linalg.svd(
+                    permuted, full_matrices=False
+                )
+                null_singular[replicate] = null_values
+                null_directions.append(null_right)
+            else:
+                null_singular[replicate] = np.linalg.svd(permuted, compute_uv=False)
         cutoff = np.quantile(
             null_singular, config.parallel_analysis_quantile, axis=0
         )
@@ -700,26 +972,85 @@ def estimate_latent_basis(
     # concentrates it in marker regions and must not be deflated away.
     candidates = np.ascontiguousarray(right[:n_components])
     filled_full = _fill_rows(residuals)
-    loadings = filled_full @ candidates.T
     quantile = config.deflation_concentration_quantile
-    top_n = max(1, int(round(quantile * loadings.shape[0])))
-    concentration = np.empty(n_components, dtype=float)
-    for component in range(n_components):
-        energy = loadings[:, component] ** 2
-        total = energy.sum()
-        concentration[component] = (
-            float(np.sort(energy)[-top_n:].sum() / total) if total > 0 else 1.0
+    concentration = _loading_concentration(filled_full, candidates, quantile)
+
+    # The boundary the concentrations are read against. Under "absolute" it is
+    # the shipped constant, so this whole block reduces to the pre-WP7a
+    # comparison; under "relative" it is a quantile of the concentration of
+    # components fitted where locality is broken -- the same directions the rank
+    # test permuted, scored through the same routine on the same residual
+    # matrix, so candidate and null differ in exactly one thing: whether the
+    # sample-space direction was fitted to real structure or to permuted noise.
+    boundary = float(config.deflation_max_concentration)
+    boundary_source = "deflation_max_concentration"
+    null_concentration = np.array([], dtype=float)
+    if relative and null_directions:
+        null_concentration = np.concatenate([
+            _loading_concentration(
+                filled_full,
+                np.ascontiguousarray(null_right[:n_components]),
+                quantile,
+            )
+            for null_right in null_directions
+        ])
+        boundary = float(
+            np.quantile(null_concentration, config.deflation_null_quantile)
         )
+        boundary_source = "permutation_null_quantile"
+
     if config.deflate_components is not None:
         # an explicit K is a user override; report the verdicts but honour it
         diffuse = np.ones(n_components, dtype=bool)
     else:
-        diffuse = concentration <= config.deflation_max_concentration
+        diffuse = concentration <= boundary
     diagnostics["loading_concentration"] = concentration.round(4).tolist()
     diagnostics["component_verdict"] = [
         "nuisance_deflated" if flag else "biological_kept" for flag in diffuse
     ]
     diagnostics["n_components"] = int(diffuse.sum())
+    # FIX_SPEC §WP6b item 2: every candidate sitting within
+    # DEFLATION_NEAR_CUTOFF_MARGIN of the cutoff, on either side, named with its
+    # concentration and the cutoff it is near. Recorded on every run that gets as
+    # far as scoring candidates, empty list included, so a consumer can tell
+    # "none near the cutoff" from "not computed". The verdict travels with each
+    # entry because the note is about the decision being marginal, not about
+    # which way it went.
+    diagnostics["deflation_max_concentration"] = float(
+        config.deflation_max_concentration
+    )
+    diagnostics["deflation_near_cutoff_margin"] = DEFLATION_NEAR_CUTOFF_MARGIN
+    # FIX_SPEC §WP7a item 2: the realised boundary is recorded exactly as the
+    # absolute path records its cutoff, plus -- under the relative rule -- the
+    # null band it was read off, so a consumer can re-read the decision at
+    # another quantile without re-running. Under "absolute" `deflation_boundary`
+    # equals `deflation_max_concentration` by construction and the null band is
+    # absent, so the two paths' manifests differ only where they genuinely do.
+    diagnostics["deflation_rule"] = config.deflation_rule
+    diagnostics["deflation_boundary"] = float(boundary)
+    diagnostics["deflation_boundary_source"] = boundary_source
+    if null_concentration.size:
+        diagnostics["deflation_null_quantile"] = float(
+            config.deflation_null_quantile
+        )
+        diagnostics["deflation_null_concentration"] = {
+            "n": int(null_concentration.size),
+            "n_replicates": int(len(null_directions)),
+            "min": float(null_concentration.min()),
+            "median": float(np.median(null_concentration)),
+            "max": float(null_concentration.max()),
+        }
+    diagnostics["near_cutoff_components"] = [
+        {
+            "component": int(index),
+            "loading_concentration": float(round(value, 4)),
+            "verdict": (
+                "nuisance_deflated" if diffuse[index] else "biological_kept"
+            ),
+        }
+        for index, value in enumerate(concentration)
+        if abs(float(value) - boundary) <= DEFLATION_NEAR_CUTOFF_MARGIN
+    ]
     if not diffuse.any():
         return np.empty((0, n_samples), dtype=float), diagnostics
     return np.ascontiguousarray(candidates[diffuse]), diagnostics
@@ -4879,10 +5210,39 @@ def call_dmrs(
     else:
         manifest["status"] = "ok"
     manifest["n_significant"] = int(region_frame["significant"].sum())
+    # FIX_SPEC §WP2: how many of those significant calls sit in the bottom
+    # length stratum, the one length x effect regime measured off target (see
+    # BOTTOM_STRATUM_FDR_NOTE). Recorded on every run that reaches the FDR
+    # path, zero included, so a consumer can tell "none" from "not computed";
+    # `significant` is a nullable boolean, so a refused stratum's pd.NA is
+    # filled to False rather than truth-tested.
+    manifest["fdr"]["n_significant_bottom_stratum"] = int(
+        (
+            region_frame["significant"].fillna(False)
+            & region_frame["n_cpg"].map(
+                lambda n: length_stratum(int(n)) == "4-5"
+            )
+        ).sum()
+    )
     manifest["n_passing_qvalue"] = int(
         (region_frame["region_qvalue"] <= config.target_fdr).sum()
     )
     manifest["n_passing_prevalence"] = int(region_frame["passes_prevalence"].sum())
+    # FIX_SPEC §WP4: how many significant calls are carried by only one or two
+    # samples -- what the CLI's one-per-run note reads (LOW_PREVALENCE_NOTE).
+    # Recorded on every run that reaches the FDR path, zero included, so a
+    # consumer can tell "none" from "not computed". Counted against the
+    # *significant* set, so raising `min_prevalence_samples` above the ceiling
+    # empties it by construction and the note falls silent, which is correct:
+    # the user has already acted on it.
+    manifest["n_significant_low_prevalence"] = int(
+        (
+            region_frame["significant"].fillna(False)
+            & region_frame["minority_size_descriptive"].between(
+                1, LOW_PREVALENCE_SAMPLE_CEILING
+            )
+        ).sum()
+    )
     manifest["biological_support"] = {
         "policy": support_policy_manifest,
         "diagnostics_file": (

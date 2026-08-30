@@ -38,15 +38,12 @@ package-dir = { "" = "Python" }
 
 [tool.setuptools.packages.find]
 where = ["Python"]
-# Only the library ships. The benchmark harness (benchmarking/), the superseded
-# 2026 beta (old_code/) and the cohort-specific analysis scripts (scripts/) are
-# in the repository for review and reproducibility but are not installed.
+# Only the runtime library and the original implementation used by --legacy ship.
+# Paper analyses, benchmark harnesses, and large fixtures live in eiger_paper.
 include = ["eiger2*", "functions*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# old_code/tests covers the superseded beta and is run explicitly:
-#   pytest old_code/tests
 filterwarnings = [
     "error::RuntimeWarning",
     # scipy's own internal advisory from stats.ttest_ind's variance calculation
@@ -73,12 +70,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Superseded code and the benchmark harness are kept verbatim for
-# reproducibility and are not held to the shipped package's lint standard.
-"old_code/**" = ["ALL"]
 # The published 2023 implementation, invoked verbatim by --legacy. It is the
 # baseline the revised method is compared against and is deliberately NOT
 # reformatted: any edit here would weaken the claim that --legacy runs the
 # original code rather than a paraphrase of it.
 "Python/functions/**" = ["ALL"]
-"benchmarking/**" = ["E501", "F401", "B023", "C408", "E402", "E731", "B905"]

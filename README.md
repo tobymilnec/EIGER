@@ -186,37 +186,28 @@ Python/eiger2/        Installable EIGER2 package, including the core caller,
 
 Python/functions/     Original EIGER implementation used by --legacy
 
-benchmarking/         Benchmarking and validation framework, the real hg38 CpG
-                      layout fixture, and generated benchmark outputs
-
-old_code/             Superseded EIGER2 beta implementation, retained with its
-                      tests and review scripts for transparency
-
-scripts/              Cohort-specific analysis scripts that are not part of
-                      the installable package
-
-analysis/             Exact commands and analyses underlying the reported
-                      validation results
-
 examples/             Example dataset generator and runnable input files
 
 tests/                Tests for the current installable package
 
-docs/                 Method design, validation results, and statistical notes
+docs/                 Method design and statistical notes
 ```
 
-Only `Python/eiger2` and `Python/functions` are installed as package code. The benchmarking framework, superseded beta implementation, and cohort-specific analyses are retained for review and reproducibility but are not shipped as part of the library.
+Only `Python/eiger2` and `Python/functions` are installed as package code. The
+paper analyses, benchmark harnesses, large fixtures, and generated evidence are
+maintained separately in the `eiger_paper` repository.
 
 ```bash
 pytest tests -q
-pytest old_code/tests -q
 ```
 
-At the time of writing (v2.2.0), the current package contains 326 tests and the superseded beta implementation contains 27 tests.
+The CI workflow runs this software-only suite on every supported Python version.
 
 ---
 
 ## Outputs
+
+> **Note (v2.2.0):** `deflation_max_concentration` moved 0.10 → 0.12, so a component scoring in (0.10, 0.12] is now treated as nuisance and projected out. Results are unchanged on both real cohorts the method has been run on (leading components 0.1258 and 0.1335) and on every synthetic grid the docs cite; what changes is behaviour on bimodal marginals, where the filter previously half-fired. No output column, schema or file changed — `schema_version` is unchanged. See [`deflation_max_concentration`](#deflation_max_concentration) below.
 
 > **Migration note (v2.1.0):** results from v2.0.0 and v2.0.1 are **void and must be regenerated.** The region-level null was replaced, which changes the edge threshold, the set of candidate regions, their areas, and every FDR column. Region *identifiers* are therefore not comparable across versions either. The edge statistic itself, the eligibility mask, and the latent-structure removal are unchanged.
 
@@ -261,6 +252,60 @@ The provisional classification is opt-in with
 `biological_class` missing, constructs no diagnostics table, writes no diagnostics
 file and preserves discovery runtime. See the support document for the candidate-label
 and performance limitations.
+
+### `--min-prevalence-samples`
+
+```bash
+eiger2 call --betas betas.tsv --locations cpgs.bed --out results/ \
+    --min-prevalence-samples 3
+```
+
+Minimum number of samples that must carry a region's deviation for it to be
+`significant`. **The default is 0 (off), and that is a measured decision, not an
+omission.** A one- or two-sample deviation across a run of CpGs is genuinely
+coordinated — it is not a false positive under any null — it is simply not a
+subgroup-defining DMR. Raising the floor to 3 was measured on the full 280-run
+`signal_grid` and on the 519-sample ICGC cohort
+(`benchmarking/results_v220/prevalence_default/`):
+
+- in 10 of the 14 grid cells it costs nothing at all — mean recall identical to
+  the last decimal, because their planted subgroups are 4 samples or larger;
+- in the four cells whose planted subgroup is exactly two samples it costs
+  **91.4–94.3 recall points** (mean recall 0.99–1.00 → 0.05–0.09);
+- pooled over all 280 runs it removes 641 of 2,051 significant calls but only 3
+  of the 90 false ones, so mean per-run FDP **rises** from 6.2% to 11.7%;
+- on ICGC it drops 1,980 of 81,979 significant regions (2.4%), of which 1,973
+  are already labelled `rare_epivariant` by
+  `--biological-support-policy five_class_v1`.
+
+So the floor stays off and `eiger2 call` instead prints one note per run naming
+how many significant regions are carried by one or two samples. Set it to 3 when
+the analysis genuinely concerns subgroup-defining regions; do not set it on a
+cohort whose minority groups may be at the two-carrier floor. `region_qvalue` is
+calibrated on the unfiltered set either way, so the setting changes no q-value.
+
+### `deflation_max_concentration`
+
+| Setting | Default | Effect |
+|---|---|---|
+| `deflation_max_concentration` | `0.12` | Only components whose loading energy is DIFFUSE are projected out. A component's *loading concentration* is the fraction of its loading energy in the top 1% of CpGs; at or below the cutoff it is `nuisance_deflated`, above it `biological_kept`. Set to `1.0` to deflate every component, or set `deflate_components` explicitly to bypass the filter. |
+| `DEFLATION_NEAR_CUTOFF_MARGIN` | `0.02` | Not a setting: a note. Any candidate within 0.02 of the cutoff — the band (0.10, 0.14) — is named in `manifest["latent_structure"]["near_cutoff_components"]` and in one stderr line. It changes no verdict and no q-value. |
+
+**0.12 is measured on both sides** (raised from 0.10 in v2.2.0). Below it, the
+simulated nuisance bands the filter must cover: 98.6% of candidates on a
+leukocyte-fitted bimodal marginal, 100% on an ICGC-fitted one, 100% on the
+synthetic one, and small-cohort recall recovering from 0.46–0.56 to 0.72–0.83.
+Above it, the real cohorts it must not touch: the immune atlas scores its
+leading component at 0.1258 genome-wide and ICGC at 0.1335, both kept, while a
+cutoff of 0.15 deflates both and churns the ICGC significant set. Full evidence
+in **[docs/EIGER2_DESIGN.md](docs/EIGER2_DESIGN.md)**.
+
+**Deflation verdicts have the scope of the basis estimation.** The same
+nuisance factor scored one chromosome at a time scatters about ±0.05 around its
+genome-wide value (immune atlas: 0.1074–0.1802 per chromosome, 0.1258 pooled).
+Estimate the basis genome-wide where memory allows; per-chromosome runs are a
+workaround whose deflation verdicts carry that scatter. Always check
+`manifest["latent_structure"]["component_verdict"]`.
 
 ### `--fdr-decision {point,upper}`
 

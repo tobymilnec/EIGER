@@ -447,3 +447,155 @@ def test_command_compare_handles_a_regions_csv_mixing_available_and_unavailable(
     # the False row and both pd.NA rows are excluded, not counted as hits.
     assert summary["A_regions"].iloc[0] == 1
     assert summary["B_regions"].iloc[0] == 1
+
+
+def _bottom_stratum_cli_run(monkeypatch, tmp_path, capsys, n_cpgs, n_bottom):
+    """Run `eiger2 call` over a canned region table of the given CpG counts."""
+
+    matrix = np.full((5, 5), 0.5)
+    locations = pd.DataFrame(
+        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
+    )
+    regions = pd.DataFrame({
+        "region_id": [f"r{i}" for i in range(len(n_cpgs))],
+        "n_cpg": list(n_cpgs),
+        "region_qvalue": [0.01] * len(n_cpgs),
+        "significant": pd.array([True] * len(n_cpgs), dtype="boolean"),
+        "coordination_significant": pd.array(
+            [True] * len(n_cpgs), dtype="boolean"
+        ),
+        "biological_class": [None] * len(n_cpgs),
+    })
+    caller_manifest = {
+        "status": "ok",
+        "gates": {"structural": {}},
+        "fdr": {"n_significant_bottom_stratum": n_bottom},
+        "layout": {}, "null": {}, "n_regions": len(n_cpgs),
+        "biological_support": {
+            "policy": {"name": "off"}, "diagnostics_file": None,
+        },
+    }
+    monkeypatch.setattr(
+        cli, "_resolve_inputs",
+        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
+    )
+    monkeypatch.setattr(
+        cli, "call_dmrs",
+        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
+    )
+    out = tmp_path / f"bottom_{n_bottom}"
+    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
+    return capsys.readouterr()
+
+
+def _near_cutoff_cli_run(monkeypatch, tmp_path, capsys, latent_structure):
+    """Run `eiger2 call` over a canned manifest carrying the given diagnostics."""
+
+    matrix = np.full((5, 5), 0.5)
+    locations = pd.DataFrame(
+        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
+    )
+    regions = pd.DataFrame({
+        "region_id": ["r0"],
+        "n_cpg": [12],
+        "region_qvalue": [0.01],
+        "significant": pd.array([True], dtype="boolean"),
+        "coordination_significant": pd.array([True], dtype="boolean"),
+        "biological_class": [None],
+    })
+    caller_manifest = {
+        "status": "ok",
+        "gates": {"structural": {}},
+        "fdr": {"n_significant_bottom_stratum": 0},
+        "layout": {}, "null": {}, "n_regions": 1,
+        "latent_structure": latent_structure,
+        "biological_support": {
+            "policy": {"name": "off"}, "diagnostics_file": None,
+        },
+    }
+    monkeypatch.setattr(
+        cli, "_resolve_inputs",
+        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
+    )
+    monkeypatch.setattr(
+        cli, "call_dmrs",
+        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
+    )
+    out = tmp_path / "near_cutoff"
+    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
+    return capsys.readouterr()
+
+
+def test_near_cutoff_note_names_the_component_its_concentration_and_the_cutoff(
+    monkeypatch, tmp_path, capsys,
+):
+    # FIX_SPEC WP6b item 2: exactly ONE run-level note, naming which candidate
+    # is near, where it sits, and what it is near -- a user cannot act on
+    # "something was close" without all three.
+    captured = _near_cutoff_cli_run(
+        monkeypatch, tmp_path, capsys,
+        latent_structure={
+            "n_candidates": 2,
+            "loading_concentration": [0.0843, 0.0960],
+            "component_verdict": ["nuisance_deflated", "nuisance_deflated"],
+            "n_components": 2,
+            "deflation_max_concentration": 0.10,
+            "deflation_near_cutoff_margin": 0.02,
+            "near_cutoff_components": [{
+                "component": 1,
+                "loading_concentration": 0.0960,
+                "verdict": "nuisance_deflated",
+            }],
+        },
+    )
+    assert captured.err.count("Deflation decision near its cutoff") == 1
+    assert "1 of 2 candidate component(s)" in captured.err
+    assert "component 1 at 0.0960 (nuisance_deflated)" in captured.err
+    assert "0.02 of the 0.1 cutoff" in captured.err
+
+
+def test_near_cutoff_note_is_silent_when_no_component_is_near_the_cutoff(
+    monkeypatch, tmp_path, capsys,
+):
+    # FIX_SPEC WP6b item 2: an empty list is recorded on every run, and an empty
+    # list must not print -- the note is only informative when it is rare.
+    captured = _near_cutoff_cli_run(
+        monkeypatch, tmp_path, capsys,
+        latent_structure={
+            "n_candidates": 2,
+            "loading_concentration": [0.0640, 0.3100],
+            "component_verdict": ["nuisance_deflated", "biological_kept"],
+            "n_components": 1,
+            "deflation_max_concentration": 0.10,
+            "deflation_near_cutoff_margin": 0.02,
+            "near_cutoff_components": [],
+        },
+    )
+    assert "Deflation decision near its cutoff" not in captured.err
+
+
+def test_bottom_stratum_note_is_silent_when_no_short_region_is_significant(
+    monkeypatch, tmp_path, capsys,
+):
+    # FIX_SPEC §WP2: 6+ CpG significant regions are inside the length regime
+    # that measured on target, so the run says nothing.
+    captured = _bottom_stratum_cli_run(
+        monkeypatch, tmp_path, capsys, n_cpgs=[8, 12, 30], n_bottom=0,
+    )
+    assert "Short-region calibration limitation" not in captured.err
+
+
+def test_bottom_stratum_note_is_emitted_once_per_run_not_per_region(
+    monkeypatch, tmp_path, capsys,
+):
+    # FIX_SPEC §WP2: three significant 4-CpG regions, still exactly ONE note
+    # -- the measured 6.9-15.4% miscalibration is a property of the regime,
+    # not of any individual row. The note names docs/FDR.md and the measured
+    # range so a user does not have to go looking for either.
+    captured = _bottom_stratum_cli_run(
+        monkeypatch, tmp_path, capsys, n_cpgs=[4, 4, 5, 20], n_bottom=3,
+    )
+    assert captured.err.count("Short-region calibration limitation") == 1
+    assert "6.9-15.4%" in captured.err
+    assert "docs/FDR.md" in captured.err
+    assert "3 of 4 significant region(s)" in captured.err

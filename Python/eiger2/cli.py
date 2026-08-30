@@ -62,7 +62,12 @@ import pandas as pd
 
 from . import __version__
 from .core import (
+    BOTTOM_STRATUM_FDR_NOTE,
     CALIBRATION_DIAGNOSTIC_NOTE,
+    LOW_PREVALENCE_NOTE,
+    LOW_PREVALENCE_SAMPLE_CEILING,
+    NEAR_BOUNDARY_CONCENTRATION_NOTE,
+    NEAR_CUTOFF_CONCENTRATION_NOTE,
     Eiger2Config,
     call_dmrs,
     chromosome_sort_permutation,
@@ -922,6 +927,74 @@ def command_call(args: argparse.Namespace) -> int:
     # Spec §2c: per-LENGTH-stratum null-opportunity refusal -- that stratum's
     # rows only, not the whole run (see region_fdr_result's docstring).
     fdr_diag = caller_manifest.get("fdr") or {}
+    # FIX_SPEC §WP2: exactly ONE run-level note when any significant region
+    # lands in the bottom length stratum -- the measured miscalibration is a
+    # property of that regime, not of an individual row, so it is never
+    # emitted per region. Informational only: no column, and no run status,
+    # depends on it (see BOTTOM_STRATUM_FDR_NOTE in core.py).
+    n_bottom_stratum = fdr_diag.get("n_significant_bottom_stratum") or 0
+    if n_bottom_stratum:
+        print(
+            f"[eiger2] NOTE: {BOTTOM_STRATUM_FDR_NOTE}\n"
+            f"         {n_bottom_stratum} of {significant} significant "
+            f"region(s) in this run fall in that 4-5 CpG stratum.",
+            file=sys.stderr,
+        )
+    # FIX_SPEC §WP4: exactly ONE run-level note naming how many significant
+    # regions are carried by one or two samples. The measured alternative --
+    # shipping min_prevalence_samples=3 -- cost up to 80 recall points in the
+    # two-carrier-floor signal_grid cells, so the count is reported and the
+    # filter left to the user (see LOW_PREVALENCE_NOTE in core.py and
+    # benchmarking/results_v220/prevalence_default/README.md). Informational
+    # only: no column and no run status depends on it.
+    n_low_prevalence = caller_manifest.get("n_significant_low_prevalence") or 0
+    if n_low_prevalence:
+        print(
+            f"[eiger2] NOTE: {LOW_PREVALENCE_NOTE}\n"
+            f"         {n_low_prevalence} of {significant} significant "
+            f"region(s) in this run are carried by "
+            f"1-{LOW_PREVALENCE_SAMPLE_CEILING} sample(s).",
+            file=sys.stderr,
+        )
+    # FIX_SPEC §WP6b item 2 (WP6 disposition option E): exactly ONE run-level
+    # note when any candidate component's loading concentration lands within
+    # DEFLATION_NEAR_CUTOFF_MARGIN of deflation_max_concentration. Read off the
+    # latent_structure diagnostics the run already wrote, so it fires whether or
+    # not the run went on to call anything -- the deflation decision is upstream
+    # of every region. Informational only: no column, no verdict and no run
+    # status depends on it (see NEAR_CUTOFF_CONCENTRATION_NOTE in core.py).
+    latent_diag = caller_manifest.get("latent_structure") or {}
+    near_cutoff = latent_diag.get("near_cutoff_components") or []
+    if near_cutoff:
+        listed = "; ".join(
+            f"component {entry['component']} at "
+            f"{entry['loading_concentration']:.4f} ({entry['verdict']})"
+            for entry in near_cutoff
+        )
+        # FIX_SPEC §WP7a item 2: the same note under either deflation rule,
+        # worded for the boundary the run actually used. Under the shipped
+        # "absolute" rule `deflation_boundary` IS `deflation_max_concentration`,
+        # so this line's output is unchanged; under "relative" the boundary is
+        # the run's own permutation-null quantile and the absolute wording
+        # would misdescribe it.
+        relative = latent_diag.get("deflation_rule") == "relative"
+        boundary = latent_diag.get(
+            "deflation_boundary", latent_diag.get("deflation_max_concentration")
+        )
+        note = (
+            NEAR_BOUNDARY_CONCENTRATION_NOTE if relative
+            else NEAR_CUTOFF_CONCENTRATION_NOTE
+        )
+        print(
+            f"[eiger2] NOTE: {note}\n"
+            f"         {len(near_cutoff)} of "
+            f"{latent_diag.get('n_candidates', len(near_cutoff))} candidate "
+            f"component(s) sit within "
+            f"{latent_diag.get('deflation_near_cutoff_margin')} of the "
+            f"{boundary} {'boundary' if relative else 'cutoff'}: "
+            f"{listed}.",
+            file=sys.stderr,
+        )
     for entry in fdr_diag.get("insufficient_null_opportunity_strata") or []:
         required = entry.get("required_null_opportunity")
         region_null_mode = (caller_manifest.get("gates") or {}).get(
@@ -1045,8 +1118,8 @@ def command_call(args: argparse.Namespace) -> int:
             f"red flag on genuinely\n"
             f"         DMR-free data, where it means the null doesn't match "
             f"the data's tail shape.\n"
-            f"         Check calibration properly with "
-            f"`benchmarking/benchmark_suite.py exchangeability`\n"
+            f"         Check calibration with the paper repository's "
+            f"DMR-free benchmark suite\n"
             f"         on DMR-free synthetic data, not by reading this "
             f"single-run number alone.",
             file=sys.stderr,
@@ -1356,7 +1429,14 @@ def build_parser() -> argparse.ArgumentParser:
                        type=int, default=None,
                        help="require at least this many samples to carry the "
                             "region's deviation. A single aberrant sample "
-                            "produces real coordination but is not a DMR; try 3.")
+                            "produces real coordination but is not a DMR. "
+                            "Default 0 (off), measured: a floor of 3 is free "
+                            "in 10 of 14 signal_grid cells but costs 91-94 "
+                            "recall points where the planted subgroup is two "
+                            "samples, and raises pooled per-run FDP from "
+                            "0.062 to 0.117 -- it removes true calls, not "
+                            "false ones. Set 3 only when subgroup-defining "
+                            "regions are the estimand.")
         p.add_argument("--fdr-replicates", dest="fdr_replicates", type=int,
                        default=0,
                        help="legacy only: NOT CURRENTLY SUPPORTED (any value "
