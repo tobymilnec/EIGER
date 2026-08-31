@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import sys
 from pathlib import Path
 
@@ -576,44 +575,249 @@ def test_the_shipped_deflation_rule_is_absolute_and_records_its_own_boundary():
     assert "deflation_null_concentration" not in diagnostics
 
 
-#: FIX_SPEC WP7b second disposition item 5: the WP7a byte-identity pin is
-#: path-aware. A SHA-256 of a numeric table cannot survive a different
-#: summation order, so one digest is a pin on one execution path; both are
-#: pinned and the active one is asserted. Region-table digest per path, then
-#: the per-sample value table, which is bit-identical on both.
-WP7A_REGION_DIGEST = {
-    "numpy": "4b6baf1edee4b28a",
-    "numba": "eb53d12bf391def9",
+#: FIX_SPEC WP7a's regression contract for the shipped default path.
+#:
+#: This was a SHA-256 of the region table's raw float64 bytes. That digest is
+#: not portable: the last bits of five accumulated float columns move with the
+#: BLAS/NumPy/SciPy build, so the pin failed on supported stacks while every
+#: scientific decision was unchanged. Measured over numpy 1.26.4/scipy 1.14.1,
+#: numpy 2.4.6/scipy 1.17.1 and the numba path of the latter, the whole
+#: disagreement is: statistic_mean 3.3e-16, statistic_min 5.8e-16,
+#: statistic_threshold 8.3e-17, region_area 1.8e-15 and pvalue_descriptive
+#: 2.7e-20 in absolute terms; 3.8e-15 relative at worst. Every other column --
+#: coordinates, region boundaries, CpG counts, the statistic name, every FDR
+#: column including region_qvalue, the significance and prevalence decisions,
+#: the nullable-decision fields and the NaN masks -- is bit-identical on all
+#: three, and so is the per-sample value table.
+#:
+#: So the contract is now: exact schema and column order, exact dtype families,
+#: exact NaN masks, exact values for every non-float column, and the float
+#: columns compared against the pinned reference at rtol=1e-12 -- 261x the
+#: worst deviation measured across those stacks, and still twelve orders of
+#: magnitude tighter than anything that could move a q-value, a boundary or a
+#: verdict. Reference values are from numpy 1.26.4/pandas 2.2.3/scipy 1.14.1.
+WP7A_FLOAT_RTOL = 1e-12
+
+WP7A_COLUMNS = (
+    "region_id", "chr", "start", "end", "n_cpg", "length_bp", "cpg_index_start",
+    "cpg_index_end", "statistic", "statistic_mean", "statistic_min",
+    "statistic_threshold", "region_support_median", "region_threshold_mode",
+    "region_area", "region_qvalue", "region_tail_fdr", "region_qvalue_lower_95",
+    "region_qvalue_upper_95", "region_qvalue_resolution",
+    "null_exceedances_at_cutoff", "region_qvalue_cutoff_rank",
+    "region_evidence_score", "evidence_score_extrapolated",
+    "minority_size_descriptive", "minority_delta_descriptive", "passes_prevalence",
+    "coordination_significant", "biological_class", "significant", "fdr_status",
+    "n_samples_observed", "missing_rate", "mean_beta", "delta_beta_descriptive",
+    "largest_gap_descriptive", "direction_descriptive",
+    "minor_group_size_descriptive", "minor_group_fraction_descriptive",
+    "minor_group_samples_descriptive", "pvalue_descriptive",
+)
+
+WP7A_DTYPE_FAMILY = {
+    "region_id": "string",
+    "chr": "string",
+    "start": "int",
+    "end": "int",
+    "n_cpg": "int",
+    "length_bp": "int",
+    "cpg_index_start": "int",
+    "cpg_index_end": "int",
+    "statistic": "string",
+    "statistic_mean": "float",
+    "statistic_min": "float",
+    "statistic_threshold": "float",
+    "region_support_median": "float",
+    "region_threshold_mode": "string",
+    "region_area": "float",
+    "region_qvalue": "float",
+    "region_tail_fdr": "float",
+    "region_qvalue_lower_95": "float",
+    "region_qvalue_upper_95": "float",
+    "region_qvalue_resolution": "float",
+    "null_exceedances_at_cutoff": "int",
+    "region_qvalue_cutoff_rank": "int",
+    "region_evidence_score": "float",
+    "evidence_score_extrapolated": "bool",
+    "minority_size_descriptive": "int",
+    "minority_delta_descriptive": "float",
+    "passes_prevalence": "bool",
+    "coordination_significant": "nullable_boolean",
+    "biological_class": "string",
+    "significant": "nullable_boolean",
+    "fdr_status": "string",
+    "n_samples_observed": "int",
+    "missing_rate": "float",
+    "mean_beta": "float",
+    "delta_beta_descriptive": "float",
+    "largest_gap_descriptive": "float",
+    "direction_descriptive": "string",
+    "minor_group_size_descriptive": "int",
+    "minor_group_fraction_descriptive": "float",
+    "minor_group_samples_descriptive": "string",
+    "pvalue_descriptive": "float",
 }
+
+WP7A_ALL_NA_COLUMNS = ('region_evidence_score', 'biological_class')
+
+WP7A_EXACT = {
+    "region_id": (
+        'EIGER2_chr1_398_423',
+        'EIGER2_chr1_2800_2823',
+        'EIGER2_chr1_5198_5223',
+        'EIGER2_chr1_7600_7623',
+    ),
+    "chr": ('chr1', 'chr1', 'chr1', 'chr1'),
+    "start": (398, 2800, 5198, 7600),
+    "end": (423, 2823, 5223, 7623),
+    "n_cpg": (13, 12, 13, 12),
+    "length_bp": (25, 23, 25, 23),
+    "cpg_index_start": (199, 1400, 2599, 3800),
+    "cpg_index_end": (211, 1411, 2611, 3811),
+    "statistic": ('correlation', 'correlation', 'correlation', 'correlation'),
+    "region_threshold_mode": ('single', 'single', 'single', 'single'),
+    "null_exceedances_at_cutoff": (0, 0, 0, 0),
+    "region_qvalue_cutoff_rank": (1, 2, 4, 3),
+    "evidence_score_extrapolated": (False, False, False, False),
+    "minority_size_descriptive": (10, 10, 4, 4),
+    "passes_prevalence": (True, True, True, True),
+    "coordination_significant": (True, True, True, True),
+    "significant": (True, True, True, True),
+    "fdr_status": ('available', 'available', 'available', 'available'),
+    "n_samples_observed": (40, 40, 40, 40),
+    "direction_descriptive": (
+        'Hypermethylation',
+        'Hypermethylation',
+        'Hypermethylation',
+        'Hypermethylation',
+    ),
+    "minor_group_size_descriptive": (10, 10, 4, 4),
+    "minor_group_samples_descriptive": (
+        'sample_14;sample_9;sample_39;sample_30;sample_32;sample_10;sample_3;sample_5;sample_23;sample_24',
+        'sample_36;sample_39;sample_19;sample_9;sample_33;sample_27;sample_29;sample_26;sample_1;sample_15',
+        'sample_6;sample_21;sample_30;sample_34',
+        'sample_10;sample_6;sample_38;sample_25',
+    ),
+}
+
+WP7A_FLOAT = {
+    "statistic_mean": (
+        0.7895439906639546,
+        0.8243576651498501,
+        0.7499782063354505,
+        0.8110111053952093,
+    ),
+    "statistic_min": (
+        0.3014551548710558,
+        0.39191517254835606,
+        0.2130179523633955,
+        0.4271472250211736,
+    ),
+    "statistic_threshold": (
+        0.18951859275689073,
+        0.18951859275689073,
+        0.18951859275689073,
+        0.18951859275689073,
+    ),
+    "region_support_median": (40.0, 40.0, 40.0, 40.0),
+    "region_area": (
+        7.200304774884767,
+        6.9832297963225525,
+        6.725515362942719,
+        6.836417639021503,
+    ),
+    "region_qvalue": (0.0, 0.0, 0.0, 0.0),
+    "region_tail_fdr": (0.0, 0.0, 0.0, 0.0),
+    "region_qvalue_lower_95": (0.0, 0.0, 0.0, 0.0),
+    "region_qvalue_upper_95": (
+        0.08135260398616234,
+        0.08135260398616234,
+        0.08135260398616234,
+        0.08135260398616234,
+    ),
+    "region_qvalue_resolution": (
+        0.06411808300395257,
+        0.03205904150197628,
+        0.01602952075098814,
+        0.021372694334650857,
+    ),
+    "minority_delta_descriptive": (
+        0.29241390810770307,
+        0.297817594402663,
+        0.31436903302140645,
+        0.3406079854200944,
+    ),
+    "missing_rate": (0.0, 0.0, 0.0, 0.0),
+    "mean_beta": (
+        0.5728024165093186,
+        0.5789083248450433,
+        0.529645848470467,
+        0.5366105692908207,
+    ),
+    "delta_beta_descriptive": (
+        0.29241390810770296,
+        0.297817594402663,
+        0.31436903302140645,
+        0.34060798542009363,
+    ),
+    "largest_gap_descriptive": (
+        0.15508905492228975,
+        0.21904163574658508,
+        0.23382194054489713,
+        0.25240576005875914,
+    ),
+    "minor_group_fraction_descriptive": (0.25, 0.25, 0.1, 0.1),
+    "pvalue_descriptive": (
+        9.877556113463473e-12,
+        5.467551487620617e-17,
+        0.00019950510983922235,
+        8.526044302963067e-07,
+    ),
+}
+
+#: The per-sample value table IS byte-identical on all three stacks measured
+#: above, so it keeps the stronger pin. If this ever fails on a supported
+#: stack, characterise the difference and move it to the same tolerance
+#: treatment as the region table -- do not re-pin one machine's digest.
 WP7A_VALUE_DIGEST = "d09c8b4942831e3b"
 
 
-def test_the_default_path_is_byte_identical_after_wp7a():
+def _dtype_family(series):
+    """Portable dtype class: pandas 2 calls string columns object, pandas 3 str."""
+    name = str(series.dtype)
+    if name == "boolean":
+        return "nullable_boolean"
+    if name == "bool":
+        return "bool"
+    if name.startswith(("int", "Int")):
+        return "int"
+    if name.startswith(("float", "Float")):
+        return "float"
+    if name in ("object", "str") or name.startswith("string"):
+        return "string"
+    return name
+
+
+def test_the_default_path_is_unchanged_after_wp7a():
     """FIX_SPEC WP7a: "no default flips, no number in docs/FDR.md moves".
 
-    The digest is of the full numeric region table and the per-sample value
-    table of one deterministic run, and it was taken from ``git show
-    HEAD:Python/eiger2/core.py`` *before* the WP7a change and confirmed
-    unchanged after it -- the shipped path's arithmetic, not merely its
-    verdicts. Anything that moves a q-value, a boundary or a region edge on the
-    default rule fails here.
+    One deterministic run of the shipped default path, pinned against the
+    reference taken from ``git show HEAD:Python/eiger2/core.py`` *before* the
+    WP7a change and confirmed unchanged after it. Anything that moves a
+    q-value, a region boundary, a decision or a reported value beyond
+    floating-point accumulation noise fails here.
 
     Re-verified on WP7b's adjudicated cutoff: this run's candidates score
     0.0857 and 0.079, below 0.10 and below 0.12, so both were already deflated
-    at the old default and both digests are unchanged by the flip. That is the
-    no-op property this pin exists to guard.
+    at the old default and nothing here is changed by the flip. That is the
+    no-op property this test exists to guard.
 
-    **Two digests, because there are two execution paths.** With numba
-    installed and ``EIGER2_USE_NUMBA=1`` set -- the environment the sweeps run
-    under -- ``_pair_statistic`` accumulates in a different order and the
-    region table differs at the last bit: max abs 3.3e-16 on
-    ``statistic_mean``, 5.6e-16 on ``statistic_min``, 2.7e-15 on
-    ``region_area``, every other column, q-value and region edge bit-identical
-    (float associativity, <= 3e-15). The verdicts, the region count and the
-    per-sample value table are the same on both paths. Pinning one digest and
-    forcing its path would test an environment the sweeps do not use; comparing
-    at a tolerance would give up bit-identity where it does hold. So each path
-    is pinned against its own digest and the test asserts the active one.
+    What it does NOT promise is byte identity of the region table across BLAS
+    and NumPy builds, because that is not a property the arithmetic has -- see
+    the note on ``WP7A_FLOAT_RTOL``. The numba path of ``_pair_statistic``
+    accumulates in a different order and lands inside the same tolerance as a
+    different NumPy build does, so both execution paths are asserted against
+    one reference rather than against a digest each.
     """
 
     matrix, locations, _truth = simulate(
@@ -625,20 +829,46 @@ def test_the_default_path_is_byte_identical_after_wp7a():
         matrix, locations,
         config=Eiger2Config(window=4, null_min_lag=100, random_seed=11),
     )
-    numeric = np.ascontiguousarray(
-        regions.select_dtypes(include=[np.number]).to_numpy(dtype=float)
-    )
-    path = (
-        "numba"
-        if _HAS_NUMBA and os.environ.get("EIGER2_USE_NUMBA") == "1"
-        else "numpy"
-    )
+
+    # Schema: exact columns, exact order, exact dtype family.
+    assert list(regions.columns) == list(WP7A_COLUMNS)
+    for column, expected_family in WP7A_DTYPE_FAMILY.items():
+        assert _dtype_family(regions[column]) == expected_family, column
+
+    # Counts, and the significant-call set itself rather than only its total.
     assert len(regions) == 4
+    assert regions["significant"].tolist() == [True, True, True, True]
     assert int(regions["significant"].sum()) == 4
-    assert (
-        hashlib.sha256(numeric.tobytes()).hexdigest()[:16]
-        == WP7A_REGION_DIGEST[path]
-    )
+    assert manifest["status"] == "ok_with_warnings"
+
+    # NaN masks: two columns are wholly unpopulated on this run, no other
+    # column may acquire or lose a missing value.
+    for column in WP7A_COLUMNS:
+        missing = regions[column].isna()
+        if column in WP7A_ALL_NA_COLUMNS:
+            assert missing.all(), column
+        else:
+            assert not missing.any(), column
+
+    # Coordinates, CpG counts, categorical fields and every nullable decision.
+    for column, expected in WP7A_EXACT.items():
+        assert regions[column].tolist() == list(expected), column
+
+    # Float columns, at a tolerance chosen from the measured cross-stack drift.
+    for column, expected in WP7A_FLOAT.items():
+        np.testing.assert_allclose(
+            regions[column].to_numpy(dtype=float),
+            np.asarray(expected, dtype=float),
+            rtol=WP7A_FLOAT_RTOL, atol=0.0, err_msg=column,
+        )
+
+    # The FDR verdict is an exact statement, not a tolerance one: no null
+    # region reached these areas, so the point estimates are exactly zero.
+    assert regions["region_qvalue"].tolist() == [0.0] * 4
+    assert regions["region_tail_fdr"].tolist() == [0.0] * 4
+    assert regions["null_exceedances_at_cutoff"].tolist() == [0] * 4
+    assert regions["fdr_status"].tolist() == ["available"] * 4
+
     assert hashlib.sha256(
         np.ascontiguousarray(
             values.select_dtypes(include=[np.number]).to_numpy(dtype=float)

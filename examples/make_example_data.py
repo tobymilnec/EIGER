@@ -38,16 +38,42 @@ chance -- every length stratum's own pooled null is genuinely empty (`K=0`).
 Before spec §2c, `region_fdr_result`'s aggregate-adequacy floor
 (``min_null_regions_for_fdr``) checked the wrong quantity here and refused
 the whole run over that emptiness, reporting `inference_unreliable`. §2c
-replaced it with a per-stratum null-OPPORTUNITY check: this fixture's null
-had ample opportunity to form a region this long in every stratum and simply
-never did, which is real evidence (`K=0` backed by opportunity gives a finite
-Garwood upper bound, spec §2c.3), so nothing is refused -- the run reports
-`ok_with_warnings` (candidate-only calibration diagnostics still apply to
-"lag" mode, see below) with genuine `region_qvalue`s. The end-to-end smoke
-test (``.github/workflows/tests.yml``) checks exactly this: the structural
-gates pass, no stratum is refused for insufficient opportunity, and the run
-completes and writes real output -- not that its status is `ok`, which "lag"
-mode's calibration diagnostics still keep out of reach on any layout.
+replaced it with a per-stratum null-OPPORTUNITY check, and that is where this
+fixture now sits: emptiness alone no longer refuses anything, but one
+stratum's null did not have enough opportunity for its `K=0` to count as
+evidence.
+
+**What this fixture actually does, as of 2.2.0.** `eiger2 call` on it exits
+`0`, all five structural gates pass, 18 regions are reported and 11 are
+significant, and the run status is **`partial_inference`**, not
+`ok_with_warnings`:
+
+* length stratum `20-49` is REFUSED for insufficient null opportunity: it
+  holds 1 observed region over 49,981 of observed opportunity, while the null
+  supplied 282,134 against the 499,810 the adequacy criterion requires at
+  `m_opportunity=10`. `region_qvalue`, its bounds and `significant` are
+  `NaN`/`pd.NA` for that stratum alone. Raising `--n-lag-draws` adds null
+  opportunity without weakening the criterion.
+* the `6-9` and `10-19` strata have empty pooled nulls that DID have real
+  opportunity (`K=0` backed by opportunity gives a finite Garwood upper
+  bound, spec §2c.3), so they report genuine `region_qvalue`s and are not
+  refused. Every stratum other than `20-49` reports normally.
+
+A refused stratum is a stratum-local outcome, not a broken null: the null
+construction is sound and the rest of the run is real inference. It is still
+a refusal, and must be read as one -- `partial_inference` is not a completed
+inference for that stratum.
+
+The end-to-end smoke tests check exactly this shape rather than a status
+string: the structural gates pass, the refused strata are inspected and
+printed, and the run writes real output. ``.github/workflows/tests.yml``
+prints the refused strata and rejects exit codes above 1;
+``make smoke``/``tools/check_smoke_manifest.py`` additionally reads the
+status off ``run_manifest.json``, reports the `20-49` refusal explicitly, and
+fails on `inference_unreliable`, on `no_regions`, on an undocumented status
+or on a status that contradicts the exit code. Neither treats reaching `ok`
+as the expectation: "lag" mode's calibration diagnostics keep `ok` out of
+reach on any layout.
 
 The data are simulated, not real, and are provided only so that the software can
 be exercised end to end.
