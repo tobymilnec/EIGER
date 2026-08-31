@@ -223,7 +223,7 @@ make check          # the complete local software gate
 |---|---|
 | `lint` | Ruff over `Python/eiger2` and `tests` |
 | `test` | the software test suite in `tests` |
-| `wheel-check` | builds an sdist and wheel in isolation, installs the wheel into a fresh virtual environment, and checks the version, `pip check`, the `eiger2` entry point and the `functions` import from outside the checkout |
+| `wheel-check` | builds an sdist and wheel in isolation, audits the wheel archive, installs it into a fresh virtual environment, and checks the version, `pip check`, the `eiger2` entry point and the `eiger2`/`functions` imports from outside the checkout |
 | `smoke` | generates the synthetic example once, then runs the revised caller (its exit code is inspected against the run manifest, never accepted blindly) and the legacy caller (exit 0 required) |
 
 The revised smoke call reads its verdict off `run_manifest.json` rather than
@@ -243,10 +243,49 @@ No target deletes or overwrites `dist/`, `examples/data/` or `examples/out_*`.
 ignored `dist/` directory, and it deletes nothing there.
 
 Individual targets (`make lint`, `make test`, `make build`, `make wheel-check`,
-`make smoke-revised`, `make smoke-legacy`) can be run on their own, and
-`PYTHON` selects the interpreter: `make check PYTHON=python3.12`. The direct
-`pip` and `pytest` commands above remain valid and are what the targets run.
-Nothing here fetches data or touches the paper workspace.
+`make wheel-gate`, `make smoke-revised`, `make smoke-legacy`) can be run on
+their own, and `PYTHON` selects the interpreter: `make check PYTHON=python3.12`.
+The direct `pip` and `pytest` commands above remain valid and are what the
+targets run. Nothing here fetches data or touches the paper workspace.
+
+#### The installed-wheel gate
+
+`make wheel-gate` is the release-facing form of `wheel-check` and is what CI
+runs. It builds one sdist and wheel in isolation, requires exactly one wheel,
+audits the archive, installs `<wheel>[legacy]` into a fresh virtual environment
+outside the repository, and then runs **both** smoke calls through that
+environment's own `eiger2` executable. It never installs the checkout, editably
+or otherwise, so a file missing from the wheel cannot be satisfied by the
+source tree:
+
+```bash
+make wheel-gate                 # the exact target the CI wheel job runs
+```
+
+`tools/check_wheel.py` holds its verdict, in three modes with their own tests
+in `tests/test_check_wheel.py`. `environment` runs before anything is built and
+refuses to proceed if `PYTHONPATH` reaches into the checkout -- which would not
+only shadow an import but make pip read the editable install's `eiger.egg-info`
+and skip installing the wheel altogether. `contents` reads the archive and requires the
+`eiger-2.2.0-py3-none-any.whl` filename, a top level of exactly `eiger2`,
+`functions` and the distribution metadata, `LICENSE` under that metadata, and
+the declared `eiger2` console entry point; any benchmarking, paper, analysis,
+provenance, script, result or fixture material fails it. `installed` runs in
+the temporary environment, from a temporary working directory, and requires
+that `PYTHONPATH`, `sys.path`, the working directory and the imported module
+itself all stay out of the checkout, that `eiger2.__version__` is `2.2.0`, that
+the installed `direct_url.json` names the wheel just built, and that
+`eiger2.benchmark` imports with no paper fixture present.
+
+`make check` runs the cheaper `wheel-check` -- the same build, audit and import
+isolation without the legacy extra or the smoke calls, which `make smoke`
+already covers against the editable install.
+
+CI runs these same targets: `make lint`, `make test` and `make smoke` on Python
+3.10, 3.11 and 3.12 against an editable install, and `make wheel-gate` once on
+Python 3.12. One version is enough for the wheel job because the artefact is a
+pure-Python `py3-none-any` wheel -- the same file each version installs -- and
+`wheel-gate` fails if that platform tag ever changes.
 
 ---
 

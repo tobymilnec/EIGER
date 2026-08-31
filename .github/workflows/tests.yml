@@ -6,7 +6,11 @@ on:
   pull_request:
 
 jobs:
+  # Normal test execution, against an editable install of the checkout, on
+  # every supported Python version.  Each step is the Make target a
+  # contributor runs locally, so a CI failure is reproducible with one command.
   test:
+    name: tests (editable, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,32 +26,50 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[legacy,dev]"
       - name: Lint
-        run: ruff check Python/eiger2 tests
+        run: make lint PYTHON=python
       - name: Test the shipped package
-        run: pytest tests -q
-      - name: End-to-end smoke test
-        run: |
-          python examples/make_example_data.py
-          e2_exit=0
-          eiger2 call --betas examples/data/betas.tsv \
-                      --locations examples/data/cpgs.bed --out /tmp/e2 || e2_exit=$?
-          # Exit 1 is the documented partial-inference state. Higher exit codes
-          # indicate a command or data failure and must fail CI.
-          if [ "$e2_exit" -gt 1 ]; then
-            echo "eiger2 call failed with exit $e2_exit" >&2
-            exit 1
-          fi
-          eiger2 call --betas examples/data/betas.tsv \
-                      --locations examples/data/cpgs.bed --out /tmp/lg --legacy
-          test -s /tmp/e2/regions.csv
-          test -s /tmp/lg/regions.csv
-          python -c "
-          import json
-          manifest = json.load(open('/tmp/e2/run_manifest.json'))
-          structural = manifest['caller_manifest']['gates']['structural']
-          failed = {k: v for k, v in structural.items() if not v['passed']}
-          assert not failed, f'structural gate(s) failed: {failed}'
-          fdr = manifest['caller_manifest']['fdr']
-          refused = fdr.get('insufficient_null_opportunity_strata', [])
-          print(f'structural gates: all passed; refused strata: {refused}')
-          "
+        run: make test PYTHON=python
+      # Both callers over the synthetic example, in a temporary directory.
+      # The revised caller's verdict is read off run_manifest.json by
+      # tools/check_smoke_manifest.py, never off the exit code alone: the
+      # shipped example reaches `partial_inference`, which the CLI exits 0
+      # for, and exit 1 means `inference_unreliable`, which is a refusal and
+      # fails here.
+      - name: Smoke test both callers
+        run: make smoke PYTHON=python
+
+  # What the editable job cannot catch: a file missing from the wheel, an
+  # invalid entry point, or a runtime dependency that only the source checkout
+  # satisfies.  This job never installs the checkout -- it installs the built
+  # wheel into a fresh environment and runs every import, CLI call and smoke
+  # call from a temporary working directory outside the workspace.
+  #
+  # One representative Python version is sufficient here and the matrix above
+  # is not duplicated: the artefact is `eiger-2.2.0-py3-none-any.whl`, a pure
+  # Python wheel with no compiled extension and no version-specific packaged
+  # content, so the same file is what 3.10, 3.11 and 3.12 would each install.
+  # `make wheel-gate` asserts that `py3-none-any` filename, so a wheel that
+  # ever became version-specific would fail this job rather than silently
+  # reduce its coverage.  Interpreter-level compatibility across all three
+  # versions is covered by the editable matrix above.
+  installed-wheel:
+    name: installed wheel gate (Python 3.12)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Build tooling only.  EIGER itself is deliberately not installed in
+      # this job: it must arrive from the wheel `make wheel-gate` builds.
+      - name: Install the build tooling
+        run: python -m pip install --upgrade pip build
+      # Builds an isolated sdist and wheel, requires exactly one wheel, audits
+      # the archive (top level, licence, entry point, version, platform tag),
+      # installs `<wheel>[legacy]` into a fresh virtualenv outside the
+      # repository, checks provenance and import isolation from installed
+      # metadata, then runs the revised and legacy callers from that
+      # environment's own `eiger2` executable.
+      - name: Build, install and smoke-test the wheel
+        run: make wheel-gate PYTHON=python
