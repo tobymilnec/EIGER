@@ -29,7 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 legacy = ["numba>=0.57", "scikit-learn>=1.1"]
 fast = ["numba>=0.57"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "build>=1.0"]
 
 [project.scripts]
 eiger2 = "eiger2.cli:main"

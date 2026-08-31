@@ -191,6 +191,10 @@ examples/             Example dataset generator and runnable input files
 tests/                Tests for the current installable package
 
 docs/                 Method design and statistical notes
+
+tools/                Small helper scripts used by the `make` targets
+
+Makefile              Software development task interface (`make help`)
 ```
 
 Only `Python/eiger2` and `Python/functions` are installed as package code. The
@@ -202,6 +206,47 @@ pytest tests -q
 ```
 
 The CI workflow runs this software-only suite on every supported Python version.
+
+### Development
+
+The root `Makefile` collects the local software tasks. `make` on its own only
+prints help; it installs nothing and writes nothing.
+
+```bash
+make install-dev    # pip install -e ".[legacy,dev]"
+make check          # the complete local software gate
+```
+
+`make check` runs, in order:
+
+| Step | What it does |
+|---|---|
+| `lint` | Ruff over `Python/eiger2` and `tests` |
+| `test` | the software test suite in `tests` |
+| `wheel-check` | builds an sdist and wheel in isolation, installs the wheel into a fresh virtual environment, and checks the version, `pip check`, the `eiger2` entry point and the `functions` import from outside the checkout |
+| `smoke` | generates the synthetic example once, then runs the revised caller (its exit code is inspected against the run manifest, never accepted blindly) and the legacy caller (exit 0 required) |
+
+The revised smoke call reads its verdict off `run_manifest.json` rather than
+off the exit code: `tools/check_smoke_manifest.py` requires the structural
+gates to pass, prints every refused length stratum, and fails on
+`inference_unreliable`, on `no_regions`, on a status eiger2 does not document,
+or on a status that contradicts the exit code. The synthetic example currently
+reaches `partial_inference` -- length stratum `20-49` is refused for
+insufficient null opportunity -- which is a documented stratum-local state and
+is reported as a refusal, never as a completed inference. Add
+`--expect-no-refusals` to that script to require a refusal-free run.
+
+Every build, virtual environment and smoke input or output `make check` creates
+lives in a `mktemp` directory outside the repository, which is removed on exit.
+No target deletes or overwrites `dist/`, `examples/data/` or `examples/out_*`.
+`make build` is the one target that writes into the repository, into the
+ignored `dist/` directory, and it deletes nothing there.
+
+Individual targets (`make lint`, `make test`, `make build`, `make wheel-check`,
+`make smoke-revised`, `make smoke-legacy`) can be run on their own, and
+`PYTHON` selects the interpreter: `make check PYTHON=python3.12`. The direct
+`pip` and `pytest` commands above remain valid and are what the targets run.
+Nothing here fetches data or touches the paper workspace.
 
 ---
 
