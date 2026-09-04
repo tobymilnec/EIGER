@@ -27,8 +27,18 @@ TEST_PATHS := tests
 DIST_DIR ?= dist
 VERSION  := 2.2.0
 
-# Helper scripts.  Both are ordinary stdlib-only scripts with their own tests
-# in `tests/`, so a target's verdict is tested logic rather than shell.
+# Helper scripts.  Both are ordinary Python scripts with their own tests in
+# `tests/`, so a target's verdict is tested logic rather than shell.
+#
+# `check_smoke_manifest.py` is stdlib-only, and so are `check_wheel.py`'s
+# `environment` and `contents` modes: they inspect PYTHONPATH and read the wheel
+# archive without installing or importing it, which is why they can run before
+# anything exists to import.  `check_wheel.py installed` is deliberately not
+# stdlib-only -- after auditing provenance it imports the installed eiger2 and
+# NumPy and runs one simulation, so that the artefact a user installs is
+# exercised rather than only opened.  Those imports resolve inside the isolated
+# environment the target just built the wheel into, never from the checkout;
+# the mode's own path checks are what enforce that.
 WHEEL_CHECKER   := $(CURDIR)/tools/check_wheel.py
 MANIFEST_CHECKER := $(CURDIR)/tools/check_smoke_manifest.py
 

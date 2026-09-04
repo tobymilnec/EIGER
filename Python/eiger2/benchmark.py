@@ -23,6 +23,20 @@ Scope of the installed package
     (``layout="wgbs_real"``, ``marginal="bimodal_fitted"``, ...) is an error.
     Paper code injects what it loaded through the ``locations`` and
     ``marginal_sampler`` parameters instead; see ``simulate``.
+
+Planted-DMR direction
+    A planted DMR is a *coordinated* region: one direction, shared by every CpG
+    and every carrier in it. ``simulate(planting_direction=...)`` says how that
+    direction is chosen. ``"region_headroom"``, the default, chooses one scalar
+    direction per planted region from the region's aggregate beta headroom.
+    ``"per_cpg_headroom"`` chooses per CpG from that CpG's own baseline, which
+    under a non-unimodal supplied marginal can give adjacent CpGs opposite-signed
+    shifts; it exists for byte-exact reproduction of a run made before
+    ``planting_direction`` existed, and for an explicit heterogeneous-direction
+    stress test. A supplied-marginal signal simulation that does not record
+    ``"region_headroom"`` is therefore not coherent-DMR power evidence; DMR-free
+    and ``marginal="unimodal"`` results are unaffected. See ``simulate`` and
+    ``PLANTING_DIRECTIONS``.
 """
 
 from __future__ import annotations
@@ -56,6 +70,37 @@ PAPER_ONLY_MARGINALS = ("bimodal_fitted", "bimodal_atlas")
 #: Clip bounds applied to every simulated matrix, whatever the marginal.
 BETA_CLIP: tuple[float, float] = (0.001, 0.999)
 
+#: How ``_plant_dmrs`` chooses the sign of the carrier shift it applies.
+#:
+#: ``"region_headroom"`` -- the default, and the coherent-DMR mode -- picks ONE
+#: scalar direction for the whole planted block from the block's aggregate beta
+#: headroom, so every CpG and every carrier in one planted region moves the same
+#: way, which is what "a differentially methylated region" means.
+#:
+#: ``"per_cpg_headroom"`` picks the direction independently for each CpG from
+#: that CpG's own baseline. Under a bimodal or otherwise non-unimodal supplied
+#: marginal adjacent CpGs can then receive opposite-signed shifts, so the block is
+#: locally anti-correlated rather than coordinated. It exists for two purposes
+#: only: byte-exact reproduction of a run made before ``planting_direction``
+#: existed, and an explicit heterogeneous-direction stress test.
+#:
+#: Consequence for stored results: a supplied-marginal *signal* simulation that
+#: does not record ``"region_headroom"`` is not coherent-DMR recall-versus-effect
+#: evidence, whatever it was labelled at the time, because the mode it ran under
+#: was the per-CpG rule. Results with no planted signal (DMR-free null and
+#: any-call calibration) and results under ``marginal="unimodal"`` are unaffected:
+#: the first never reaches this code, and in the second every baseline is exactly
+#: 0.5, so the two modes are byte-identical.
+PLANTING_DIRECTIONS = ("region_headroom", "per_cpg_headroom")
+
+#: Absolute tolerance on the ``"region_headroom"`` comparison. Both sides of it
+#: are means of beta-scale headrooms, so they live in ``[0, 1]`` and an absolute
+#: tolerance is well scaled. It exists so that a case which ties in exact
+#: arithmetic -- a block whose baselines are symmetric about 0.5, the commonest
+#: mixed-baseline case there is -- takes the documented ``+delta`` tie-break
+#: rather than whichever side happened to win by a last-bit rounding difference.
+HEADROOM_TIE_ATOL: float = 1e-12
+
 #: What ``simulate`` expects of a caller-supplied marginal: given the run's
 #: generator and the CpG count, return ``(baseline_mu, total_sd)`` -- the
 #: per-CpG baseline mean and the per-CpG total standard deviation to hit. Both
@@ -81,6 +126,50 @@ def _reject_paper_only(kind: str, name: str, paper_only: tuple[str, ...],
             f"{kind} in {supported}. Load it with the eiger_paper helper and "
             f"pass the result to simulate({injection}=...)."
         )
+
+
+def _check_planting_direction(planting_direction: str) -> None:
+    """Reject an unknown planting direction with one actionable line."""
+
+    if planting_direction not in PLANTING_DIRECTIONS:
+        raise ValueError(
+            f"planting_direction must be one of {PLANTING_DIRECTIONS}, got "
+            f"{planting_direction!r}; 'region_headroom' gives one planted region "
+            f"one direction (the default), 'per_cpg_headroom' reproduces the "
+            f"historical per-CpG direction for old runs and heterogeneous-"
+            f"direction stress tests"
+        )
+
+
+def _region_direction(block_mu: np.ndarray, delta: float) -> float:
+    """The one scalar sign a whole planted block is shifted by.
+
+    Aggregate beta headroom: for the block's baseline means, and the same
+    ``BETA_CLIP`` bounds the finished matrix is clipped to, compare the mean
+    attainable shift of ``+delta`` against that of ``-delta`` and take the larger.
+
+        up_i   = clip(mu_i + delta) - clip(mu_i)
+        down_i = clip(mu_i) - clip(mu_i - delta)
+
+    Both are non-negative. The direction is ``+1`` when ``mean(up)`` is greater
+    than ``mean(down)`` or the two agree to within ``HEADROOM_TIE_ATOL``, and
+    ``-1`` otherwise: the documented tie-break is ``+delta``. The tolerance is
+    what makes that tie-break reachable -- a block whose baselines are symmetric
+    about 0.5 ties exactly in real arithmetic but not always in floating point,
+    and it would otherwise be decided by a last-bit rounding difference rather
+    than by the rule.
+
+    The rule reads the block's baselines, ``delta`` and ``BETA_CLIP`` and nothing
+    else: no biological label, no called region, no q-value, no benchmark outcome,
+    and no random draw. It is therefore deterministic, and choosing a mode costs
+    no random number.
+    """
+
+    low, high = BETA_CLIP
+    at = np.clip(block_mu, low, high)
+    up = float((np.clip(block_mu + delta, low, high) - at).mean())
+    down = float((at - np.clip(block_mu - delta, low, high)).mean())
+    return 1.0 if up > down or abs(up - down) <= HEADROOM_TIE_ATOL else -1.0
 
 
 def _layout_locations(layout: str, n_cpg: int) -> pd.DataFrame:
@@ -117,6 +206,7 @@ def _plant_dmrs(
     rng: np.random.Generator,
     n_samples: int,
     baseline_mu: np.ndarray,
+    planting_direction: str = "region_headroom",
     start_position: int = 200,
 ) -> tuple[list[tuple[int, int, float, float, int, int]], int, list[tuple]]:
     """Plant DMRs on the sequential (position += spacing) grid used since EIGER 2's
@@ -132,14 +222,32 @@ def _plant_dmrs(
     the grid needs, so every candidate is always plantable at its nominal
     position -- this reduces exactly to the pre-§6.1 behaviour.
 
-    **Direction (FIX_SPEC WP6.3, option (a), architect-confirmed).** The shift is
-    applied toward whichever side of the CpG's baseline has more headroom
-    (``sign = -1 if baseline_mu > 0.5 else +1``), per CpG. Under a realistic
-    bimodal marginal a ``delta = 0.35`` planted upward at a baseline of 0.9 is
-    not plantable -- the clip would silently eat most of it and recall-vs-delta
-    would stop comparing like with like across marginals. Under
-    ``marginal="unimodal"`` every baseline is exactly 0.5, so the sign is ``+1``
-    everywhere and this reduces to the previous unsigned ``+= delta * group``.
+    **Direction.** The shift is applied toward the side with beta headroom, so a
+    ``delta = 0.35`` planted at a baseline of 0.9 is not silently eaten by the clip
+    and recall-vs-delta keeps comparing like with like across marginals.
+    ``planting_direction`` says at what granularity that choice is made:
+
+    ``"region_headroom"`` (the default)
+        One scalar sign for the whole planted block, from the block's aggregate
+        headroom; see ``_region_direction``. Every CpG and every carrier in one
+        planted region moves the same way, which is what a planted DMR is meant to
+        be. Adjacent CpGs can never receive opposite-signed effects.
+
+    ``"per_cpg_headroom"``
+        The historical rule, ``sign = -1 if baseline_mu > 0.5 else +1``, applied
+        per CpG. Under a bimodal or otherwise non-unimodal supplied marginal
+        adjacent CpGs can then be shifted in opposite directions, making the block
+        locally anti-correlated rather than a coordinated region. It exists for
+        byte-exact reproduction of a run made before ``planting_direction``
+        existed, and for an explicit heterogeneous-direction stress test; a
+        supplied-marginal result produced under it is not coherent-DMR power
+        evidence. See ``PLANTING_DIRECTIONS``.
+
+    Under ``marginal="unimodal"`` every baseline is exactly 0.5, so both modes give
+    ``+1`` everywhere and both reduce to the original unsigned ``+= delta * group``.
+    Neither mode consumes a random number, so the carrier draws -- and every
+    matrix, truth coordinate and layout placement -- are identical between them at
+    the same seed.
 
     The third return value is one ``(start, end, carriers, pre_block)`` entry per
     planted DMR, in ``truth`` order, carrying the pre-plant values of the rows it
@@ -148,6 +256,7 @@ def _plant_dmrs(
     recall-vs-effect curve once the clip is in play.
     """
 
+    _check_planting_direction(planting_direction)
     spans = eligible_run_spans(locations, max_cpg_gap_bp)
     run_starts = np.array([s for s, _ in spans])
     run_ends = np.array([e for _, e in spans])
@@ -176,10 +285,13 @@ def _plant_dmrs(
             group = np.zeros(n_samples)
             group[rng.choice(n_samples, size, replace=False)] = 1
             block = slice(actual_start, actual_start + dmr_length)
-            # -1 where the baseline sits above 0.5, +1 otherwise: the shift goes
-            # toward the side with headroom. Column vector so it broadcasts per
-            # CpG against the per-sample carrier row.
-            sign = np.where(baseline_mu[block] > 0.5, -1.0, 1.0)[:, None]
+            # The shift goes toward the side with headroom: one scalar for the
+            # whole block, or -- historically -- one per CpG as a column vector
+            # that broadcasts against the per-sample carrier row.
+            if planting_direction == "region_headroom":
+                sign = _region_direction(baseline_mu[block], delta)
+            else:
+                sign = np.where(baseline_mu[block] > 0.5, -1.0, 1.0)[:, None]
             plants.append((
                 actual_start, actual_start + dmr_length - 1,
                 group > 0, matrix[block].copy(),
@@ -208,6 +320,7 @@ def simulate(
     layout: str = "dense",
     max_cpg_gap_bp: int | None = 300,
     marginal: str = "unimodal",
+    planting_direction: str = "region_headroom",
     locations: pd.DataFrame | None = None,
     marginal_sampler: MarginalSampler | None = None,
 ) -> tuple[
@@ -239,14 +352,57 @@ def simulate(
     ``eiger_paper``, which owns the fits; naming one here without supplying a
     ``marginal_sampler`` is an error.
 
+    ``planting_direction`` selects how the sign of a planted shift is chosen. It
+    is validated before anything is drawn and must be one of
+    ``PLANTING_DIRECTIONS``:
+
+    ``"region_headroom"`` (the default)
+        One scalar direction for a whole planted region, chosen from the region's
+        aggregate beta headroom (see ``_region_direction``): every CpG and every
+        carrier in that region is shifted the same way, so the plant is a
+        coordinated, region-consistent DMR. This is the correct default for a
+        power simulation, and the only mode whose blocks match the documented
+        meaning of a planted DMR under a non-unimodal marginal.
+
+    ``"per_cpg_headroom"``
+        The direction is chosen per CpG from that CpG's own baseline, exactly as
+        it was before this argument existed. Under a bimodal or otherwise
+        non-unimodal supplied marginal, adjacent CpGs of one block can then move
+        in opposite directions, so the block is locally anti-correlated rather
+        than coordinated. It exists for byte-exact reproduction of a run made
+        before ``planting_direction`` existed, and for an explicit
+        heterogeneous-direction stress test. It is not a coherent-DMR power
+        simulation.
+
+    The two modes consume the same random numbers in the same order, so carrier
+    identities, truth coordinates and layout placement are identical between them
+    at one seed; only the sign pattern inside a planted block differs. Under
+    ``marginal="unimodal"`` they are byte-identical, every baseline being 0.5.
+
+    **Which stored results this bears on.** A supplied-marginal simulation with
+    planted signal that does not record ``"region_headroom"`` ran under the
+    per-CpG rule and is not coherent-DMR recall-versus-effect evidence; it may be
+    retained as heterogeneous-direction stress evidence if labelled that way.
+    Results with no planted signal -- DMR-free null and any-call calibration,
+    including under a supplied marginal -- and results under
+    ``marginal="unimodal"`` are unaffected, the modes being unreachable in the
+    first case and byte-identical in the second. Record the mode with the run:
+    it is reported at ``locations.attrs["planting_direction"]``.
+
     Each truth entry is ``(start, end, fraction, delta, run_start, run_end,
     effective_delta)``. ``effective_delta`` is the mean absolute post-clip shift
     actually realised over the planted block's carrier entries: equal to ``delta``
     whenever the clip did not bite (always so under ``"unimodal"`` at the deltas
     the benchmarks use), and below it where a supplied baseline sat close enough
-    to a boundary that part of the shift was clipped away.
+    to a boundary that part of the shift was clipped away. Under
+    ``"region_headroom"`` a block whose baselines straddle 0.5 pays for coherence
+    here rather than silently: the one chosen direction has headroom at some of
+    the block's CpGs and less at others, so ``effective_delta`` falls below
+    ``delta``. Plot against ``effective_delta``, not ``delta``, whenever a
+    supplied marginal is in play.
     """
 
+    _check_planting_direction(planting_direction)
     rng = np.random.default_rng(seed)
     strata = strata if strata is not None else []
     n_dmr = len(strata) * replicates
@@ -304,6 +460,7 @@ def simulate(
         matrix, locations, strata=strata, replicates=replicates, spacing=spacing,
         dmr_length=dmr_length, max_cpg_gap_bp=max_cpg_gap_bp, rng=rng,
         n_samples=n_samples, baseline_mu=baseline_mu,
+        planting_direction=planting_direction,
     )
 
     matrix = np.clip(matrix, *BETA_CLIP)
@@ -336,6 +493,7 @@ def simulate(
     # the layout constrained the planting grid (master spec §6.1).
     locations.attrs["layout"] = layout
     locations.attrs["marginal"] = marginal
+    locations.attrs["planting_direction"] = planting_direction
     locations.attrs["n_dmrs_requested"] = n_dmr
     locations.attrs["n_dmrs_not_plantable"] = n_not_plantable
     return matrix, locations, truth

@@ -1,5 +1,154 @@
 # EIGER benchmark: original vs EIGER 2
 
+## The simulator: how a planted DMR is planted
+
+This section documents `eiger2.benchmark.simulate`, which **is** shipped in the
+wheel, as distinct from the harness and tables below, which are not.
+
+### Direction is chosen per region, not per CpG
+
+A planted DMR is a *coordinated* region: one methylation direction, shared by
+every CpG and every carrier sample in the block. `simulate(planting_direction=…)`
+selects how that direction is chosen.
+
+| value | meaning |
+|---|---|
+| `"region_headroom"` (**default**) | One scalar direction for the whole planted region, chosen from the region's aggregate beta headroom. Every CpG and every carrier in that region moves the same way; adjacent CpGs can never receive opposite-signed effects. |
+| `"per_cpg_headroom"` | The direction is chosen independently for each CpG, from that CpG's own baseline (`-1` above 0.5, `+1` otherwise). |
+
+**Region-consistent direction is the default, and it is the only mode that
+simulates an ordinary coherent-DMR power scenario.** `"per_cpg_headroom"` is
+retained for two purposes only: reproducing a run made before
+`planting_direction` existed, and an explicit heterogeneous-direction stress
+test. Under a bimodal or otherwise non-unimodal supplied marginal it can shift
+adjacent CpGs of one block in opposite directions, which makes the block locally
+*anti*-correlated rather than a coordinated region — the opposite of what the
+planted truth claims. Do not use it for a recall-vs-effect curve.
+
+Under `marginal="unimodal"` — the only marginal the package draws on its own —
+every baseline is exactly 0.5, so both modes plant `+delta` at every CpG and are
+byte-identical. The choice only matters when a marginal is supplied through
+`marginal_sampler`.
+
+### The aggregate-headroom rule
+
+For a planted block with baseline means `mu` and nominal effect `delta`, and the
+same `BETA_CLIP = (0.001, 0.999)` bounds the finished matrix is clipped to:
+
+```
+up_i   = clip(mu_i + delta) - clip(mu_i)      # attainable upward shift
+down_i = clip(mu_i) - clip(mu_i - delta)      # attainable downward shift
+```
+
+The region is planted upward when `mean(up) > mean(down)`, downward otherwise,
+and upward on a tie. `HEADROOM_TIE_ATOL` makes that tie-break reachable: a block
+whose baselines are symmetric about 0.5 ties in exact arithmetic but not always
+in floating point, and the documented rule should decide it rather than a
+last-bit rounding difference.
+
+The rule reads the block's baselines, `delta` and the clip bounds and nothing
+else — no biological label, no called region, no q-value, no benchmark outcome —
+and it consumes no random number. Choosing a `planting_direction` therefore does
+not move the random stream: carrier identities, truth coordinates and layout
+placement are identical between the two modes at one seed, and only the sign
+pattern inside a planted block differs.
+
+### `effective_delta` is still the realised beta-scale effect
+
+Each truth entry's `effective_delta` is the mean absolute *post-clip* shift
+actually realised over the planted block's carrier entries, exactly as before.
+It is unchanged in meaning, and it is what a recall-vs-effect curve must be
+plotted against whenever a marginal is supplied.
+
+Region-consistent planting makes that number do visible work. One direction
+cannot have full headroom at every CpG of a block whose baselines straddle 0.5,
+so on such blocks `effective_delta` sits below the nominal `delta` — where the
+per-CpG rule reported the full `delta` by shifting each CpG whichever way suited
+it, and so reported a coherent effect it had not planted. The shortfall is
+recorded per region rather than hidden, and no block is filtered, relocated or
+rejected on account of it.
+
+### What a supplied marginal does and does not reproduce
+
+`marginal_sampler` supplies a per-CpG `(baseline_mu, total_sd)`. That reproduces
+the *marginal* distribution of methylation values — it does not reproduce the
+*spatial autocorrelation* of real data, because each CpG's baseline is supplied
+independently of its neighbours' and the only shared structure in the matrix is
+the latent factors. A fitted-marginal arm is therefore a marginal-realism
+simulation, not a full replication of a real track's correlation structure, and
+its results should be described as such.
+
+### Which earlier simulated results the direction change invalidates
+
+> **Historical — every supplied-marginal *signal* simulation produced before the
+> commit introducing `region_headroom` used the equivalent of
+> `planting_direction="per_cpg_headroom"`.** In those runs adjacent CpGs of one
+> planted block could receive opposite-signed shifts, so the block was not a
+> coherent same-direction region. Such runs are **not** coherent-DMR recall or
+> power evidence and must not be presented as such. They remain valid as
+> heterogeneous-direction (alternating-direction) stress tests, provided they are
+> labelled that way. Results produced under `planting_direction="region_headroom"`
+> are the coherent-DMR evidence.
+
+The exact API this turns on:
+
+```python
+simulate(..., planting_direction="region_headroom")    # coherent DMR; the default
+simulate(..., planting_direction="per_cpg_headroom")   # historical / stress only
+```
+
+**Unaffected — no rerun, no relabelling.**
+
+- `call_dmrs` and every real-data EIGER analysis. The change is confined to the
+  simulator; no caller, inference default or output semantic moved.
+- DMR-free null and any-call calibration, **including under supplied marginals**:
+  no signal is planted, so the planting code path is never entered.
+- Dense/unimodal simulations. Every baseline is exactly 0.5, so the two modes are
+  byte-identical and every pinned digest is unchanged.
+- Coordinate-layout estimation and marginal fitting themselves. The fits are
+  inputs to the simulator, not products of it.
+- Software inference defaults and output semantics, including the truth-tuple
+  schema and `effective_delta`'s meaning.
+
+**Rerun required, under `planting_direction="region_headroom"`.** Relabelling is
+not sufficient: the simulated matrix itself differs.
+
+- Supplied-marginal `signal_grid` and `power_curve` arms.
+- `bimodal_marginal` recall/FDP evidence, and the inputs to Table S6.
+- Realistic-marginal beta-versus-M signal results.
+- Simulated supervised and unsupervised method-comparison arms run on those
+  marginals.
+- M1 `bimodal_atlas` and `bimodal_fitted` weak-signal arms.
+- M1 `delta=0.20` positive controls and the paired amplitude diagnostics.
+- Figures 3 and 4, and every supplementary table or claim consuming the above.
+
+**Historical / stress only.**
+
+- Anything generated under `per_cpg_headroom`, whether or not it was named at the
+  time.
+- Retain it as heterogeneous-direction or alternating-direction stress evidence
+  if that is what is being argued.
+- Never present it as ordinary same-direction DMR power or recall evidence.
+
+**Consumers in `eiger_paper` that need an explicit update.** These are named for
+the reader's orientation; nothing here is a dependency of this repository, and
+the wheel neither imports nor ships any of it.
+
+- `benchmarking/simulate_support.py`
+- `benchmarking/bimodal_marginal.py`
+- `benchmarking/beta_vs_m.py`
+- the comparator runners that simulate under a supplied marginal
+- the uncommitted M1 scripts and protocols
+
+The paper-side simulation helper must pass `planting_direction` **explicitly**
+rather than relying on the default, and must record the value it passed in the
+run manifest, so a stored result states which mode produced it instead of leaving
+it to be inferred from a date. `simulate` reports the mode it used at
+`locations.attrs["planting_direction"]`; that value is a plain string and is the
+one to record.
+
+---
+
 ## Stage 2D screen and confirm workflow
 
 > **This workflow belongs to `eiger_paper`, not to this repository.** The
