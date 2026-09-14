@@ -2,7 +2,7 @@
 
 # EIGER: Estimating Interdependent Genome-wide Epigenetic Regions
 
-**Unsupervised discovery of coordinated DNA methylation regions, with region-level empirical false discovery rate estimation.**
+**Unsupervised discovery of coordinated DNA methylation regions, reported as a ranked candidate list.**
 
 EIGER identifies genomic regions in which neighbouring CpGs show coordinated methylation patterns across samples. Unlike conventional DMR callers, it does not require predefined groups or a specified comparison before regions are identified.
 
@@ -23,7 +23,21 @@ eiger2 call \
     --out results/
 ```
 
-The generated example is 50,000 CpGs on one chromosome. It is below the preferred ~103,000-CpG member-step size but above the exact minimum detectable-region floor, so it exercises the measured short-subtrack fallback while retaining the configured locality-breaking lag. Inspect the manifest's preferred/fallback diagnostics and per-length null opportunity before interpreting its q-values.
+The generated example is 50,000 CpGs on one chromosome. The default run is a
+**discovery** run: it reports candidate regions ranked by `region_area`, and no
+q-value.
+
+```
+rank,region_id,chr,start,end,n_cpg,...,region_area,region_qvalue,...,fdr_status
+1,EIGER2_chr1_511820_512241,chr1,511820,512241,22,...,6.195,,...,no_calibrated_null
+2,EIGER2_chr1_650200_650421,chr1,650200,650421,12,...,3.348,,...,no_calibrated_null
+```
+
+`rank` orders regions by area within chromosome order; `region_qvalue` and
+`significant` are empty, and `fdr_status` says why. **Region FDR against the
+genome background requires matched control matrices**, and the path that
+consumes them is specified but not implemented in this release -- see
+[docs/FDR.md](docs/FDR.md) section 18 for the measurements behind that default.
 
 Full installation instructions, input formats, and command-line options are provided in **[QUICKSTART.md](QUICKSTART.md)**.
 
@@ -45,9 +59,8 @@ EIGER2 was developed to address this limitation and to provide a clearer statist
 |---|---|
 | **Pairwise-complete estimation** | Avoids the covariance reduction introduced by mean imputation. Under 5% missingness in a 24-sample simulation, complete-case estimation detected no regions, meaning that the original result depended strongly on how missing values were handled. |
 | **Correlation as the default statistic** | Correlation normalises covariance by the variance of the CpGs and is therefore less directly constrained by subgroup prevalence once the methylation difference exceeds the background noise. |
-| **A locality-breaking edge threshold** | CpGs are paired with distant sites on the same chromosome to decide which individual edges count as elevated. This preserves cross-sample structure while removing local genomic adjacency. |
-| **A separate region-level null** | Deciding whether a *run* of elevated edges is longer or stronger than chance requires a different null from the one that sets the edge threshold. See "The region-level null" below. |
-| **Region-level empirical FDR estimation** | Null coordination tracks are processed through the same segmentation procedure as the observed data. Region areas are compared within CpG-count strata, giving an empirical region-level false discovery rate with explicit finite-null uncertainty bounds. |
+| **A data-derived edge threshold** | An edge counts as elevated when it exceeds this genome's own 99th percentile of the statistic, taken within joint bp-gap and sample-support bins so that the quantile means the same thing at every spacing and completeness. (Before v2.3 the threshold came from the locality-breaking null; see [docs/FDR.md](docs/FDR.md) section 18 for why it no longer does.) |
+| **Ranked candidates by default** | Runs of elevated edges become regions, and regions are ranked by `region_area`. Region FDR against the genome background is available only when matched control matrices are supplied: every self-calibrated background null measured on WGBS-realistic data failed. |
 
 The assumptions and commands underlying these changes are documented in **[docs/](docs/)**. The validation analyses themselves live in the separate `eiger_paper` repository, which is not part of this package: see its **[analysis/README.md](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/analysis/README.md)**.
 
@@ -85,10 +98,11 @@ Full derivation is in **[docs/FDR.md](docs/FDR.md)**.
 
 A separate set of **structural gates** -- signal-independent conditions on the null's
 construction, checked regardless of whether the observed data contains any signal at all --
-can fail closed. `manifest["status"]` is one of four values:
+can fail closed. `manifest["status"]` is one of five values:
 
 | status | meaning |
 |---|---|
+| `discovery_only` | **the default.** No region null was built, so `region_qvalue`, its bounds and `significant` are refused (`NaN`/`pd.NA`) with `fdr_status = "no_calibrated_null"`, and the regions are ranked candidates. Nothing failed; nothing was claimed |
 | `ok` | no structural failure, no calibration-diagnostic concern |
 | `ok_with_warnings` | a calibration diagnostic above is out of its expected range; `region_qvalue`/`significant` unaffected |
 | `partial_inference` | one or more length strata lacked enough null OPPORTUNITY to report `region_qvalue` (below `m_opportunity`, spec §2c); those strata's rows are refused (`NaN`/`pd.NA`), every other stratum reports normally -- the null is otherwise sound |
@@ -106,9 +120,12 @@ affect the exit code -- every other stratum's `region_qvalue` is unaffected and 
 
 ### Minimum input size, and automatic fallback
 
-The preferred 100-position member-step construction needs about **103,000 CpGs on a chromosome** at default settings. Shorter chromosomes now use the fallback above. The absolute construction floor is derived from the minimum detectable region: `null_min_lag × (min_cpgs + window − 1)`, **7,000 CpGs** at the defaults. Below that, `region_null_mode="auto"` falls back to the older `"lag"` construction and prints a warning.
+The preferred 100-position member-step construction needs about **103,000 CpGs on a chromosome** at default settings. Shorter chromosomes now use the fallback above. The absolute construction floor is derived from the minimum detectable region: `null_min_lag × (min_cpgs + window − 1)`, **7,000 CpGs** at the defaults. Both matter only when a region null is requested at all.
 
-Pass `--region-null-mode member_step` to raise an error instead of falling back, or `--region-null-mode off` to skip `region_qvalue` entirely and report candidate regions only.
+Since v2.3 `--region-null-mode` defaults to `off`, and `"auto"` has been removed: it
+resolved silently to a null now known to be misspecified on WGBS backgrounds.
+`--region-null-mode member_step` and `--region-null-mode lag` remain available by
+explicit request, both with a warning naming [docs/FDR.md](docs/FDR.md) section 18.
 
 ---
 
@@ -301,7 +318,10 @@ prevalence, largest-gap tail and influence/robustness details live in
 `region_support_diagnostics.csv`, keyed by `region_id`; see
 **[docs/BIOLOGICAL_SUPPORT.md](docs/BIOLOGICAL_SUPPORT.md)**.
 
-**`region_qvalue` is the principal field used to assess region-level statistical support.**
+**`rank` is the principal field on the default path: regions ordered by
+`region_area` within chromosome order.** `region_qvalue` and the six columns below
+it are populated only when a region null was requested and built; on the default
+path they are `NaN` and `fdr_status` reads `no_calibrated_null`.
 
 Other fields, including methylation difference, direction, and inferred sample grouping, are descriptive. These values are calculated after region selection using the same data and should not be treated as independent statistical evidence or used as additional significance filters without further validation.
 

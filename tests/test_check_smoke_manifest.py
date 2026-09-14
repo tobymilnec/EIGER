@@ -199,3 +199,22 @@ def test_a_manifest_with_no_structural_gates_fails(tmp_path):
     result = run_checker(tmp_path, make_manifest(structural={}))
     assert result.returncode == 1
     assert "no structural gate results" in result.stderr
+
+
+def test_discovery_only_passes_with_no_structural_gates(tmp_path):
+    # v2.3's default path builds no null, so it reports no null-construction
+    # gates. That is the correct shape for that status, not a truncated
+    # manifest, and it is a pass.
+    manifest = make_manifest(status="discovery_only", structural={})
+    result = run_checker(tmp_path, manifest)
+    assert result.returncode == 0, result.stderr
+    assert "none built (discovery_only)" in result.stdout
+
+
+def test_discovery_only_with_structural_gates_is_self_contradictory(tmp_path):
+    # Gates on a null that was never built mean one of the two statements is
+    # false; the checker must not pick which.
+    manifest = make_manifest(status="discovery_only")
+    result = run_checker(tmp_path, manifest)
+    assert result.returncode == 1
+    assert "contradicts itself" in result.stderr

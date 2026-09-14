@@ -68,6 +68,7 @@ from .core import (
     LOW_PREVALENCE_SAMPLE_CEILING,
     NEAR_BOUNDARY_CONCENTRATION_NOTE,
     NEAR_CUTOFF_CONCENTRATION_NOTE,
+    NO_CALIBRATED_NULL_NOTE,
     Eiger2Config,
     call_dmrs,
     chromosome_sort_permutation,
@@ -671,6 +672,15 @@ def command_call(args: argparse.Namespace) -> int:
             f"input has {matrix.shape[0]:,} CpGs, member_step needs >= "
             f"{min_n_cpg:,}"
         )
+        if config.region_null_mode != "off":
+            print(
+                f"[eiger2] WARNING: region_null_mode={config.region_null_mode!r} "
+                "calibrates region_qvalue against the locality-breaking null, "
+                "which is misspecified on WGBS backgrounds -- see "
+                "docs/FDR.md section 18. The default is 'off': ranked "
+                "candidates, no genome-background FDR.",
+                file=sys.stderr,
+            )
         regions, values, caller_manifest = call_dmrs(
             matrix, locations, sample_names=samples, config=config
         )
@@ -699,24 +709,6 @@ def command_call(args: argparse.Namespace) -> int:
         values.to_csv(out / "region_sample_means.csv", index=False)
 
     warnings_list: list[str] = []
-    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
-    # left at its default "auto" fell back to "lag" because the input was
-    # below member_step's minimum size. Loud and immediate (printed to stderr
-    # below, not only recorded in the manifest), naming the input size, the
-    # required size, and that "lag" fails both region gates and is not
-    # calibrated -- the whole point of the fallback is that this is visible in
-    # the output, not merely non-fatal.
-    fallback = caller_manifest.get("gates", {}).get("region_null_mode_fallback")
-    if fallback:
-        warnings_list.append(
-            f"region_null_mode='auto' fell back to 'lag': input has "
-            f"{fallback['n_cpg']:,} CpGs, below member_step's minimum of "
-            f"{fallback['n_cpg_required']:,}. 'lag' fails both region-level "
-            f"exchangeability gates on real layouts and its region_qvalue is "
-            f"not calibrated -- treat it as candidates-only. Pass "
-            f"--region-null-mode member_step to raise instead of falling "
-            f"back, or --region-null-mode off to skip region_qvalue entirely."
-        )
     fdr_diag = caller_manifest.get("fdr") or {}
     # Spec §2c: null-opportunity adequacy is a per-LENGTH-stratum check now,
     # not a single aggregate one -- a refused stratum's rows are suppressed,
@@ -782,7 +774,7 @@ def command_call(args: argparse.Namespace) -> int:
             f"long enough, regardless of what was called"
         )
     acf_gate_result = caller_manifest.get("gates", {}).get("acf")
-    if acf_gate_result is not None and not acf_gate_result["passed"]:
+    if acf_gate_result is not None and not acf_gate_result.get("passed", True):
         bad_lags = [
             lag for lag, d in acf_gate_result["diff"].items()
             if not (np.isfinite(d) and abs(d) <= acf_gate_result["tolerance"])
@@ -794,7 +786,7 @@ def command_call(args: argparse.Namespace) -> int:
             f"hard gate on a signal-rich cohort"
         )
     region_exch = caller_manifest.get("gates", {}).get("region_exchangeability")
-    if region_exch is not None:
+    if region_exch is not None and not region_exch.get("skipped"):
         ratio = region_exch["region_exchangeability_ratio"]
         if not math.isfinite(ratio):
             warnings_list.append(
@@ -883,11 +875,17 @@ def command_call(args: argparse.Namespace) -> int:
               f"unobserved in every sample")
     print(f"[eiger2] caller     : {'legacy' if args.legacy else 'eiger2'}")
     print(f"[eiger2] regions    : {len(regions)}")
-    if significant is not None:
+    run_status = caller_manifest.get("status")
+    if run_status == "discovery_only":
+        # "0 significant" would be a measurement; nothing was measured.
+        print(
+            "[eiger2] significant: not computed (candidates ranked by "
+            "region_area; region FDR needs matched controls)"
+        )
+    elif significant is not None:
         print(f"[eiger2] significant: {significant} at q <= {args.target_fdr}")
     else:
         print("[eiger2] significant: n/a (legacy defines no error rate)")
-    run_status = caller_manifest.get("status")
     if run_status:
         print(f"[eiger2] status      : {run_status}")
     if run_status == "ok_with_warnings":
@@ -897,6 +895,13 @@ def command_call(args: argparse.Namespace) -> int:
             f"measured values.",
             file=sys.stderr,
         )
+    elif run_status == "discovery_only":
+        print(
+            f"[eiger2] NOTE: {NO_CALIBRATED_NULL_NOTE}\n"
+            f"         The regions above are candidates, ranked by "
+            f"region_area (column `rank`).",
+            file=sys.stderr,
+        )
     elif run_status == "partial_inference":
         print(
             "[eiger2] NOTE: one or more length strata lacked enough null "
@@ -904,24 +909,6 @@ def command_call(args: argparse.Namespace) -> int:
             "rows are refused (NaN / pd.NA); every other stratum reports "
             "normally -- the null is otherwise sound. See the WARNING(s) "
             "below for which stratum/strata and why.",
-            file=sys.stderr,
-        )
-    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
-    # "auto" fell back to "lag" -- loud and immediate, not buried only in the
-    # manifest (STOP 1e §5 flagged the previous behaviour, a hard uncatchable
-    # error with no CLI way out, as broken for a public tool).
-    fallback = (caller_manifest.get("gates") or {}).get("region_null_mode_fallback")
-    if fallback:
-        print(
-            f"[eiger2] WARNING: region_null_mode='auto' fell back to 'lag'\n"
-            f"         (input has {fallback['n_cpg']:,} CpGs, below "
-            f"member_step's minimum of {fallback['n_cpg_required']:,}).\n"
-            f"         'lag' fails both region-level exchangeability gates on "
-            f"real layouts and its region_qvalue is not calibrated -- treat "
-            f"it as candidates-only.\n"
-            f"         Pass --region-null-mode member_step to raise instead "
-            f"of falling back, or --region-null-mode off to skip "
-            f"region_qvalue entirely.",
             file=sys.stderr,
         )
     # Spec §2c: per-LENGTH-stratum null-opportunity refusal -- that stratum's
@@ -1074,7 +1061,7 @@ def command_call(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     acf_gate_result = (caller_manifest.get("gates") or {}).get("acf")
-    if acf_gate_result is not None and not acf_gate_result["passed"]:
+    if acf_gate_result is not None and not acf_gate_result.get("passed", True):
         tolerance = acf_gate_result["tolerance"]
         bad_lags = [
             lag for lag in acf_gate_result["lags"]
@@ -1093,8 +1080,10 @@ def command_call(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     region_exch = (caller_manifest.get("gates") or {}).get("region_exchangeability")
-    if region_exch is not None and not math.isfinite(
-        region_exch["region_exchangeability_ratio"]
+    if (
+        region_exch is not None
+        and not region_exch.get("skipped")
+        and not math.isfinite(region_exch["region_exchangeability_ratio"])
     ):
         print(
             f"[eiger2] WARNING: Gate 2 (region-level exchangeability, master spec "
@@ -1391,13 +1380,14 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["member_step", "lag", "off"], default=None,
                        help="region-level null behind region_qvalue (distinct "
                             "from --null-mode above). Default (unset here) is "
-                            "'auto': use 'member_step' when the input clears "
-                            "its min_cpgs-derived absolute floor (7,000 CpGs "
-                            "at defaults; 103,000 is preferred, with measured "
-                            "short-subtrack fallback below it), else fall back "
-                            "to 'lag' "
-                            "automatically with a warning. Pass 'member_step' "
-                            "explicitly to raise instead of falling back; "
+                            "'off': no region null is built, region_qvalue is "
+                            "refused with fdr_status='no_calibrated_null', "
+                            "and the output is the ranked candidate list. "
+                            "'member_step' and 'lag' are calibrated against "
+                            "the locality-breaking null, misspecified on WGBS "
+                            "backgrounds (docs/FDR.md section 18), and warn "
+                            "when requested; 'member_step' raises below its "
+                            "minimum size rather than falling back; "
                             "'lag' for small inputs or reproducing historical "
                             "comparisons (fails both region gates, not "
                             "recommended for inference); 'off' to skip the "

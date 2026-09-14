@@ -53,6 +53,7 @@ __all__ = [
     "estimate_latent_basis",
     "member_step_chromosome_feasibility",
     "null_threshold",
+    "observed_edge_threshold",
     "permutation_null_tracks",
     "region_fdr",
     "region_minority_size",
@@ -104,6 +105,21 @@ BOTTOM_STRATUM_FDR_NOTE = (
 # the measurement that decided it), so this count is REPORTED rather than
 # filtered: a NOTE, not a gate. It changes no q-value, no `significant` call
 # and no run status. Shared with cli.py so the wording has one source.
+# The default path builds no region null, so there is no region FDR against
+# the genome background to report. Shared with cli.py so the wording has one
+# source, and written into the manifest so a reader of the output alone is told
+# what the run does not claim.
+NO_CALIBRATED_NULL_NOTE = (
+    "No region FDR against the genome background. region_null_mode='off' is "
+    "the default: every self-calibrated background null measured on "
+    "WGBS-realistic data failed (docs/FDR.md section 18), so region_qvalue, "
+    "region_qvalue_upper_95 and significant are refused and the regions are "
+    "reported as candidates ranked by region_area. Region FDR against the "
+    "genome background requires matched control matrices; the calibrated "
+    "opt-in path that consumes them (--null-reference) is specified in "
+    "docs/FDR.md section 18 and is not implemented in this release."
+)
+
 LOW_PREVALENCE_SAMPLE_CEILING = 2
 LOW_PREVALENCE_NOTE = (
     "Low-prevalence regions. Some significant regions are carried by one or "
@@ -374,7 +390,7 @@ class Eiger2Config:
     observed cutoff curve (including its number of discoveries), not on an
     artificial one-region denominator; see docs/FDR.md.
     """
-    null_quantile: float = 0.995
+    null_quantile: float = 0.99
     null_min_lag: int = 1000
     """Minimum genomic separation, in retained CpG rows, between the CpGs paired
     to build the null. Must comfortably exceed the methylation correlation
@@ -401,21 +417,26 @@ class Eiger2Config:
     from delta beta.
     """
 
-    region_null_mode: str = "auto"
-    """``"auto"`` | ``"member_step"`` | ``"lag"`` | ``"off"``. The REGION-level
-    null construction, distinct from ``null_mode`` above (which is edge-level:
+    region_null_mode: str = "off"
+    """``"off"`` | ``"member_step"`` | ``"lag"``. The REGION-level null
+    construction, distinct from ``null_mode`` above (which is edge-level:
     which edges count as elevated). This axis decides which *runs* of elevated
     edges are significant.
 
-    ``"auto"`` (default): use ``"member_step"`` (below) when the input clears
-    its genome-scale minimum-size floor (``member_step_min_n_cpg(config)``);
-    otherwise fall back to ``"lag"`` automatically, with a warning naming the
-    input size, the required size, and that ``"lag"``'s q-values are not
-    calibrated (``call_dmrs`` records ``manifest["gates"]
-    ["region_null_mode_fallback"]``). An **explicitly** requested
-    ``"member_step"`` (below) does NOT fall back: a caller who asked for it by
-    name is told it cannot be done on this input, not silently given
-    something else.
+    ``"off"`` (default): no region null is built at all, and no region FDR
+    against the genome background is claimed. ``region_qvalue``,
+    ``region_qvalue_upper_95`` and ``significant`` are refused (``NaN`` /
+    ``-1`` / ``pd.NA``) with ``fdr_status = "no_calibrated_null"``, and the
+    output is the ranked candidate list. This is the default because every
+    self-calibrated background null measured on WGBS-realistic data failed:
+    the locality-breaking null tests a hypothesis that is false everywhere on
+    such a background (``docs/FDR.md`` section 18). Region FDR against the
+    genome background requires matched control matrices.
+
+    ``"auto"`` was REMOVED: it resolved to ``"member_step"`` or ``"lag"``,
+    both of which are now off the default path, so a silent resolution to a
+    misspecified null is exactly what must not happen. Requesting it raises,
+    naming this default.
 
     ``"member_step"``: consecutive null "positions" step by one LAG (not one
     CpG), so they share ``window - 1`` of ``window`` members exactly as
@@ -424,22 +445,18 @@ class Eiger2Config:
     ``member_step_lag_null_ensemble``). Passes both region-level gates on real
     layouts at genome scale with recall identical to ``"lag"``; see
     ``docs/FDR.md``. Raises below its minimum-size floor rather than
-    degrading silently -- use ``"auto"`` (default) unless you specifically
-    want that raise.
+    degrading silently. Available only by explicit request, and warns: its
+    q-values are calibrated against the locality-breaking null whose
+    misspecification is documented in ``docs/FDR.md`` section 18.
 
     ``"lag"``: the region-level null built the same way as the edge-level one
     -- consecutive positions slide by one CpG rather than sharing members the
     way the observed track does. **Fails region-level exchangeability on real
-    layouts** -- do not request it directly for region-level inference; kept
-    for small inputs (``"auto"``'s fallback) and reproducibility. Still the
-    edge-level null every ``null_mode`` uses; only the REGION-level use of it
-    is not recommended.
-
-    ``"off"``: no region null is built at all. ``region_qvalue`` and every
-    inferential column are refused (``NaN`` / ``-1`` / ``significant=False``)
-    via the same degenerate path ``region_fdr_result`` already takes for
-    ``replicates == 0`` -- an explicit, cheap "candidates only, no region FDR"
-    mode, not a new refusal mechanism.
+    layouts** -- kept for small inputs and reproducibility, available only by
+    explicit request and with the same warning. Requesting either mode also
+    restores the locality-breaking edge null as the source of the edge
+    threshold, since the null tracks must be segmented against a threshold of
+    their own.
     """
 
     n_lag_draws: int = 75
@@ -603,7 +620,7 @@ class Eiger2Config:
     constitute a valid construction").
 
     The threshold is an upper quantile and needs a populated tail. At the
-    default ``null_quantile`` of 0.995 this floor leaves at least five null
+    default ``null_quantile`` of 0.99 this floor leaves at least ten null
     values above the threshold, which is the minimum for it to mean anything.
     Genome-scale runs will exceed it by orders of magnitude; the floor exists to
     catch small or heavily fragmented inputs, not to set a target.
@@ -753,14 +770,21 @@ class Eiger2Config:
                 "(edge-wise permutation destroys the same autocorrelation "
                 "the corrected 'lag' null exists to preserve). Use the "
                 "default null_mode='lag' for the edge-level null; for the "
-                "region-level null, see region_null_mode='member_step' (or "
-                "leave it at its default 'auto', which resolves to "
-                "'member_step' automatically on input large enough to "
-                "support it)."
+                "region-level null, see region_null_mode='member_step', "
+                "which must now be requested by name."
             )
-        if self.region_null_mode not in {"auto", "member_step", "lag", "off"}:
+        if self.region_null_mode == "auto":
             raise ValueError(
-                "region_null_mode must be 'auto', 'member_step', 'lag', or 'off'"
+                "region_null_mode='auto' was removed: it resolved silently to "
+                "'member_step' or 'lag', both of which are calibrated against "
+                "the locality-breaking null that is misspecified on WGBS "
+                "backgrounds (docs/FDR.md section 18). Use the default "
+                "region_null_mode='off' for ranked candidates, or request "
+                "'member_step'/'lag' by name and accept the warning."
+            )
+        if self.region_null_mode not in {"member_step", "lag", "off"}:
+            raise ValueError(
+                "region_null_mode must be 'off', 'member_step', or 'lag'"
             )
         if self.n_lag_draws < 1:
             raise ValueError("n_lag_draws must be positive")
@@ -1845,9 +1869,9 @@ def member_step_lag_null_tracks(
 def member_step_min_n_cpg(config: Eiger2Config) -> int:
     """Minimum TOTAL ``n_cpg`` for ``region_null_mode="member_step"`` to be
     worth attempting at all: the smallest input able to carry the configured
-    minimum detectable region at ``null_min_lag``. Shared by ``call_dmrs``'s
-    ``region_null_mode="auto"`` fallback check, so a cheap pre-check and the
-    real construction cannot silently drift apart in what "too small" means.
+    minimum detectable region at ``null_min_lag``. Reported by ``cli.py``
+    before a run, so a caller who is about to request ``"member_step"`` sees
+    the constraint before the pipeline runs rather than after it raises.
 
     Deliberately genome-wide, not per-chromosome (spec §2b.4's own
     construction IS per-chromosome): this is a cheap, approximate,
@@ -2403,6 +2427,106 @@ def null_threshold(
             f"raise null_replicates, or call chromosomes separately."
         )
     return threshold, diagnostics
+
+
+EDGE_GAP_BIN_UPPER_BP = np.array([4, 19, 49, 99, 300], dtype=np.int64)
+"""Upper bp gap of each edge-threshold gap bin; the last bin is open-ended.
+
+A CpG pair 3 bp apart and one 4 kb apart do not have the same null
+coordination, so one genome-wide quantile is not one threshold: it is a
+mixture whose composition varies along the genome. Conditioning on the gap
+(and on how many samples actually observe the whole window) makes the quantile
+mean the same thing everywhere.
+"""
+
+MIN_EDGES_PER_THRESHOLD_BIN = 1_000
+"""Below this many usable edges a threshold bin borrows: joint -> gap -> global.
+
+A quantile of a few hundred values is mostly noise; 1,000 edges put at least
+ten above a 0.99 quantile, the same resolution floor ``min_null_values`` uses.
+"""
+
+
+def observed_edge_threshold(
+    statistic: np.ndarray,
+    eligible: np.ndarray,
+    locations: pd.DataFrame,
+    support: np.ndarray,
+    config: Eiger2Config,
+) -> tuple[np.ndarray, dict]:
+    """Per-edge threshold: the OBSERVED track's own ``null_quantile``, within
+    joint bp-gap x complete-window-support bins.
+
+    This is the default discovery threshold. It asks "which edges are extreme
+    for this genome, given this gap and this support?" and answers it from the
+    genome in front of it, rather than from the locality-breaking null, whose
+    hypothesis is false everywhere on a WGBS background (docs/FDR.md §18).
+
+    A joint bin with fewer than ``MIN_EDGES_PER_THRESHOLD_BIN`` usable edges
+    takes its quantile from its gap bin, then from every usable edge. The
+    returned array always has ``statistic``'s shape; ineligible edges carry the
+    global quantile and are never segmented anyway.
+    """
+
+    statistic = np.asarray(statistic, dtype=float)
+    usable = np.asarray(eligible, dtype=bool) & np.isfinite(statistic)
+    support = np.asarray(support, dtype=np.int64)
+    usable &= support >= 0
+    if not usable.any():
+        raise ValueError(
+            "no usable observed edges: every edge is ineligible, non-finite or "
+            "observed in no complete window"
+        )
+
+    starts = locations["start"].to_numpy(dtype=np.int64)
+    ends = locations["end"].to_numpy(dtype=np.int64)
+    gaps = starts[1:] - ends[:-1]
+    gap_bin = np.searchsorted(EDGE_GAP_BIN_UPPER_BP, gaps, side="left")
+
+    support_edges = np.unique(np.quantile(support[usable], (0.25, 0.5, 0.75)))
+    support_bin = _assign_support_bin(support, support_edges)
+    joint = gap_bin * (support_edges.size + 1) + support_bin
+
+    global_threshold = float(np.quantile(statistic[usable], config.null_quantile))
+    thresholds = np.full(statistic.size, global_threshold, dtype=float)
+    sources = {"joint": 0, "gap": 0, "global": 0}
+    per_bin: list[dict] = []
+    for label in np.unique(joint[usable]):
+        rows = usable & (joint == label)
+        source, source_name = rows, "joint"
+        if int(rows.sum()) < MIN_EDGES_PER_THRESHOLD_BIN:
+            source = usable & (gap_bin == gap_bin[np.flatnonzero(rows)[0]])
+            source_name = "gap"
+        if int(source.sum()) < MIN_EDGES_PER_THRESHOLD_BIN:
+            source, source_name = usable, "global"
+        value = float(np.quantile(statistic[source], config.null_quantile))
+        thresholds[rows] = value
+        sources[source_name] += int(rows.sum())
+        per_bin.append({
+            "gap_bin": int(label // (support_edges.size + 1)),
+            "support_bin": int(label % (support_edges.size + 1)),
+            "edges": int(rows.sum()),
+            "source": source_name,
+            "threshold": value,
+        })
+
+    diagnostics = {
+        "mode": "observed_gap_support_quantile",
+        "null_quantile": config.null_quantile,
+        "usable_edges": int(usable.sum()),
+        "gap_bins_upper_bp": EDGE_GAP_BIN_UPPER_BP.tolist(),
+        "support_bin_edges": support_edges.tolist(),
+        "min_edges_per_bin": MIN_EDGES_PER_THRESHOLD_BIN,
+        "threshold": global_threshold,
+        "threshold_edges_by_source": sources,
+        "threshold_by_bin": per_bin,
+        "note": (
+            "the edge threshold is the observed track's own quantile within "
+            "joint gap and support bins; the locality-breaking null is not "
+            "used on this path (docs/FDR.md section 18)"
+        ),
+    }
+    return thresholds, diagnostics
 
 
 # --------------------------------------------------------------------------
@@ -4125,194 +4249,251 @@ def call_dmrs(
         s for s in LENGTH_STRATA if s not in realised
     ]
     manifest["layout"] = layout_diagnostics
-    # The threshold always comes from the locality-breaking null: it decides
-    # which individual edges count as elevated, and that question is unaffected
-    # by cohort size in the way the region-level question is.
-    try:
-        # Construct the expensive edge-null ensemble once. ``null_threshold``
-        # accepts precomputed tracks specifically so thresholding, diagnostics,
-        # structural gates, and the lag-mode region null all share the exact
-        # same deterministic realisations.
-        tracks = null_tracks(deflated, config, frame)
-        threshold, null_diagnostics = null_threshold(
-            deflated, config, frame, tracks=tracks,
-            statistic=statistic, eligible=eligible,
-        )
-    except ValueError as exc:
-        # Structural gate (spec §2a.2): numerical failure in the null
-        # pipeline -- e.g. the locality-breaking null produced no usable
-        # pairs at all. Fail closed with a manifest naming the failure
-        # rather than an unhandled exception with no output at all; there is
-        # no threshold to segment against, so no candidates are possible.
-        manifest["status"] = "inference_unreliable"
-        manifest["gates"] = {
-            "structural": {
-                "numerical_failure": {"passed": False, "error": str(exc)},
-            },
-        }
-        return empty_regions, empty_values, manifest
-    null_diagnostics["mode"] = config.null_mode
-    # null_mode="permutation" is rejected at Eiger2Config construction, so
-    # this is the only edge-level null reachable here.
-    manifest["null"] = null_diagnostics
 
-    # Spec §2b.3: a chromosome too small to admit a feasible lag
-    # (chromosome_lag_feasibility, computed once here and reused by
-    # null_tracks() above via its own internal call) contributes nothing to
-    # the null in any replicate. It is not silently dropped behind a fixed
-    # warning threshold -- its share of the genome's own eligible observed
-    # edges is measured (`missing_exposure`) and escalated to a structural
-    # gate when material.
-    chromosome_feasibility = chromosome_lag_feasibility(
-        frame, config, observed_eligible=eligible,
-    )
-    infeasible_chromosome_edges = sum(
-        v["eligible_observed_edges"] for v in chromosome_feasibility.values()
-        if not v["feasible"]
-    )
-    total_chromosome_edges = sum(
-        v["eligible_observed_edges"] for v in chromosome_feasibility.values()
-    )
-    missing_exposure = (
-        infeasible_chromosome_edges / total_chromosome_edges
-        if total_chromosome_edges else 0.0
+    # --- support-conditioned threshold ---
+    n_cpg_total = deflated.shape[0]
+    w = max(config.window, 1)
+    finite_mask = np.isfinite(deflated)
+
+    def _member_offsets(window: int, lag: int = 1) -> np.ndarray:
+        """Window-member offsets from a base position: the adjacent pair at
+        w=1 (offsets [0, lag]), else [0, lag, 2*lag, ..., (w-1)*lag].
+        `lag=1` gives the observed-track convention; any other `lag` gives a null
+        position's member set, matching `_lag_null_track`'s own construction."""
+        if window == 1:
+            return np.array([0, lag])
+        return np.arange(window) * lag
+
+    obs_offsets = _member_offsets(w)
+    obs_offset0 = 0 if w == 1 else w // 2 - 1
+    obs_base = np.arange(statistic.size) - obs_offset0
+    valid_obs = (obs_base >= 0) & (obs_base + obs_offsets.max() < n_cpg_total)
+    observed_support = np.zeros(statistic.size, dtype=np.int64)
+    observed_support[valid_obs] = _window_support(
+        finite_mask, obs_base[valid_obs], obs_offsets,
     )
 
-    # Structural gates (spec §2a.2): signal-independent conditions that are
-    # broken regardless of whether real signal is present, so they can hard-
-    # fail without the false-rejection risk revision 1's calibration-ratio
-    # gates carried (§0.1) -- these do not depend on the observed track at
-    # all, only on how much of the null actually survived construction.
-    surviving_fraction = (
-        len(tracks) / config.null_replicates if config.null_replicates else 0.0
-    )
-    structural_gates = {
-        "surviving_null_tracks": {
-            "surviving": len(tracks),
-            "null_replicates": config.null_replicates,
-            "fraction": surviving_fraction,
-            "floor_fraction": 0.5,
-            "passed": surviving_fraction >= 0.5,
-        },
-        "null_coverage": {
-            "value": null_diagnostics["null_coverage"],
-            "floor": config.min_null_coverage,
-            "passed": null_diagnostics["null_coverage"] >= config.min_null_coverage,
-        },
-        "null_construction": {
-            "value": null_diagnostics["null_values"],
-            "floor": config.min_null_values,
-            "passed": null_diagnostics["null_values"] >= config.min_null_values,
-            "note": (
-                "too few pooled null values to constitute a valid construction "
-                "-- promoted from null_threshold's pre-existing warning "
-                "(config.min_null_values) to a hard gate."
-            ),
-        },
-        "chromosome_exposure": {
-            "missing_exposure": missing_exposure,
-            # Explicit and independently tunable (spec §2b.3's own wording:
-            # "rather than an arbitrary percentage" -- an EXPLICIT, DOCUMENTED,
-            # SWEEPABLE percentage is the honest form of that, not a floor
-            # borrowed from min_null_coverage, a different quantity: that one
-            # is about how much of the OFFERED null was usable, this one
-            # about how much of the OBSERVED genome has no null
-            # representation at all).
-            "floor": config.max_missing_null_exposure,
-            "passed": missing_exposure <= config.max_missing_null_exposure,
-            "infeasible_chromosomes": sorted(
-                name for name, v in chromosome_feasibility.items()
-                if not v["feasible"]
-            ),
-            "note": (
-                "no feasible lag on these chromosomes (spec §2a.2/§2b.3) -- "
-                "excluded from the null in every replicate, not silently, "
-                "since their share of this run's own eligible observed "
-                "edges is measured and gated here explicitly. See "
-                "manifest['null']['threshold_by_chromosome'] for the cheap "
-                "half of the sensitivity report: the same null_quantile "
-                "recomputed per feasible chromosome, alongside the pooled "
-                "threshold it is a comparison for."
-            ),
-        },
-    }
-    # The REGION-level null, a separate axis from the edge-level `tracks`
-    # above. `"lag"` reuses `tracks` directly; `"member_step"` builds an
-    # independent ensemble reproducing the observed track's autocorrelation;
-    # `"off"` uses `region_fdr_result`'s existing degenerate (NaN/-1) path for
-    # `replicates == 0`. `"auto"` (the default) resolves to `"member_step"`
-    # when the input clears its minimum-size floor, else falls back to
-    # `"lag"` and records why in `region_null_mode_fallback` below (`cli.py`
-    # turns that into a stderr warning; this function does no I/O). An
-    # EXPLICIT `"member_step"` request does not fall back and still raises
-    # below the floor. Every branch from here on keys on
-    # `resolved_region_null_mode`, not `config.region_null_mode`.
-    region_null_mode_fallback: dict | None = None
+    support_dispersion = float("nan")
+    usable_mask = eligible & np.isfinite(statistic)
+    if np.any(usable_mask):
+        usable_support = observed_support[usable_mask]
+        median = np.median(usable_support)
+        if median > 0:
+            support_dispersion = float(
+                (np.quantile(usable_support, 0.9) - np.quantile(usable_support, 0.1))
+                / median
+            )
+
+    # --- the edge threshold ---
+    #
+    # Default path (`region_null_mode="off"`): the threshold is the OBSERVED
+    # track's own `null_quantile` within joint bp-gap and support bins. The
+    # locality-breaking null is not built at all -- it tests "is there any
+    # regional coordination here?", a hypothesis that is false everywhere on a
+    # WGBS background, so its quantile is not the quantile of anything this
+    # genome is (docs/FDR.md section 18). Skipping it also removes the whole
+    # null ensemble from the default run.
+    #
+    # `"lag"`/`"member_step"` (explicit request only): unchanged. Those modes
+    # segment null TRACKS, whose region areas can only be compared with the
+    # observed ones when both are measured against a threshold built the same
+    # way, so the legacy null-derived threshold stays with them.
     resolved_region_null_mode = config.region_null_mode
-    if config.region_null_mode == "auto":
-        n_cpg_here = deflated.shape[0]
-        min_n_cpg = member_step_min_n_cpg(config)
-        if n_cpg_here < min_n_cpg:
-            resolved_region_null_mode = "lag"
-            region_null_mode_fallback = {
-                "requested": "auto",
-                "used": "lag",
-                "reason": "input below member_step minimum",
-                "n_cpg": int(n_cpg_here),
-                "n_cpg_required": int(min_n_cpg),
+    if resolved_region_null_mode != "off":
+        # A library caller never sees cli.py's stderr, and this is not a
+        # detail to find out about from the manifest afterwards.
+        warnings.warn(
+            f"region_null_mode={resolved_region_null_mode!r} calibrates "
+            "region_qvalue against the locality-breaking null, which is "
+            "misspecified on WGBS backgrounds -- see docs/FDR.md section 18. "
+            "The default is 'off': ranked candidates, no genome-background "
+            "FDR.",
+            UserWarning,
+            stacklevel=2,
+        )
+    structural_gates: dict = {}
+    tracks: list = []
+    observed_per_edge_threshold: np.ndarray | None = None
+    if resolved_region_null_mode == "off":
+        try:
+            observed_per_edge_threshold, null_diagnostics = observed_edge_threshold(
+                statistic, eligible, frame, observed_support, config,
+            )
+        except ValueError as exc:
+            # Same fail-closed contract as the null path below: no threshold
+            # means no candidates are possible, so say why in the manifest
+            # rather than raise.
+            manifest["status"] = "inference_unreliable"
+            manifest["gates"] = {
+                "structural": {
+                    "numerical_failure": {"passed": False, "error": str(exc)},
+                },
             }
-        else:
-            resolved_region_null_mode = "member_step"
+            return empty_regions, empty_values, manifest
+        threshold = float(null_diagnostics["threshold"])
+        manifest["null"] = null_diagnostics
+    else:
+        # The threshold always comes from the locality-breaking null: it decides
+        # which individual edges count as elevated, and that question is unaffected
+        # by cohort size in the way the region-level question is.
+        try:
+            # Construct the expensive edge-null ensemble once. ``null_threshold``
+            # accepts precomputed tracks specifically so thresholding, diagnostics,
+            # structural gates, and the lag-mode region null all share the exact
+            # same deterministic realisations.
+            tracks = null_tracks(deflated, config, frame)
+            threshold, null_diagnostics = null_threshold(
+                deflated, config, frame, tracks=tracks,
+                statistic=statistic, eligible=eligible,
+            )
+        except ValueError as exc:
+            # Structural gate (spec §2a.2): numerical failure in the null
+            # pipeline -- e.g. the locality-breaking null produced no usable
+            # pairs at all. Fail closed with a manifest naming the failure
+            # rather than an unhandled exception with no output at all; there is
+            # no threshold to segment against, so no candidates are possible.
+            manifest["status"] = "inference_unreliable"
+            manifest["gates"] = {
+                "structural": {
+                    "numerical_failure": {"passed": False, "error": str(exc)},
+                },
+            }
+            return empty_regions, empty_values, manifest
+        null_diagnostics["mode"] = config.null_mode
+        # null_mode="permutation" is rejected at Eiger2Config construction, so
+        # this is the only edge-level null reachable here.
+        manifest["null"] = null_diagnostics
 
-    # The member-step region null has its own per-chromosome construction
-    # requirement. A preferred 100-position track is not a structural floor:
-    # shorter chromosomes may contribute down to the configured minimum
-    # detectable region, with per-length opportunity checked later. Only
-    # chromosomes unable to support even that absolute minimum count as
-    # missing exposure. The edge-null exposure diagnostic remains separate.
-    if resolved_region_null_mode == "member_step":
-        member_step_feasibility = member_step_chromosome_feasibility(
+        # Spec §2b.3: a chromosome too small to admit a feasible lag
+        # (chromosome_lag_feasibility, computed once here and reused by
+        # null_tracks() above via its own internal call) contributes nothing to
+        # the null in any replicate. It is not silently dropped behind a fixed
+        # warning threshold -- its share of the genome's own eligible observed
+        # edges is measured (`missing_exposure`) and escalated to a structural
+        # gate when material.
+        chromosome_feasibility = chromosome_lag_feasibility(
             frame, config, observed_eligible=eligible,
         )
-        member_step_missing_edges = sum(
-            v["eligible_observed_edges"]
-            for v in member_step_feasibility.values()
+        infeasible_chromosome_edges = sum(
+            v["eligible_observed_edges"] for v in chromosome_feasibility.values()
             if not v["feasible"]
         )
-        member_step_total_edges = sum(
-            v["eligible_observed_edges"] for v in member_step_feasibility.values()
+        total_chromosome_edges = sum(
+            v["eligible_observed_edges"] for v in chromosome_feasibility.values()
         )
-        member_step_missing_exposure = (
-            member_step_missing_edges / member_step_total_edges
-            if member_step_total_edges else 0.0
+        missing_exposure = (
+            infeasible_chromosome_edges / total_chromosome_edges
+            if total_chromosome_edges else 0.0
         )
-        structural_gates["region_null_chromosome_exposure"] = {
-            "mode": "member_step",
-            "missing_exposure": member_step_missing_exposure,
-            "floor": config.max_missing_null_exposure,
-            "passed": (
-                member_step_missing_exposure <= config.max_missing_null_exposure
-            ),
-            "infeasible_chromosomes": sorted(
-                name for name, value in member_step_feasibility.items()
-                if not value["feasible"]
-            ),
-            "preferred_chromosomes": sorted(
-                name for name, value in member_step_feasibility.items()
-                if value["construction"] == "preferred"
-            ),
-            "fallback_chromosomes": sorted(
-                name for name, value in member_step_feasibility.items()
-                if value["construction"] == "fallback"
-            ),
-            "chromosomes": member_step_feasibility,
-            "note": (
-                "member-step-specific exposure gate. min_subtrack_length is "
-                "preferred; fallback chromosomes use the largest feasible "
-                "lag that still supports min_cpgs positions. Only chromosomes "
-                "unable to support min_cpgs at null_min_lag are absent."
-            ),
+
+        # Structural gates (spec §2a.2): signal-independent conditions that are
+        # broken regardless of whether real signal is present, so they can hard-
+        # fail without the false-rejection risk revision 1's calibration-ratio
+        # gates carried (§0.1) -- these do not depend on the observed track at
+        # all, only on how much of the null actually survived construction.
+        surviving_fraction = (
+            len(tracks) / config.null_replicates if config.null_replicates else 0.0
+        )
+        structural_gates = {
+            "surviving_null_tracks": {
+                "surviving": len(tracks),
+                "null_replicates": config.null_replicates,
+                "fraction": surviving_fraction,
+                "floor_fraction": 0.5,
+                "passed": surviving_fraction >= 0.5,
+            },
+            "null_coverage": {
+                "value": null_diagnostics["null_coverage"],
+                "floor": config.min_null_coverage,
+                "passed": null_diagnostics["null_coverage"] >= config.min_null_coverage,
+            },
+            "null_construction": {
+                "value": null_diagnostics["null_values"],
+                "floor": config.min_null_values,
+                "passed": null_diagnostics["null_values"] >= config.min_null_values,
+                "note": (
+                    "too few pooled null values to constitute a valid construction "
+                    "-- promoted from null_threshold's pre-existing warning "
+                    "(config.min_null_values) to a hard gate."
+                ),
+            },
+            "chromosome_exposure": {
+                "missing_exposure": missing_exposure,
+                # Explicit and independently tunable (spec §2b.3's own wording:
+                # "rather than an arbitrary percentage" -- an EXPLICIT, DOCUMENTED,
+                # SWEEPABLE percentage is the honest form of that, not a floor
+                # borrowed from min_null_coverage, a different quantity: that one
+                # is about how much of the OFFERED null was usable, this one
+                # about how much of the OBSERVED genome has no null
+                # representation at all).
+                "floor": config.max_missing_null_exposure,
+                "passed": missing_exposure <= config.max_missing_null_exposure,
+                "infeasible_chromosomes": sorted(
+                    name for name, v in chromosome_feasibility.items()
+                    if not v["feasible"]
+                ),
+                "note": (
+                    "no feasible lag on these chromosomes (spec §2a.2/§2b.3) -- "
+                    "excluded from the null in every replicate, not silently, "
+                    "since their share of this run's own eligible observed "
+                    "edges is measured and gated here explicitly. See "
+                    "manifest['null']['threshold_by_chromosome'] for the cheap "
+                    "half of the sensitivity report: the same null_quantile "
+                    "recomputed per feasible chromosome, alongside the pooled "
+                    "threshold it is a comparison for."
+                ),
+            },
         }
+
+        # The member-step region null has its own per-chromosome construction
+        # requirement. A preferred 100-position track is not a structural floor:
+        # shorter chromosomes may contribute down to the configured minimum
+        # detectable region, with per-length opportunity checked later. Only
+        # chromosomes unable to support even that absolute minimum count as
+        # missing exposure. The edge-null exposure diagnostic remains separate.
+        if resolved_region_null_mode == "member_step":
+            member_step_feasibility = member_step_chromosome_feasibility(
+                frame, config, observed_eligible=eligible,
+            )
+            member_step_missing_edges = sum(
+                v["eligible_observed_edges"]
+                for v in member_step_feasibility.values()
+                if not v["feasible"]
+            )
+            member_step_total_edges = sum(
+                v["eligible_observed_edges"] for v in member_step_feasibility.values()
+            )
+            member_step_missing_exposure = (
+                member_step_missing_edges / member_step_total_edges
+                if member_step_total_edges else 0.0
+            )
+            structural_gates["region_null_chromosome_exposure"] = {
+                "mode": "member_step",
+                "missing_exposure": member_step_missing_exposure,
+                "floor": config.max_missing_null_exposure,
+                "passed": (
+                    member_step_missing_exposure <= config.max_missing_null_exposure
+                ),
+                "infeasible_chromosomes": sorted(
+                    name for name, value in member_step_feasibility.items()
+                    if not value["feasible"]
+                ),
+                "preferred_chromosomes": sorted(
+                    name for name, value in member_step_feasibility.items()
+                    if value["construction"] == "preferred"
+                ),
+                "fallback_chromosomes": sorted(
+                    name for name, value in member_step_feasibility.items()
+                    if value["construction"] == "fallback"
+                ),
+                "chromosomes": member_step_feasibility,
+                "note": (
+                    "member-step-specific exposure gate. min_subtrack_length is "
+                    "preferred; fallback chromosomes use the largest feasible "
+                    "lag that still supports min_cpgs positions. Only chromosomes "
+                    "unable to support min_cpgs at null_min_lag are absent."
+                ),
+            }
 
     structural_gate_failure = not all(
         gate["passed"] for gate in structural_gates.values()
@@ -4339,8 +4520,8 @@ def call_dmrs(
         "structural": structural_gates,
         "calibration_diagnostic_note": CALIBRATION_DIAGNOSTIC_NOTE,
     }
-    if region_null_mode_fallback is not None:
-        manifest["gates"]["region_null_mode_fallback"] = region_null_mode_fallback
+    if resolved_region_null_mode == "off":
+        manifest["region_fdr_note"] = NO_CALIBRATED_NULL_NOTE
     if resolved_region_null_mode == "member_step" and region_lags:
         # Per chromosome, not genome-wide (spec §2b.4): each segment's own
         # implied sub-track length depends on ITS OWN chromosome's row
@@ -4391,43 +4572,14 @@ def call_dmrs(
     # signal is present; only a red flag on genuinely DMR-free data. Uses
     # `region_tracks`, not the edge-level `tracks` -- Gate 1 validates
     # whichever null actually forms regions.
-    manifest["gates"]["acf"] = acf_gate(
-        statistic, eligible, region_tracks, config.window,
+    # Gate 1 needs a region null to compare the observed track against. With
+    # `region_null_mode="off"` there is none, so it is recorded as skipped
+    # rather than computed against an empty ensemble and failed.
+    manifest["gates"]["acf"] = (
+        acf_gate(statistic, eligible, region_tracks, config.window)
+        if region_tracks
+        else {"skipped": True, "reason": "region_null_mode='off'"}
     )
-
-    # --- support-conditioned threshold ---
-    n_cpg_total = deflated.shape[0]
-    w = max(config.window, 1)
-    finite_mask = np.isfinite(deflated)
-
-    def _member_offsets(window: int, lag: int = 1) -> np.ndarray:
-        """Window-member offsets from a base position: the adjacent pair at
-        w=1 (offsets [0, lag]), else [0, lag, 2*lag, ..., (w-1)*lag].
-        `lag=1` gives the observed-track convention; any other `lag` gives a null
-        position's member set, matching `_lag_null_track`'s own construction."""
-        if window == 1:
-            return np.array([0, lag])
-        return np.arange(window) * lag
-
-    obs_offsets = _member_offsets(w)
-    obs_offset0 = 0 if w == 1 else w // 2 - 1
-    obs_base = np.arange(statistic.size) - obs_offset0
-    valid_obs = (obs_base >= 0) & (obs_base + obs_offsets.max() < n_cpg_total)
-    observed_support = np.zeros(statistic.size, dtype=np.int64)
-    observed_support[valid_obs] = _window_support(
-        finite_mask, obs_base[valid_obs], obs_offsets,
-    )
-
-    support_dispersion = float("nan")
-    usable_mask = eligible & np.isfinite(statistic)
-    if np.any(usable_mask):
-        usable_support = observed_support[usable_mask]
-        median = np.median(usable_support)
-        if median > 0:
-            support_dispersion = float(
-                (np.quantile(usable_support, 0.9) - np.quantile(usable_support, 0.1))
-                / median
-            )
 
     dispersion_cut = (
         config.support_dispersion_cut if config.support_dispersion_cut is not None
@@ -4468,7 +4620,13 @@ def call_dmrs(
     # equivalence holding forever, so initialize defensively here to turn a
     # future NameError into an empty (inert) list instead.
     null_full_support: list[np.ndarray] = []
-    per_edge_threshold: float | np.ndarray = threshold
+    # The default path already has its per-edge array from
+    # `observed_edge_threshold`; the null-derived paths start scalar and are
+    # replaced below if support binning succeeds.
+    per_edge_threshold: float | np.ndarray = (
+        threshold if observed_per_edge_threshold is None
+        else observed_per_edge_threshold
+    )
     # Per-replicate threshold arrays fed to segment()/region_area() for each
     # null track, aligned 1:1 with `tracks`. Defaults to the scalar threshold;
     # replaced below when binning succeeds. Each null track's threshold must
@@ -4568,7 +4726,9 @@ def call_dmrs(
         manifest["support_binning_skipped_reason"] = support_binning_skipped_reason
 
     region_threshold_mode_value = (
-        "support_binned" if support_binning in ("auto_on", "forced_on") else "single"
+        "observed_gap_support_binned" if observed_per_edge_threshold is not None
+        else "support_binned" if support_binning in ("auto_on", "forced_on")
+        else "single"
     )
 
     # `null_edge_thresholds` is 1:1 with `tracks` (the edge null); when
@@ -4671,12 +4831,19 @@ def call_dmrs(
     # path, matching the region_rate_by_support_bin diagnostic's own scope
     # below: both are silent on the "no_regions" early return, same as
     # `manifest["fdr"]`.
-    manifest["gates"]["region_exchangeability"] = region_exchangeability_gate(
+    # Like Gate 1 above: with no region null there is nothing to compare the
+    # observed region rate against, so the gate is skipped rather than failed
+    # against an empty pool.
+    manifest["gates"]["region_exchangeability"] = (
+        {"skipped": True, "reason": "region_null_mode='off'"}
+        if not region_tracks
+        else region_exchangeability_gate(
         observed_regions=len(regions),
         observed_eligible_edges=int(np.sum(eligible & np.isfinite(statistic))),
         null_regions_total=int(sum(len(r) for r in null_regions_by_replicate)),
         null_eligible_edges=null_edge_total,
         min_null_regions_for_fdr=config.min_null_regions_for_fdr,
+        )
     )
     # `s = observed_eligible_edges / null_eligible_edges` is
     # `region_fdr_result`'s finite-null resolution scale
@@ -5005,7 +5172,7 @@ def call_dmrs(
                 ),
                 "statistic_threshold": (
                     float(np.mean(per_edge_threshold[first:last]))
-                    if region_threshold_mode_value == "support_binned"
+                    if np.ndim(per_edge_threshold)
                     else threshold
                 ),
                 "region_support_median": manifest[
@@ -5051,6 +5218,11 @@ def call_dmrs(
                 "fdr_status": (
                     "available"
                     if np.isfinite(decision_qvalue[position])
+                    # Not "unavailable": nothing failed. No region null was
+                    # built, so there is no genome-background FDR to report
+                    # (NO_CALIBRATED_NULL_NOTE).
+                    else "no_calibrated_null"
+                    if resolved_region_null_mode == "off"
                     else (
                         "unavailable_run"
                         if globally_unavailable
@@ -5143,7 +5315,30 @@ def call_dmrs(
             )
         value_rows.append(means)
 
-    region_frame = pd.DataFrame(rows)[_REGION_COLUMNS]
+    region_frame = pd.DataFrame(rows)
+    # Ranking (spec: the discovery output is a ranked list). Chromosomes keep
+    # canonical order; within a chromosome the strongest region comes first,
+    # by `region_area` descending. `rank` is dense, 1..n, in exactly the order
+    # of the rows it labels, so a reader can take "the top k" without sorting
+    # anything themselves and without a q-value.
+    chromosome_position = {
+        name: index
+        for index, name in enumerate(
+            canonical_chromosome_order(region_frame["chr"].unique().tolist())
+        )
+    }
+    order = np.lexsort(
+        (
+            -region_frame["region_area"].to_numpy(dtype=float),
+            region_frame["chr"].map(chromosome_position).to_numpy(dtype=np.int64),
+        )
+    )
+    region_frame = region_frame.iloc[order].reset_index(drop=True)
+    value_rows = [value_rows[position] for position in order]
+    if support_rows is not None:
+        support_rows = [support_rows[position] for position in order]
+    region_frame.insert(0, "rank", np.arange(1, len(region_frame) + 1, dtype=np.int64))
+    region_frame = region_frame[_REGION_COLUMNS]
     # pandas would otherwise infer `object` dtype from a column mixing `bool`
     # and `pd.NA`; the nullable BooleanDtype is what makes `pd.NA` survive a
     # CSV round trip as a genuinely missing value rather than a stringified
@@ -5178,9 +5373,10 @@ def call_dmrs(
     region_exch = manifest["gates"].get("region_exchangeability")
     null_exchangeability_ratio = null_diagnostics.get("null_exchangeability_ratio")
     calibration_concern = (
-        (acf_gate_result is not None and not acf_gate_result["passed"])
+        (acf_gate_result is not None and not acf_gate_result.get("passed", True))
         or (
             region_exch is not None
+            and not region_exch.get("skipped")
             and region_exch["observed_regions"] > 0
             and not math.isfinite(region_exch["region_exchangeability_ratio"])
         )
@@ -5203,7 +5399,12 @@ def call_dmrs(
         or fdr_result.diagnostics.get("insufficient_cluster_replicates_strata")
         or fdr_result.diagnostics.get("insufficient_scale_opportunity_strata")
     )
-    if inference_suppressed:
+    if resolved_region_null_mode == "off":
+        # The default path. Inference was not attempted, so it was not
+        # suppressed: "inference_unreliable" would report a failure that did
+        # not happen, and "ok" would imply a q-value that does not exist.
+        manifest["status"] = "discovery_only"
+    elif inference_suppressed:
         manifest["status"] = "inference_unreliable"
     elif stratum_refused:
         manifest["status"] = "partial_inference"
@@ -5264,6 +5465,7 @@ def call_dmrs(
 
 
 _REGION_COLUMNS = [
+    "rank",
     "region_id",
     "chr",
     "start",
@@ -5309,7 +5511,7 @@ _REGION_COLUMNS = [
 
 
 _REGION_MAIN_COLUMNS = [
-    "region_id", "chr", "start", "end", "n_cpg", "length_bp",
+    "rank", "region_id", "chr", "start", "end", "n_cpg", "length_bp",
     "cpg_index_start", "cpg_index_end", "statistic", "statistic_mean",
     "statistic_min", "statistic_threshold", "region_support_median",
     "region_threshold_mode", "region_area", "region_qvalue", "region_tail_fdr",

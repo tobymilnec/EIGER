@@ -65,14 +65,14 @@ def test_region_null_mode_cli_flag_round_trips_into_config():
 
 
 def test_region_null_mode_unset_leaves_config_at_its_own_default():
-    # Stage 1f Task 1b: the CLI flag choices are member_step/lag/off only --
-    # "auto" is not CLI-selectable, it is what happens when the flag is left
-    # unset entirely (matching every other --null-* flag's default=None
-    # pattern, filtered out of _config_from_args's kwargs by the `is not
-    # None` check, so Eiger2Config's own field default applies untouched).
+    # The CLI flag choices are member_step/lag/off; leaving it unset applies
+    # Eiger2Config's own field default untouched (matching every other
+    # --null-* flag's default=None pattern, filtered out of
+    # _config_from_args's kwargs by the `is not None` check). Since v2.3 that
+    # default is "off": ranked candidates, no genome-background region FDR.
     args = build_parser().parse_args(_BASE_ARGS)
     config = _config_from_args(args)
-    assert config.region_null_mode == "auto"
+    assert config.region_null_mode == "off"
 
 
 def test_n_lag_draws_cli_flag_round_trips_into_config():

@@ -1030,8 +1030,8 @@ The same audit and the same fix, with a preferred
 individually clears even the fallback floor, naming the largest chromosome's own
 `n_cpg`/fallback `L_max` rather than the genome-wide total.
 `member_step_min_n_cpg()` stays genome-wide -- a cheap, approximate, conservative
-pre-check for `region_null_mode="auto"`'s fallback decision, run before any per-chromosome
-breakdown is available; the authoritative check is `member_step_lag_null_ensemble`'s own.
+pre-check reported before a run (v2.3: `"auto"` and its fallback are gone; see section
+18), available before any per-chromosome breakdown is; the authoritative check is `member_step_lag_null_ensemble`'s own.
 Its preferred/fallback/infeasible chromosome lists, missing eligible-edge share,
 realised per-chromosome subtrack-length range, and forced-boundary fraction are recorded
 by `structural.region_null_chromosome_exposure`; only truly infeasible exposure is
@@ -1203,3 +1203,125 @@ committed in `eiger_paper`).
 
 See also: [`docs/PROBABILITY.md`](PROBABILITY.md) for the identical direction/tie fix
 applied to `probability._tail_area_fdr` and its effect on `region_evidence_score`.
+
+---
+
+## 18. The locality-breaking null is misspecified on WGBS backgrounds (v2.3)
+
+**Summary.** The edge null built by pairing CpGs at least `null_min_lag` rows
+apart tests the hypothesis *"there is no regional coordination here"*. On a
+WGBS-realistic background that hypothesis is false everywhere: ordinary
+short-range methylation dependence produces regional coordination without any
+DMR. A null that is false everywhere cannot calibrate anything, so from v2.3
+it no longer sets the edge threshold on the default path, and
+`region_null_mode` defaults to `"off"`: no region FDR against the genome
+background is claimed unless matched controls are supplied.
+
+All figures below were measured on the benchmark's frozen 224,216-CpG
+development blocks, 40 samples, realistic observation model, query seeds 21-40,
+against the eiger-benchmark repository's provenance directories named beside
+them. None is a held-out benchmark result.
+
+### 18.1 The hypothesis the null tests, and why it is false on real WGBS
+
+The locality-breaking construction retains cross-sample structure and removes
+genomic locality by design. The observed track's dependence is therefore
+compared with a reference that has none. At `window = 1`, where window overlap
+manufactures no autocorrelation of its own, the mismatch on a planted-free
+correlated-null matrix is unambiguous
+(`provenance/eiger_null_audit_v1/REPORT.md`):
+
+| Quantity | Observed correlated null | Locality-breaking null |
+|---|---:|---:|
+| statistic-track lag-1 ACF | 0.267255 | 0.000323 |
+| edge exceedance-rate ratio | | 17.39 |
+| region-formation-rate ratio | | 505.45 |
+| candidates / "significant" regions | | 404 / 404 |
+
+A locus-independent control generated with the same marginal, coverage,
+missingness and cohort size behaved normally (two candidates, one significant,
+edge exchangeability ratio 0.921), which isolates *local dependence*, not
+bimodality, as the cause.
+
+### 18.2 What was tried
+
+Every self-calibrated replacement was measured and failed
+(`provenance/eiger_null_resolution_spike_v1/REPORT.md` and
+`provenance/eiger_pooled_longlag_spike_v1/REPORT.md`):
+
+- **Circular per-sample shifts.** Preserve each sample's spatial series,
+  destroy between-sample alignment: region exchangeability ratio 86.97,
+  17/17 candidates called significant.
+- **A generator fitted to the query's own curve.** Still fails region
+  exchangeability on every seed: mean query/reference candidate-region rate
+  1.358 against the true-parameter oracle's 1.026, higher on all 20 paired
+  seeds (paired sign test `p = 1.91e-6`).
+- **A sign-symmetry (mirror) null.** Edge tails balance almost exactly
+  (38,240 positive against 38,501 negative edges), but the same edges form
+  1,708 positive qualifying regions against 842 negative ones, every one of
+  20 matrices in the same direction (`p = 1.91e-6`); target recall 76/408
+  (18.6%) (`provenance/eiger_symmetry_spike_v1/summary.json`).
+- **A long-lag (6-11) statistic against the member-step null.** ACF gate
+  passed 0/20; observed/null candidate-region rate ratio 17.159; 26,394 null
+  calls. Moving the band to 8-13 or 10-15 does not approach one.
+- **Pooled decisions over stratum-specific tail probabilities.** Calibrate
+  (0-1 of 20 null matrices) and recall 0/408 targets. They erase power rather
+  than reallocating it.
+
+### 18.3 The ceiling, measured with a true-parameter oracle
+
+Matched, independently generated reference matrices - the configuration no
+unsupervised run has - do calibrate, with the error budget split equally
+across the five length strata (add-one, `q < 0.01` per stratum,
+`provenance/eiger_reference_count_stratum_budget_spike_v1/`, reported in
+`provenance/eiger_null_resolution_spike_v1/REPORT.md`):
+
+| Oracle references | Null matrices with any call | Target recall | Wholly off-target |
+|---:|---:|---:|---:|
+| 20 | 0/20 | 143/408 (35.0%) | 0 |
+| 50 | 0/20 | 195/408 (47.8%) | 0 |
+| 75 | 0/20 | 198/408 (48.5%) | 0 |
+
+So even with an oracle reference panel, a 5% genome-wide decision caps recall
+near 48%. That is the ceiling the q-value machinery buys, and it is bought with
+matrices a user does not have.
+
+### 18.4 What the statistic itself does
+
+The coordination statistic is not the problem. On the same matrices, a
+window-4 statistic on a fully internal planted edge exceeds a random
+correlated-null edge with probability 0.980, and the cross-fitted discovery
+rule finds 91.7% of planted regions as candidates (0.9167 with a global
+threshold, 0.9118 with gap-binned thresholds;
+`provenance/eiger_crossfit_spike_v1/summary.json`). The loss is entirely in
+the decision layer: the same run's q-value decision retains 21.8% recall and
+still calls every one of 20 null matrices.
+
+### 18.5 What the default now claims, and what it does not
+
+**Claims.** These CpGs co-vary across samples more than this genome's own
+edges at the same gap and support typically do, and these runs of such edges
+are the longest and strongest of them. `rank` orders that evidence.
+
+**Does not claim.** That a ranked region is unlikely to arise on a DMR-free
+genome. No such statement is available from the query matrix alone, and
+`region_qvalue`, `region_qvalue_upper_95` and `significant` are therefore
+refused with `fdr_status = "no_calibrated_null"`.
+
+**How to get an error rate.** Matched control matrices with the query's CpG
+layout, at least 20 of them, passed through the identical centring, deflation,
+threshold binning, segmenter and area, with add-one region FDR and the error
+budget split equally across the five length strata -- the configuration
+measured at 0 of 20 null calls and 47.8% recall in 18.3. **That path is
+specified here and is not implemented in this release**: the benchmark's
+oracle-reference arm is produced by the eiger-benchmark repository's
+`scripts/eiger_reference_count_spike.py`, and the paper describes it as "Eiger
+given matched controls". A second tier -- confirming a candidate by testing whether its own per-sample
+region means come from one population -- was specified and measured, and is not
+shipped: both predeclared tests failed their predeclared null-calibration rule
+on 20 correlated-null development matrices (the eiger-benchmark repository's
+`provenance/eiger_confirm_spike_v1/REPORT.md`).
+
+`region_null_mode="member_step"` and `"lag"` remain available by explicit
+request for reproducing historical results. Both warn, and both are calibrated
+against the null this section is about.

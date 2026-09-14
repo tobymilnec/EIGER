@@ -36,7 +36,7 @@ from pathlib import Path
 # else is undocumented and must be escalated rather than interpreted here.
 COMPLETED_STATUSES = ("ok", "ok_with_warnings")
 DOCUMENTED_STATUSES = COMPLETED_STATUSES + (
-    "partial_inference", "inference_unreliable", "no_regions",
+    "discovery_only", "partial_inference", "inference_unreliable", "no_regions",
 )
 
 # Per-stratum refusals recorded by region_fdr_result.
@@ -81,7 +81,19 @@ def main() -> int:
     # so nothing else in the manifest means anything until they pass.
     gates = caller.get("gates") or {}
     structural = (gates.get("structural") if isinstance(gates, dict) else None) or {}
-    if not isinstance(structural, dict) or not structural:
+    # The default path builds no null, so it has no null-construction gates to
+    # report: an EMPTY structural block is correct there, and a populated one
+    # would mean a null was built after all.  Everywhere else an empty block is
+    # a truncated manifest.
+    discovery_only = caller.get("status") == "discovery_only"
+    if not isinstance(structural, dict):
+        return fail("the manifest's structural gate block is not an object")
+    if discovery_only and structural:
+        return fail(
+            "status 'discovery_only' but structural null gates are recorded; "
+            "the manifest contradicts itself"
+        )
+    if not discovery_only and not structural:
         return fail("no structural gate results in the manifest")
     # A gate entry that does not say `passed: true` counts as failed, so a
     # truncated or malformed manifest cannot read as a pass.
@@ -92,7 +104,11 @@ def main() -> int:
     }
     if failed:
         return fail(f"structural gate(s) failed: {failed}")
-    print(f"[smoke] structural gates: {len(structural)} present, all passed")
+    print(
+        "[smoke] structural gates: none built (discovery_only)"
+        if discovery_only
+        else f"[smoke] structural gates: {len(structural)} present, all passed"
+    )
 
     # Refused length strata, inspected and printed whether or not any exist.
     fdr = caller.get("fdr") or {}
@@ -161,6 +177,12 @@ def main() -> int:
             f"against the opportunity required. Every other stratum reported "
             f"normally ({n_significant} significant regions); the run as a "
             f"whole did not complete inference"
+        )
+    elif status == "discovery_only":
+        print(
+            f"[smoke] revised caller ran in its default discovery mode "
+            f"(status {status}): region FDR against the genome background was "
+            f"not attempted, and the regions are ranked candidates"
         )
     else:
         print(

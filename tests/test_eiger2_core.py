@@ -74,6 +74,7 @@ from eiger2.core import (  # noqa: E402
     null_exchangeability,
     null_threshold,
     null_tracks,
+    observed_edge_threshold,
     permutation_null_tracks,
     qvalue_result_from_track,
     qvalues_from_track,
@@ -599,7 +600,7 @@ def test_the_shipped_deflation_rule_is_absolute_and_records_its_own_boundary():
 WP7A_FLOAT_RTOL = 1e-12
 
 WP7A_COLUMNS = (
-    "region_id", "chr", "start", "end", "n_cpg", "length_bp", "cpg_index_start",
+    "rank", "region_id", "chr", "start", "end", "n_cpg", "length_bp", "cpg_index_start",
     "cpg_index_end", "statistic", "statistic_mean", "statistic_min",
     "statistic_threshold", "region_support_median", "region_threshold_mode",
     "region_area", "region_qvalue", "region_tail_fdr", "region_qvalue_lower_95",
@@ -825,10 +826,26 @@ def test_the_default_path_is_unchanged_after_wp7a():
         spacing=1200, dmr_length=12, n_samples=40, n_latent=2,
         latent_loading_sd=0.07, noise_sd=0.04, layout="dense",
     )
+    # v2.3: the pinned values are the LEGACY inferential path, which is no
+    # longer the default -- `region_null_mode` now defaults to "off" and
+    # `null_quantile` to 0.99. Both are named explicitly here so the WP7a
+    # no-op guarantee still has something to guard; the new default path is
+    # asserted in
+    # `test_default_path_refuses_region_fdr_and_reports_discovery_only` below.
     regions, values, manifest = call_dmrs(
         matrix, locations,
-        config=Eiger2Config(window=4, null_min_lag=100, random_seed=11),
+        config=Eiger2Config(
+            window=4, null_min_lag=100, random_seed=11,
+            region_null_mode="member_step", null_quantile=0.995,
+        ),
     )
+    # The table is ranked by area within chromosome order (v2.3); these pins
+    # are in genomic order, so put both tables back in genomic order -- the
+    # same permutation for both, since `values`' rows are aligned to
+    # `regions`' rows by position.
+    order = regions.sort_values("cpg_index_start").index.to_numpy()
+    regions = regions.iloc[order].reset_index(drop=True)
+    values = values.iloc[order].reset_index(drop=True)
 
     # Schema: exact columns, exact order, exact dtype family.
     assert list(regions.columns) == list(WP7A_COLUMNS)
@@ -1219,31 +1236,33 @@ def test_call_dmrs_manifest_records_member_step_gate_fields():
     assert "region_exchangeability" in gates
 
 
-def test_region_null_mode_auto_falls_back_to_lag_on_undersized_input():
-    # Stage 1f Task 1b (pre-release, master spec pre-release): region_null_mode
-    # left at its default ("auto") on input below member_step's genome-scale
-    # absolute minimum floor (derived from min_cpgs, not the preferred
-    # min_subtrack_length) must fall back to "lag"
-    # automatically, warn (via the manifest key -- cli.py turns it into stderr
-    # output), and complete -- not raise, which was STOP 1e's flagged gap (a
-    # CLI user got a hard, uncatchable error with no command-line way out).
+def test_region_null_mode_auto_is_removed_and_says_what_to_use_instead():
+    # v2.3: "auto" resolved silently to "member_step" or "lag", both of which
+    # are calibrated against the locality-breaking null that is misspecified on
+    # WGBS backgrounds (docs/FDR.md section 18). A silent resolution to a
+    # misspecified null is exactly what must not happen, so the value is gone
+    # and the error names the replacement rather than leaving a caller to guess.
+    with pytest.raises(ValueError, match="region_null_mode='auto' was removed"):
+        Eiger2Config(region_null_mode="auto")
+    with pytest.raises(ValueError, match="region_null_mode must be"):
+        Eiger2Config(region_null_mode="lags")
+
+
+def test_region_null_mode_default_is_off_and_builds_no_region_null():
+    # The default is the discovery path: no region null is constructed, so the
+    # region-level gates have nothing to compare against and say so, rather than
+    # being computed against an empty pool and failed.
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
-    config = Eiger2Config(
-        window=4, null_min_lag=300, null_replicates=6,
-        min_null_regions_for_fdr=0,
-        random_seed=5,
-    )
-    assert config.region_null_mode == "auto"  # sanity: the literal field default
+    config = Eiger2Config(window=4, null_min_lag=300, random_seed=5)
+    assert config.region_null_mode == "off"
+    assert config.null_quantile == 0.99
     regions, _, manifest = call_dmrs(matrix, frame, config=config)
     gates = manifest["gates"]
-    assert gates["region_null_mode"] == "lag"
-    fallback = gates["region_null_mode_fallback"]
-    assert fallback["requested"] == "auto"
-    assert fallback["used"] == "lag"
-    assert fallback["reason"] == "input below member_step minimum"
-    assert fallback["n_cpg"] == len(frame)
-    assert fallback["n_cpg"] < fallback["n_cpg_required"]
-    # "completes": no exception, and it produced a real (non-degenerate) result.
+    assert gates["region_null_mode"] == "off"
+    assert gates["n_lag_draws"] == 0
+    assert gates["acf"]["skipped"] is True
+    assert manifest["null"]["mode"] == "observed_gap_support_quantile"
+    assert "region_fdr_note" in manifest
     assert isinstance(regions, pd.DataFrame)
 
 
@@ -1261,24 +1280,95 @@ def test_region_null_mode_explicit_member_step_still_raises_on_undersized_input(
         call_dmrs(matrix, frame, config=config)
 
 
-def test_region_null_mode_auto_uses_member_step_on_oversized_input():
-    # Stage 1f Task 1b: the mirror image of the fallback test above -- once
-    # the input clears the floor, "auto" resolves to real member_step, not a
-    # fallback, and no region_null_mode_fallback key is recorded. Same small
-    # null_min_lag/min_subtrack_length trick as
-    # test_call_dmrs_manifest_records_member_step_gate_fields (lowers the
-    # floor so this stays fast), but region_null_mode is left UNSET here to
-    # exercise "auto"'s resolution, not passed explicitly.
+def test_default_path_refuses_region_fdr_and_reports_discovery_only():
+    # The default path's refusal is a statement, not a failure: `significant`
+    # is pd.NA (not False -- "not tested" is not "tested, not significant"),
+    # `fdr_status` names the reason, and the run status says the run did what
+    # it was asked to do.
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
-    config = Eiger2Config(
-        window=4, null_replicates=6, min_null_regions_for_fdr=0,
-        null_min_lag=5, min_subtrack_length=10, n_lag_draws=6, random_seed=5,
+    regions, _, manifest = call_dmrs(
+        matrix, frame,
+        config=Eiger2Config(window=4, null_min_lag=300, random_seed=5),
     )
-    assert config.region_null_mode == "auto"
-    _, _, manifest = call_dmrs(matrix, frame, config=config)
-    gates = manifest["gates"]
-    assert gates["region_null_mode"] == "member_step"
-    assert "region_null_mode_fallback" not in gates
+    assert len(regions)
+    assert manifest["status"] == "discovery_only"
+    assert regions["fdr_status"].tolist() == ["no_calibrated_null"] * len(regions)
+    assert regions["region_qvalue"].isna().all()
+    assert regions["region_qvalue_upper_95"].isna().all()
+    assert regions["significant"].isna().all()
+    assert regions["region_threshold_mode"].unique().tolist() == [
+        "observed_gap_support_binned"
+    ]
+    # Every descriptive column survives the refusal.
+    for column in ("region_area", "n_cpg", "delta_beta_descriptive",
+                   "direction_descriptive", "statistic_mean"):
+        assert column in regions
+        assert regions[column].notna().all()
+
+
+def test_rank_is_dense_and_area_monotone_within_each_chromosome():
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=6, seed=5)
+    regions, _, _ = call_dmrs(
+        matrix, frame,
+        config=Eiger2Config(window=4, null_min_lag=300, random_seed=5),
+    )
+    assert len(regions) > 1
+    assert regions["rank"].tolist() == list(range(1, len(regions) + 1))
+    for _chromosome, group in regions.groupby("chr", sort=False):
+        areas = group["region_area"].to_numpy(dtype=float)
+        assert np.all(np.diff(areas) <= 0)
+        assert group["rank"].tolist() == sorted(group["rank"].tolist())
+
+
+def test_gap_binned_threshold_equals_the_global_quantile_in_one_bin():
+    # When every edge falls in the same gap and support bin, conditioning can
+    # only reproduce the unconditioned quantile -- the binning adds nothing it
+    # was not asked for.
+    rng = np.random.default_rng(3)
+    n_cpg = 4_000
+    statistic = rng.normal(size=n_cpg - 1)
+    eligible = np.ones(n_cpg - 1, dtype=bool)
+    # constant spacing -> one gap bin; constant support -> one support bin
+    locations = pd.DataFrame({
+        "chr": ["chr1"] * n_cpg,
+        "start": np.arange(n_cpg) * 3,
+        "end": np.arange(n_cpg) * 3 + 1,
+    })
+    support = np.full(n_cpg - 1, 40, dtype=np.int64)
+    config = Eiger2Config(window=4, null_quantile=0.99)
+    thresholds, diagnostics = observed_edge_threshold(
+        statistic, eligible, locations, support, config,
+    )
+    expected = float(np.quantile(statistic, 0.99))
+    assert np.allclose(thresholds, expected)
+    assert diagnostics["threshold"] == pytest.approx(expected)
+    assert diagnostics["threshold_edges_by_source"]["joint"] == statistic.size
+
+
+def test_gap_binned_threshold_is_higher_where_edges_are_more_coordinated():
+    # Two gap regimes with different null levels: a single genome-wide quantile
+    # would put one bin's ordinary edges above the threshold and hide the
+    # other's extremes. Conditioning gives each its own.
+    rng = np.random.default_rng(4)
+    n_close, n_far = 3_000, 3_000
+    n_cpg = n_close + n_far + 1
+    statistic = np.concatenate([
+        rng.normal(0.5, 0.1, size=n_close), rng.normal(0.0, 0.1, size=n_far),
+    ])
+    starts = np.concatenate([
+        np.arange(n_close + 1) * 3,
+        (n_close + 1) * 3 + np.arange(n_far) * 500,
+    ])
+    locations = pd.DataFrame({
+        "chr": ["chr1"] * n_cpg, "start": starts, "end": starts + 1,
+    })
+    thresholds, diagnostics = observed_edge_threshold(
+        statistic, np.ones(n_cpg - 1, dtype=bool), locations,
+        np.full(n_cpg - 1, 40, dtype=np.int64),
+        Eiger2Config(window=4, null_quantile=0.99),
+    )
+    assert thresholds[:n_close].min() > thresholds[n_close + 1:].max()
+    assert len(diagnostics["threshold_by_bin"]) >= 2
 
 
 def test_well_separated_region_gets_q_zero_not_refused_by_its_length_stratum():
@@ -2681,6 +2771,9 @@ def test_full_pipeline_upper_rule_controls_null_and_retains_strong_signal():
         "m_opportunity": 0,
         "min_null_values": 1,
         "min_null_coverage": 0,
+        # As above: this standing regression is measured at the pre-v2.3 edge
+        # quantile, not at the v2.3 discovery default.
+        "null_quantile": 0.995,
     }
     false_calls = 0
     total_calls = 0
@@ -3085,13 +3178,19 @@ def test_upper_decision_uses_upper_bound_not_point_estimate():
     # logic, tuned against specific pre-existing significant-region counts; the
     # spec §5 null-adequacy guard is orthogonal and disabled here rather than
     # re-deriving those counts under refusal.
+    # null_quantile pinned at the pre-v2.3 default: the counts this test was
+    # searched for are a property of that edge threshold, and the v2.3 default
+    # (0.99) is a discovery-path choice, not a change to the decision rule
+    # under test.
     point_config = Eiger2Config(
         window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
         fdr_decision="point", min_null_regions_for_fdr=0, region_null_mode="lag",
+        null_quantile=0.995,
     )
     upper_config = Eiger2Config(
         window=4, null_replicates=500, random_seed=7, target_fdr=0.05,
         fdr_decision="upper", min_null_regions_for_fdr=0, region_null_mode="lag",
+        null_quantile=0.995,
     )
     point_regions, _, _ = call_dmrs(matrix, locs, config=point_config)
     upper_regions, _, _ = call_dmrs(matrix, locs, config=upper_config)
@@ -4460,9 +4559,16 @@ def test_support_binned_threshold_off_reproduces_scalar_path_bit_for_bit():
     expected_bounds = np.column_stack([
         source_index[manual_regions[:, 0]], source_index[manual_regions[:, 1]],
     ]) if manual_regions.size else np.empty((0, 2), dtype=int)
-    actual_bounds = regions_off[["cpg_index_start", "cpg_index_end"]].to_numpy()
+    # The region table is ranked by area within chromosome order (v2.3), so
+    # compare the region SET, in genomic order, not the table's row order.
+    actual_bounds = regions_off.sort_values("cpg_index_start")[
+        ["cpg_index_start", "cpg_index_end"]
+    ].to_numpy()
     assert np.array_equal(expected_bounds, actual_bounds)
-    assert np.array_equal(manual_areas, regions_off["region_area"].to_numpy())
+    assert np.array_equal(
+        manual_areas,
+        regions_off.sort_values("cpg_index_start")["region_area"].to_numpy(),
+    )
 
 
 def test_support_dispersion_detector_computed_and_recorded():
@@ -5406,11 +5512,18 @@ def test_bottom_stratum_counter_counts_only_short_significant_regions():
     long_significant = long_regions[long_regions["significant"].fillna(False)]
     assert len(short_significant) and len(long_significant)
 
-    # The 12-CpG run calls nothing in the bottom stratum, so the counter is
-    # recorded as zero -- present, not absent: a consumer must be able to tell
-    # "no short calls" from "never computed".
-    assert (long_significant["n_cpg"] >= 6).all()
-    assert long_manifest["fdr"]["n_significant_bottom_stratum"] == 0
+    # The counter must equal the number of significant regions in the "4-5"
+    # stratum on BOTH runs, and must be PRESENT on both -- a consumer has to be
+    # able to tell "no short calls" from "never computed". (Before the v2.3
+    # null_quantile default moved from 0.995 to 0.99, the 12-CpG run called
+    # nothing at all in the bottom stratum; at the looser threshold it calls a
+    # few, so the invariant is asserted directly rather than through that
+    # incidental zero.)
+    assert "n_significant_bottom_stratum" in long_manifest["fdr"]
+    assert long_manifest["fdr"]["n_significant_bottom_stratum"] == int(
+        (long_significant["n_cpg"] <= 5).sum()
+    )
+    assert (long_significant["n_cpg"] >= 6).any()
 
     assert short_manifest["fdr"]["n_significant_bottom_stratum"] == int(
         (short_significant["n_cpg"] <= 5).sum()

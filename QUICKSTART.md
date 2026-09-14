@@ -90,10 +90,21 @@ eiger2 compare --betas examples/data/betas.tsv \
                --out examples/out_compare
 ```
 
-The exact candidate/significant counts can change with method revisions. Confirm in
-`run_manifest.json` that the resolved region null is `member_step`, inspect the
-preferred/fallback chromosome diagnostics, and check whether any length stratum was
-refused for insufficient opportunity before using its q-values.
+The default run is a **discovery** run. `regions.csv` is a ranked candidate list:
+
+```
+rank,region_id,chr,start,end,n_cpg,...,region_area,region_qvalue,...,fdr_status
+1,EIGER2_chr1_511820_512241,chr1,511820,512241,22,...,6.195,,...,no_calibrated_null
+2,EIGER2_chr1_650200_650421,chr1,650200,650421,12,...,3.348,,...,no_calibrated_null
+```
+
+`rank` orders regions by `region_area` within chromosome order. `region_qvalue`,
+`region_qvalue_upper_95` and `significant` are empty, `fdr_status` reads
+`no_calibrated_null`, and `run_manifest.json` records `status: discovery_only`
+with the reason. **Region FDR against the genome background requires matched
+control matrices**, and the path that consumes them is specified but not
+implemented in this release -- see [docs/FDR.md](docs/FDR.md) section 18. The exact
+candidate counts can change with method revisions.
 
 ---
 
@@ -207,8 +218,11 @@ coverage files is not yet wired into the CLI.
 | `region_sample_means.csv` | per-region mean methylation for each sample |
 | `run_manifest.json` | resolved configuration, input checksums, package versions, runtime, `schema_version`, `fdr_decision`, and the realised null diagnostics |
 
-**`region_qvalue` is the principal field that expresses confidence that a region is
-real.** Every `*_descriptive` field — delta beta, direction, the inferred sample
+**On the default path `rank` is the principal field: regions ordered by
+`region_area`, strongest first within each chromosome. `region_qvalue` is
+populated only when a region null was requested and built** (`--region-null-mode`
+below), and expresses confidence that a region is real only then. Every
+`*_descriptive` field — delta beta, direction, the inferred sample
 split — is computed *after* the region was selected, on the same data, and is
 for reading rather than filtering.
 
@@ -305,34 +319,36 @@ below) pairs CpGs far apart on the same chromosome for the **edge-level** null -
 which edges count as elevated. Region-level FDR (which *runs* of elevated edges are
 significant) is a separate null, `--region-null-mode` (Stage 1f, pre-release).
 
-**Default: leave it unset.** With no `--region-null-mode` flag, the resolved
-behaviour is `"auto"`: `member_step` (below) is used when the input clears its
-min_cpgs-derived absolute floor, and the CLI falls back to `lag` automatically --
-printing a loud warning naming the input size, the required size, and that `lag`'s
-q-values are not calibrated -- when it does not. This is what a CLI user hitting a
-small test file, a targeted panel, or a single-chromosome subset now gets instead
-of a hard, uncatchable error (the gap flagged in an earlier release note, now
-fixed). At the defaults the absolute floor is 7,000 CpGs; 103,000 CpGs is the
-preferred 100-position subtrack size. Chromosomes between the two use the measured
-fallback and are reported separately in the manifest.
+**Default: leave it unset.** With no `--region-null-mode` flag the resolved
+behaviour is `"off"`: no region null is built, `region_qvalue`,
+`region_qvalue_upper_95` and `significant` are refused with
+`fdr_status = "no_calibrated_null"`, and the output is the ranked candidate list.
+Region FDR against the genome background requires matched control matrices; every
+self-calibrated background null was measured and failed
+([docs/FDR.md](docs/FDR.md) section 18).
 
-`member_step` (the resolved default on large-enough input) is what actually fixed
+`"auto"` was **removed** in v2.3 -- it resolved silently to one of the two modes
+below, which is exactly what must not happen when the null they use is
+misspecified. Requesting it raises, naming the default. At the defaults
+`member_step`'s absolute floor is 7,000 CpGs; 103,000 CpGs is the preferred
+100-position subtrack size.
+
+`member_step` (explicit request only, and it warns) is what fixed
 large-cohort saturation: on a 519-sample cohort, the pre-v2.1.0 default assigned
 q = 0 to all 73,784 reported regions -- arithmetically correct given a near-empty
 null, but useless. A simulated 500-sample cohort under the current default
 produces finite, non-saturating q-values instead (measured minimum 0.27, zero
 exact-zeros; see `docs/FDR.md` §11-§12).
 
-`--region-null-mode member_step` (passed explicitly) skips the fallback: on input
-below the floor it raises, naming the required size, rather than silently using
-`lag` -- for a caller who wants to know for certain which construction ran.
+`--region-null-mode member_step` raises on input below the floor, naming the
+required size, rather than silently using `lag` -- for a caller who wants to know
+for certain which construction ran.
 `--region-null-mode lag` (reproduces the pre-v2.1.0 region-level null, including
 the saturation above) is for small inputs below the absolute floor
 (`null_min_lag * (min_cpgs + window - 1)`, 7,000 CpGs at shipped
-defaults) where you specifically want `lag`'s behaviour rather than the automatic
-fallback, or for reproducing historical comparisons -- not recommended for
-inference on real-sized data. `--region-null-mode off` skips the region-level null
-entirely (candidates only, no `region_qvalue`).
+defaults) where you specifically want `lag`'s behaviour, or for reproducing
+historical comparisons -- not recommended for inference on real-sized data.
+`--region-null-mode off` is the default: candidates only, no `region_qvalue`.
 
 **`--null-mode permutation` was removed in v2.1.0.** It was edge-wise permutation
 (block length 1), which destroys the same run-length autocorrelation region-level FDR
