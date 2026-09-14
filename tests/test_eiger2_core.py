@@ -1253,19 +1253,52 @@ def test_region_null_mode_auto_is_removed_and_says_what_to_use_instead():
 def test_region_null_mode_default_is_off_and_builds_no_region_null():
     # The default is the discovery path: no region null is constructed, so the
     # region-level gates have nothing to compare against and say so, rather than
-    # being computed against an empty pool and failed.
+    # being computed against an empty pool and failed. The EDGE threshold still
+    # comes from the lag null (the v2.2 rule), so the edge-null block and its
+    # structural gates are present.
     matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
     config = Eiger2Config(window=4, null_min_lag=300, random_seed=5)
     assert config.region_null_mode == "off"
-    assert config.null_quantile == 0.99
+    assert config.edge_threshold == "lag_null"
+    assert config.null_quantile == 0.995
     regions, _, manifest = call_dmrs(matrix, frame, config=config)
     gates = manifest["gates"]
     assert gates["region_null_mode"] == "off"
     assert gates["n_lag_draws"] == 0
     assert gates["acf"]["skipped"] is True
-    assert manifest["null"]["mode"] == "observed_gap_support_quantile"
+    assert manifest["null"]["mode"] == "lag"
+    assert manifest["null"]["null_replicates"] > 0
+    assert gates["structural"]
     assert "region_fdr_note" in manifest
     assert isinstance(regions, pd.DataFrame)
+
+
+def test_observed_quantile_threshold_is_opt_in_and_builds_no_null():
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_min_lag=300, random_seed=5,
+        edge_threshold="observed_quantile", null_quantile=0.99,
+    )
+    regions, _, manifest = call_dmrs(matrix, frame, config=config)
+    assert manifest["null"]["mode"] == "observed_gap_support_quantile"
+    assert manifest["gates"]["structural"] == {}
+    assert manifest["status"] == "discovery_only"
+    assert isinstance(regions, pd.DataFrame)
+
+
+def test_observed_quantile_threshold_rejects_a_region_null():
+    matrix, frame, _ = simulate(strata=[(0.2, 0.4)], replicates=3, seed=5)
+    config = Eiger2Config(
+        window=4, null_min_lag=300, random_seed=5,
+        edge_threshold="observed_quantile", region_null_mode="lag",
+    )
+    with pytest.raises(ValueError, match="observed_quantile"):
+        call_dmrs(matrix, frame, config=config)
+
+
+def test_edge_threshold_rejects_unknown_values():
+    with pytest.raises(ValueError, match="edge_threshold"):
+        Eiger2Config(edge_threshold="magic")
 
 
 def test_region_null_mode_explicit_member_step_still_raises_on_undersized_input():
@@ -1298,9 +1331,8 @@ def test_default_path_refuses_region_fdr_and_reports_discovery_only():
     assert regions["region_qvalue"].isna().all()
     assert regions["region_qvalue_upper_95"].isna().all()
     assert regions["significant"].isna().all()
-    assert regions["region_threshold_mode"].unique().tolist() == [
-        "observed_gap_support_binned"
-    ]
+    # The default edge threshold is the lag null's single quantile.
+    assert regions["region_threshold_mode"].unique().tolist() == ["single"]
     # Every descriptive column survives the refusal.
     for column in ("region_area", "n_cpg", "delta_beta_descriptive",
                    "direction_descriptive", "statistic_mean"):

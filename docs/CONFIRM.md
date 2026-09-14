@@ -36,7 +36,12 @@ exactly why it survives where the background null does not.
 - **Effect size:** a two-component one-dimensional Gaussian fit of the same
   logit means, mapped back through the logistic. `delta_hat` is the difference
   of the component means on the beta scale, `f_hat` the weight of the smaller
-  component, `direction` the sign of the smaller component's shift. Starts are
+  component, `direction` the sign of the smaller component's shift **relative
+  to the larger one** -- in a cohort that is mostly tumour, the minor component
+  is usually benign, so a hypermethylated tumour region reads as `direction =
+  -1`; orient against a label before comparing signs (on ICGC, 33.7% raw
+  agreement with the published tumour-minus-benign sign became 95.6% once
+  oriented). Starts are
   data quantiles, so the fit is deterministic and needs no seed. This is
   descriptive: it is computed after the region was selected and it changes no
   decision.

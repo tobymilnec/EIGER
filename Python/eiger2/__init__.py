@@ -9,7 +9,7 @@ Everything about *which* samples differ and *by how much* is post-selection
 characterisation and is kept strictly downstream of discovery.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 from .confirm import confirm_regions, region_sample_means, two_component_fit
 from .core import (

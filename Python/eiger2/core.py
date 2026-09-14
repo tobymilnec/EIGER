@@ -399,7 +399,37 @@ class Eiger2Config:
     observed cutoff curve (including its number of discoveries), not on an
     artificial one-region denominator; see docs/FDR.md.
     """
-    null_quantile: float = 0.99
+    null_quantile: float = 0.995
+    """Upper quantile that sets the edge threshold, under whichever
+    ``edge_threshold`` source is in use. 0.995 is the v2.2 default for the
+    ``"lag_null"`` source; the ``"observed_quantile"`` source was validated on
+    the benchmark at 0.99 (docs/FDR.md section 18)."""
+
+    edge_threshold: str = "lag_null"
+    """``"lag_null"`` | ``"observed_quantile"``: where the edge threshold comes
+    from. It decides which individual edges count as elevated, and therefore
+    which runs become candidates. It is NOT the region-level FDR, which
+    ``region_null_mode`` governs.
+
+    ``"lag_null"`` (default): the ``null_quantile`` of the locality-breaking
+    edge null -- pairs of CpGs at least ``null_min_lag`` rows apart, so the
+    threshold is anchored to this cohort's cross-sample structure without
+    locality. This is the v2.2 rule. On the 519-sample ICGC cohort it gives
+    0.267 and 81,979 candidates. Its region-level FDR is misspecified on WGBS
+    backgrounds (docs/FDR.md section 18); as a CANDIDATE threshold it is not
+    a calibration claim, only an anchor, and it does not assume signal is
+    sparse.
+
+    ``"observed_quantile"``: the observed track's own ``null_quantile`` within
+    joint bp-gap and sample-support bins (``observed_edge_threshold``). No
+    null ensemble is built, so it is cheap, and on sparse-signal inputs it
+    gave 90.9% candidate recall on the benchmark. It ASSUMES signal is sparse:
+    it keeps a fixed fraction of edges whatever the biology. On the ICGC
+    cohort, where a tumour axis coordinates a large share of the genome, the
+    99th percentile of observed correlation was 0.932 and only 1,915
+    candidates survived, 2.3% of the lag-null set. Use it only when most of
+    the genome is expected to carry no coordinated signal.
+    """
     null_min_lag: int = 1000
     """Minimum genomic separation, in retained CpG rows, between the CpGs paired
     to build the null. Must comfortably exceed the methylation correlation
@@ -805,6 +835,10 @@ class Eiger2Config:
                 "backgrounds (docs/FDR.md section 18). Use the default "
                 "region_null_mode='off' for ranked candidates, or request "
                 "'member_step'/'lag' by name and accept the warning."
+            )
+        if self.edge_threshold not in {"lag_null", "observed_quantile"}:
+            raise ValueError(
+                "edge_threshold must be 'lag_null' or 'observed_quantile'"
             )
         if self.region_null_mode not in {"member_step", "lag", "off"}:
             raise ValueError(
@@ -4338,7 +4372,13 @@ def call_dmrs(
     structural_gates: dict = {}
     tracks: list = []
     observed_per_edge_threshold: np.ndarray | None = None
-    if resolved_region_null_mode == "off":
+    if config.edge_threshold == "observed_quantile":
+        if resolved_region_null_mode != "off":
+            raise ValueError(
+                "edge_threshold='observed_quantile' builds no null ensemble, "
+                "so region_null_mode must be 'off' with it; 'member_step' and "
+                "'lag' segment null tracks against the lag-null threshold."
+            )
         try:
             observed_per_edge_threshold, null_diagnostics = observed_edge_threshold(
                 statistic, eligible, frame, observed_support, config,

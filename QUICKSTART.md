@@ -276,6 +276,11 @@ coverage checks, and simultaneity scope (per-stratum, not genome-wide).
 --n-lag-draws 75                    # independent genome-wide region-null clusters
 --fdr-decision point|upper           # default point; upper decides on
                                       # region_qvalue_upper_95 instead (conservative)
+--edge-threshold lag_null|observed_quantile
+                                      # default lag_null (v2.2 rule, no sparsity
+                                      # assumption); observed_quantile keeps a fixed
+                                      # fraction of edges and needs --region-null-mode off
+--null-quantile 0.995                 # quantile behind the edge threshold
 --support-binned-threshold auto|on|off  # condition the null-quantile threshold on
                                       # local measurement support; default auto
 --biological-support-policy off|five_class_v1

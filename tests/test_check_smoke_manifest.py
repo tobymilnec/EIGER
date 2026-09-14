@@ -28,6 +28,7 @@ def make_manifest(
     refused=None,
     n_significant=11,
     fdr_extra=None,
+    null_mode="lag",
 ):
     """A run manifest of the shape ``eiger2 call`` writes."""
     if structural is None:
@@ -41,6 +42,7 @@ def make_manifest(
     return {
         "caller_manifest": {
             "status": status,
+            "null": {"mode": null_mode},
             "gates": {"structural": structural},
             "fdr": fdr,
             "n_significant": n_significant,
@@ -201,20 +203,34 @@ def test_a_manifest_with_no_structural_gates_fails(tmp_path):
     assert "no structural gate results" in result.stderr
 
 
-def test_discovery_only_passes_with_no_structural_gates(tmp_path):
-    # v2.3's default path builds no null, so it reports no null-construction
-    # gates. That is the correct shape for that status, not a truncated
-    # manifest, and it is a pass.
-    manifest = make_manifest(status="discovery_only", structural={})
+def test_observed_threshold_passes_with_no_structural_gates(tmp_path):
+    # edge_threshold='observed_quantile' builds no null, so it reports no
+    # null-construction gates. That is the correct shape for that threshold
+    # source, not a truncated manifest, and it is a pass.
+    manifest = make_manifest(
+        status="discovery_only", structural={},
+        null_mode="observed_gap_support_quantile",
+    )
     result = run_checker(tmp_path, manifest)
     assert result.returncode == 0, result.stderr
-    assert "none built (discovery_only)" in result.stdout
+    assert "none built (observed-quantile threshold)" in result.stdout
 
 
-def test_discovery_only_with_structural_gates_is_self_contradictory(tmp_path):
+def test_discovery_only_with_the_lag_null_threshold_keeps_its_gates(tmp_path):
+    # The default: discovery mode, but the edge threshold came from the lag
+    # null, so that null's structural gates exist and must all pass.
+    manifest = make_manifest(status="discovery_only")
+    result = run_checker(tmp_path, manifest)
+    assert result.returncode == 0, result.stderr
+    assert "2 present, all passed" in result.stdout
+
+
+def test_observed_threshold_with_structural_gates_is_self_contradictory(tmp_path):
     # Gates on a null that was never built mean one of the two statements is
     # false; the checker must not pick which.
-    manifest = make_manifest(status="discovery_only")
+    manifest = make_manifest(
+        status="discovery_only", null_mode="observed_gap_support_quantile",
+    )
     result = run_checker(tmp_path, manifest)
     assert result.returncode == 1
     assert "contradicts itself" in result.stderr

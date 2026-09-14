@@ -1373,6 +1373,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "insufficient per-stratum null opportunity")
         p.add_argument("--null-min-lag", dest="null_min_lag", type=int,
                        default=None)
+        p.add_argument("--null-quantile", dest="null_quantile", type=float,
+                       default=None,
+                       help="upper quantile that sets the edge threshold under "
+                            "--edge-threshold (default 0.995, the v2.2 value "
+                            "for the lag null; 0.99 was the value validated "
+                            "for observed_quantile)")
         p.add_argument("--target-fdr", dest="target_fdr", type=float,
                        default=0.05)
         p.add_argument("--null-mode", dest="null_mode",
@@ -1394,6 +1400,18 @@ def build_parser() -> argparse.ArgumentParser:
                             "region's own per-sample means come from one "
                             "population, which needs no reference panel -- see "
                             "docs/CONFIRM.md.")
+        p.add_argument("--edge-threshold", dest="edge_threshold",
+                       choices=["lag_null", "observed_quantile"], default=None,
+                       help="where the edge threshold comes from. Default "
+                            "'lag_null': the --null-quantile of the "
+                            "locality-breaking edge null (the v2.2 rule; "
+                            "anchored to cross-sample structure, no sparsity "
+                            "assumption). 'observed_quantile': the observed "
+                            "track's own quantile within gap and support bins; "
+                            "cheap, but keeps a fixed fraction of edges and so "
+                            "assumes most of the genome carries no signal "
+                            "(on ICGC it kept 2.3%% of the lag-null "
+                            "candidates). Requires --region-null-mode off.")
         p.add_argument("--region-null-mode", dest="region_null_mode",
                        choices=["member_step", "lag", "off"], default=None,
                        help="region-level null behind region_qvalue (distinct "

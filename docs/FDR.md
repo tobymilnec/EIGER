@@ -1299,9 +1299,25 @@ still calls every one of 20 null matrices.
 
 ### 18.5 What the default now claims, and what it does not
 
-**Claims.** These CpGs co-vary across samples more than this genome's own
-edges at the same gap and support typically do, and these runs of such edges
-are the longest and strongest of them. `rank` orders that evidence.
+**The edge threshold comes from the lag null, not from the observed track.**
+The first v2.3 build set the edge threshold to the observed track's own 99th
+percentile within gap and support bins. That rule keeps a fixed 1% of edges
+whatever the biology, which is only sensible when nearly all of the genome
+carries no coordinated signal. The benchmark's target arms are that sparse, so
+the rule scored 90.9% candidate recall there. The 519-sample ICGC cohort is
+not: a tumour axis coordinates a large share of the genome, the observed 99th
+percentile of correlation was 0.932 against the lag null's 0.267 on the same
+2,295,991 CpGs, and 1,915 candidates survived where the v2.2 rule found
+81,979. Every one of the 1,915 lay inside the 81,979. The lag-null threshold
+is therefore the default again (`edge_threshold="lag_null"`,
+`null_quantile=0.995`), as a candidate anchor and not as a calibration claim:
+its region-level FDR remains misspecified (18.1 to 18.3), and `region_null_mode`
+stays `"off"`. `edge_threshold="observed_quantile"` is retained for
+sparse-signal inputs and requires `region_null_mode="off"`.
+
+**Claims.** These CpGs co-vary across samples more than distant CpG pairs of
+this cohort do, and these runs of such edges are the longest and strongest of
+them. `rank` orders that evidence.
 
 **Does not claim.** That a ranked region is unlikely to arise on a DMR-free
 genome. No such statement is available from the query matrix alone, and

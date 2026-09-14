@@ -122,9 +122,14 @@ def test_call_dmrs_carries_the_confirmation_columns_and_the_flag_removes_them():
         "confirm_pvalue", "confirm_qvalue", "confirmed", "delta_hat", "f_hat",
         "direction", "n_samples_tested",
     ]
-    regions, _values, manifest = call_dmrs(
-        matrix, locations, config=Eiger2Config(window=4, random_seed=11),
+    # The fixture is far too small for the default lag null's 1,000-row
+    # minimum lag, so this test exercises tier two through the cheap
+    # observed-quantile threshold; the columns are the same on both paths.
+    config = Eiger2Config(
+        window=4, random_seed=11,
+        edge_threshold="observed_quantile", null_quantile=0.99,
     )
+    regions, _values, manifest = call_dmrs(matrix, locations, config=config)
     assert len(regions)
     for column in columns:
         assert column in regions
@@ -134,7 +139,10 @@ def test_call_dmrs_carries_the_confirmation_columns_and_the_flag_removes_them():
 
     off, _values, off_manifest = call_dmrs(
         matrix, locations,
-        config=Eiger2Config(window=4, random_seed=11, confirm_regions=False),
+        config=Eiger2Config(
+            window=4, random_seed=11, confirm_regions=False,
+            edge_threshold="observed_quantile", null_quantile=0.99,
+        ),
     )
     for column in columns:
         assert column not in off

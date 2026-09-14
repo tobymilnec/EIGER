@@ -85,15 +85,20 @@ def main() -> int:
     # report: an EMPTY structural block is correct there, and a populated one
     # would mean a null was built after all.  Everywhere else an empty block is
     # a truncated manifest.
-    discovery_only = caller.get("status") == "discovery_only"
+    null_block = caller.get("null") or {}
+    observed_threshold = (
+        isinstance(null_block, dict)
+        and null_block.get("mode") == "observed_gap_support_quantile"
+    )
     if not isinstance(structural, dict):
         return fail("the manifest's structural gate block is not an object")
-    if discovery_only and structural:
+    if observed_threshold and structural:
         return fail(
-            "status 'discovery_only' but structural null gates are recorded; "
-            "the manifest contradicts itself"
+            "the edge threshold came from the observed track, so no null was "
+            "built, but structural null gates are recorded; the manifest "
+            "contradicts itself"
         )
-    if not discovery_only and not structural:
+    if not observed_threshold and not structural:
         return fail("no structural gate results in the manifest")
     # A gate entry that does not say `passed: true` counts as failed, so a
     # truncated or malformed manifest cannot read as a pass.
@@ -105,8 +110,8 @@ def main() -> int:
     if failed:
         return fail(f"structural gate(s) failed: {failed}")
     print(
-        "[smoke] structural gates: none built (discovery_only)"
-        if discovery_only
+        "[smoke] structural gates: none built (observed-quantile threshold)"
+        if observed_threshold
         else f"[smoke] structural gates: {len(structural)} present, all passed"
     )
 
