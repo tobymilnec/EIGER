@@ -1316,11 +1316,15 @@ measured at 0 of 20 null calls and 47.8% recall in 18.3. **That path is
 specified here and is not implemented in this release**: the benchmark's
 oracle-reference arm is produced by the eiger-benchmark repository's
 `scripts/eiger_reference_count_spike.py`, and the paper describes it as "Eiger
-given matched controls". A second tier -- confirming a candidate by testing whether its own per-sample
-region means come from one population -- was specified and measured, and is not
-shipped: both predeclared tests failed their predeclared null-calibration rule
-on 20 correlated-null development matrices (the eiger-benchmark repository's
-`provenance/eiger_confirm_spike_v1/REPORT.md`).
+given matched controls". Without controls, **tier two** answers a different and answerable question
+instead: do this region's own per-sample means come from one population?
+Hartigan's dip test on the region's per-sample logit mean betas, with BH across
+the run's candidates, makes no claim about the genome background and needs no
+reference panel. It is on by default and documented in
+[`CONFIRM.md`](CONFIRM.md), including the measurement that chose it over three
+calibrated alternatives (the eiger-benchmark repository's
+`provenance/eiger_confirm_spike_v1/REPORT.md` and
+`provenance/eiger_confirm_spike_v2/REPORT.md`).
 
 `region_null_mode="member_step"` and `"lag"` remain available by explicit
 request for reproducing historical results. Both warn, and both are calibrated

@@ -24,6 +24,9 @@ dependencies = [
     "numpy>=1.23",
     "pandas>=1.5",
     "scipy>=1.9",
+    # Hartigan's dip test, the tier-two confirmation test (docs/CONFIRM.md).
+    # A runtime dependency, not an extra: confirmation is on by default.
+    "diptest>=0.9",
 ]
 
 [project.optional-dependencies]

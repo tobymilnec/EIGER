@@ -98,7 +98,11 @@ rank,region_id,chr,start,end,n_cpg,...,region_area,region_qvalue,...,fdr_status
 2,EIGER2_chr1_650200_650421,chr1,650200,650421,12,...,3.348,,...,no_calibrated_null
 ```
 
-`rank` orders regions by `region_area` within chromosome order. `region_qvalue`,
+`rank` orders regions by `region_area` within chromosome order. Seven further
+columns -- `confirm_pvalue`, `confirm_qvalue`, `confirmed`, `delta_hat`,
+`f_hat`, `direction`, `n_samples_tested` -- carry tier two, the per-region
+confirmation test (`--no-confirm` turns it off; see
+[docs/CONFIRM.md](docs/CONFIRM.md)). `region_qvalue`,
 `region_qvalue_upper_95` and `significant` are empty, `fdr_status` reads
 `no_calibrated_null`, and `run_manifest.json` records `status: discovery_only`
 with the reason. **Region FDR against the genome background requires matched

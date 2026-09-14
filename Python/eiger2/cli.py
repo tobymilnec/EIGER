@@ -875,6 +875,14 @@ def command_call(args: argparse.Namespace) -> int:
               f"unobserved in every sample")
     print(f"[eiger2] caller     : {'legacy' if args.legacy else 'eiger2'}")
     print(f"[eiger2] regions    : {len(regions)}")
+    confirmation = caller_manifest.get("confirmation") or {}
+    if confirmation.get("test"):
+        print(
+            f"[eiger2] confirmed  : {confirmation.get('n_confirmed', 0)} of "
+            f"{confirmation.get('regions_tested', 0)} tested "
+            f"(dip test on per-sample means, BH at "
+            f"{confirmation.get('target_fdr')})"
+        )
     run_status = caller_manifest.get("status")
     if run_status == "discovery_only":
         # "0 significant" would be a measurement; nothing was measured.
@@ -1376,6 +1384,16 @@ def build_parser() -> argparse.ArgumentParser:
                             "measured at zero usable null regions -- see "
                             "--region-null-mode for large-cohort saturation, "
                             "which no longer needs a workaround.")
+        p.add_argument("--no-confirm", dest="confirm_regions",
+                       action="store_false", default=None,
+                       help="skip tier two: report ranked candidates without "
+                            "the per-region confirmation columns "
+                            "(confirm_pvalue, confirm_qvalue, confirmed, "
+                            "delta_hat, f_hat, direction, n_samples_tested). "
+                            "Confirmation is on by default; it tests whether a "
+                            "region's own per-sample means come from one "
+                            "population, which needs no reference panel -- see "
+                            "docs/CONFIRM.md.")
         p.add_argument("--region-null-mode", dest="region_null_mode",
                        choices=["member_step", "lag", "off"], default=None,
                        help="region-level null behind region_qvalue (distinct "

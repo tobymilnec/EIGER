@@ -6,8 +6,8 @@
 #
 # Every dependency is pinned here, so the pip step installs nothing further.
 # numba, scikit-learn and joblib are required only by the LEGACY caller
-# (Python/functions/processing.py); the revised caller needs numpy, pandas and
-# scipy alone.
+# (Python/functions/processing.py); the revised caller needs numpy, pandas,
+# scipy and diptest.
 name: eiger
 
 channels:
@@ -19,6 +19,7 @@ dependencies:
   - numpy=1.26.4
   - pandas=2.2.2
   - scipy=1.14.1
+  - diptest=0.11.0  # Hartigan's dip test, tier-two confirmation
   # legacy caller only
   - numba=0.60.0
   - scikit-learn=1.5.2

@@ -109,6 +109,15 @@ BOTTOM_STRATUM_FDR_NOTE = (
 # the genome background to report. Shared with cli.py so the wording has one
 # source, and written into the manifest so a reader of the output alone is told
 # what the run does not claim.
+CONFIRMATION_NOTE = (
+    "Confirmed regions reject unimodality of their own per-sample mean "
+    "methylation (Hartigan's dip test, BH across this run's candidates at "
+    "target_fdr). That is an error rate against the hypothesis 'these samples "
+    "are one population', not against the genome background. A DMR present in "
+    "every sample is invisible to it, a continuously graded effect stays a "
+    "candidate, and a rare subset has little power. See docs/CONFIRM.md."
+)
+
 NO_CALIBRATED_NULL_NOTE = (
     "No region FDR against the genome background. region_null_mode='off' is "
     "the default: every self-calibrated background null measured on "
@@ -415,6 +424,21 @@ class Eiger2Config:
     Sign-agnostic: a hypomethylated region produces the same positive adjacent
     correlation as a hypermethylated one. Direction is recovered afterwards
     from delta beta.
+    """
+
+    confirm_regions: bool = True
+    """Run tier two: confirm each candidate from its own per-sample means.
+
+    Hartigan's dip test on the region's per-sample logit mean betas, BH across
+    the run's candidates, and a two-component fit for the effect size -- see
+    ``eiger2.confirm`` and ``docs/CONFIRM.md``. It asks whether the region's
+    own samples come from one population, which is answerable without a
+    reference panel, unlike region FDR against the genome background.
+
+    On by default because it is the only error rate this tool can honestly
+    report unsupervised, and cheap (an interpolated-table p-value per region).
+    Set ``False`` (``--no-confirm``) to report ranked candidates only; the
+    columns are then absent rather than empty.
     """
 
     region_null_mode: str = "off"
@@ -5110,6 +5134,32 @@ def call_dmrs(
         )
     )
 
+    # --- tier two: confirmation from the region's own per-sample means ---
+    # A different question from region FDR, with a null that is a property of
+    # the region rather than of the genome background, so it needs no
+    # reference panel (docs/CONFIRM.md). BH runs across THIS run's candidates,
+    # which is why it is computed once here rather than per row.
+    if config.confirm_regions:
+        from .confirm import MIN_CONFIRM_SAMPLES
+        from .confirm import confirm_regions as _confirm
+
+        confirmation = _confirm(matrix, regions, target_fdr=config.target_fdr)
+        manifest["confirmation"] = {
+            "test": "hartigan_dip_interpolated_table",
+            "family": "candidates of this run",
+            "target_fdr": config.target_fdr,
+            "min_samples_tested": MIN_CONFIRM_SAMPLES,
+            "regions_tested": confirmation["n_tested_regions"],
+            "regions_not_tested": int(len(regions) - confirmation["n_tested_regions"]),
+            "n_confirmed": int(
+                sum(value is True for value in confirmation["confirmed"])
+            ),
+            "note": CONFIRMATION_NOTE,
+        }
+    else:
+        confirmation = None
+        manifest["confirmation"] = {"test": None, "note": "confirmation disabled"}
+
     rows = []
     support_rows: list[dict] | None = (
         [] if config.biological_support_policy == "five_class_v1" else None
@@ -5235,6 +5285,25 @@ def call_dmrs(
                         )
                     )
                 ),
+                **(
+                    {
+                        "confirm_pvalue": float(
+                            confirmation["confirm_pvalue"][position]
+                        ),
+                        "confirm_qvalue": float(
+                            confirmation["confirm_qvalue"][position]
+                        ),
+                        "confirmed": confirmation["confirmed"][position],
+                        "delta_hat": float(confirmation["delta_hat"][position]),
+                        "f_hat": float(confirmation["f_hat"][position]),
+                        "direction": float(confirmation["direction"][position]),
+                        "n_samples_tested": int(
+                            confirmation["n_samples_tested"][position]
+                        ),
+                    }
+                    if confirmation is not None
+                    else {}
+                ),
                 "n_samples_observed": description["n_observed"],
                 "missing_rate": float(np.mean(~np.isfinite(block))),
                 "mean_beta": description["mean_beta"],
@@ -5338,7 +5407,9 @@ def call_dmrs(
     if support_rows is not None:
         support_rows = [support_rows[position] for position in order]
     region_frame.insert(0, "rank", np.arange(1, len(region_frame) + 1, dtype=np.int64))
-    region_frame = region_frame[_REGION_COLUMNS]
+    region_frame = region_frame[
+        [column for column in _REGION_COLUMNS if column in region_frame]
+    ]
     # pandas would otherwise infer `object` dtype from a column mixing `bool`
     # and `pd.NA`; the nullable BooleanDtype is what makes `pd.NA` survive a
     # CSV round trip as a genuinely missing value rather than a stringified
@@ -5347,6 +5418,11 @@ def call_dmrs(
     region_frame["coordination_significant"] = region_frame[
         "coordination_significant"
     ].astype("boolean")
+    if "confirmed" in region_frame:
+        # Same contract as `significant`: pd.NA is "not tested" (fewer than
+        # MIN_CONFIRM_SAMPLES samples observed enough of the region), which is
+        # a different statement from False, "tested, not separated".
+        region_frame["confirmed"] = region_frame["confirmed"].astype("boolean")
     if support_rows is not None:
         support_frame = pd.DataFrame(
             support_rows, columns=_SUPPORT_OUTPUT_COLUMNS
@@ -5413,6 +5489,8 @@ def call_dmrs(
     else:
         manifest["status"] = "ok"
     manifest["n_significant"] = int(region_frame["significant"].sum())
+    if "confirmed" in region_frame:
+        manifest["n_confirmed"] = int(region_frame["confirmed"].fillna(False).sum())
     # FIX_SPEC §WP2: how many of those significant calls sit in the bottom
     # length stratum, the one length x effect regime measured off target (see
     # BOTTOM_STRATUM_FDR_NOTE). Recorded on every run that reaches the FDR
@@ -5497,6 +5575,13 @@ _REGION_COLUMNS = [
     "biological_class",
     "significant",
     "fdr_status",
+    "confirm_pvalue",
+    "confirm_qvalue",
+    "confirmed",
+    "delta_hat",
+    "f_hat",
+    "direction",
+    "n_samples_tested",
     "n_samples_observed",
     "missing_rate",
     "mean_beta",
@@ -5520,6 +5605,8 @@ _REGION_MAIN_COLUMNS = [
     "region_qvalue_cutoff_rank", "region_evidence_score",
     "evidence_score_extrapolated", "coordination_significant",
     "biological_class", "passes_prevalence", "significant", "fdr_status",
+    "confirm_pvalue", "confirm_qvalue", "confirmed", "delta_hat", "f_hat",
+    "direction", "n_samples_tested",
 ]
 
 

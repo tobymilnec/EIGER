@@ -11,6 +11,7 @@ characterisation and is kept strictly downstream of discovery.
 
 __version__ = "2.2.0"
 
+from .confirm import confirm_regions, region_sample_means, two_component_fit
 from .core import (
     Eiger2Config,
     RegionFdrResult,
@@ -45,6 +46,7 @@ __all__ = [
     "biological_support_diagnostics",
     "call_dmrs",
     "centre_cpgs",
+    "confirm_regions",
     "characterise_region",
     "deflate",
     "edge_statistic",
@@ -57,5 +59,7 @@ __all__ = [
     "region_fdr",
     "region_fdr_result",
     "reliability_table",
+    "region_sample_means",
     "segment",
+    "two_component_fit",
 ]

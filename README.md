@@ -34,7 +34,10 @@ rank,region_id,chr,start,end,n_cpg,...,region_area,region_qvalue,...,fdr_status
 ```
 
 `rank` orders regions by area within chromosome order; `region_qvalue` and
-`significant` are empty, and `fdr_status` says why. **Region FDR against the
+`significant` are empty, and `fdr_status` says why. Alongside them,
+`confirmed`, `confirm_qvalue`, `delta_hat`, `f_hat` and `direction` report
+tier two: whether that region's own per-sample means separate into more than
+one population, and by how much ([docs/CONFIRM.md](docs/CONFIRM.md)). **Region FDR against the
 genome background requires matched control matrices**, and the path that
 consumes them is specified but not implemented in this release -- see
 [docs/FDR.md](docs/FDR.md) section 18 for the measurements behind that default.
@@ -61,6 +64,7 @@ EIGER2 was developed to address this limitation and to provide a clearer statist
 | **Correlation as the default statistic** | Correlation normalises covariance by the variance of the CpGs and is therefore less directly constrained by subgroup prevalence once the methylation difference exceeds the background noise. |
 | **A data-derived edge threshold** | An edge counts as elevated when it exceeds this genome's own 99th percentile of the statistic, taken within joint bp-gap and sample-support bins so that the quantile means the same thing at every spacing and completeness. (Before v2.3 the threshold came from the locality-breaking null; see [docs/FDR.md](docs/FDR.md) section 18 for why it no longer does.) |
 | **Ranked candidates by default** | Runs of elevated edges become regions, and regions are ranked by `region_area`. Region FDR against the genome background is available only when matched control matrices are supplied: every self-calibrated background null measured on WGBS-realistic data failed. |
+| **Per-region confirmation (tier two)** | Each candidate is separately tested for whether its own per-sample mean betas come from one population (Hartigan's dip test, BH across the run's candidates), with the effect size, prevalence and direction of the split. That null is a property of the region, not of the genome background, so it needs no controls. See [docs/CONFIRM.md](docs/CONFIRM.md). |
 
 The assumptions and commands underlying these changes are documented in **[docs/](docs/)**. The validation analyses themselves live in the separate `eiger_paper` repository, which is not part of this package: see its **[analysis/README.md](https://github.com/tobymilnec/eiger_paper/blob/d83f61decfa624cbc079c38f38e3dd480fee322b/analysis/README.md)**.
 

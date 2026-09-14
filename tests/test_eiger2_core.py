@@ -609,6 +609,8 @@ WP7A_COLUMNS = (
     "region_evidence_score", "evidence_score_extrapolated",
     "minority_size_descriptive", "minority_delta_descriptive", "passes_prevalence",
     "coordination_significant", "biological_class", "significant", "fdr_status",
+    "confirm_pvalue", "confirm_qvalue", "confirmed", "delta_hat", "f_hat",
+    "direction", "n_samples_tested",
     "n_samples_observed", "missing_rate", "mean_beta", "delta_beta_descriptive",
     "largest_gap_descriptive", "direction_descriptive",
     "minor_group_size_descriptive", "minor_group_fraction_descriptive",
