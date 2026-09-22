@@ -1,0 +1,167 @@
+{
+  "source": {
+    "reference_implementation": "eiger_fdr_validation_v2/src/vfdr (callers, permute, fdr, streamed)",
+    "reference_vfdr_sha256": {
+      "__init__.py": "57cae146b9b8985d83025fc24e417131acd4abad01514bcbf6d5989827603cf5",
+      "callers.py": "114a082cec8ecebbd86589434300821e243c1fb286217cec7b0b96f4812e64b5",
+      "env.py": "8c712a1573f82e88ad9e9dc59b109d77f54770052f96eb74123bf0696aa9aca9",
+      "evaluate.py": "b8aa01d5452ed5c69d1b388ef417a676bc2a594806302ea65e0fb08adfd13541",
+      "evaluate2.py": "638932821550c6c2987c6dfd66ccff7d60b4f315b6ce2cf83982f8f4bfab5f27",
+      "fdr.py": "b6d4e0266905981eb1116db957ee8dd36ba876f74b6ca33b84f1a4cacc2c6bdc",
+      "layouts2.py": "d6a89ce80f5a99438927c296d05df79f5025501a5a805eee055096311c131312",
+      "permute.py": "b1fd07196057625d2d113356402928971adfb6569a018729b94dd293e167e340",
+      "pipeline.py": "d2964e104e001d0974d0a425ed13e5ef6d59de2bf4630772cad09d908f494149",
+      "pipeline2.py": "9863753136dcfa466502f2620623ff1ff55c85af0691f7af6f18fd561be4331c",
+      "profiles2.py": "97ba707d6176d90bea5e75ecde5df220edc3f7fab94ce112332bb5792f1ac440",
+      "scenarios.py": "bfb813cd148514ae316a7fe193f0bd34e7253e29f3365edc93e06839f6662274",
+      "scenarios2.py": "9b8496e062b580710f20327dab6a575d068a6d6c3c7f381dd7f86d142e86a46f",
+      "simulate.py": "86755ecb7b9bdab5114b9cefc2b370149bd40b29a40dfc7f5bcc564869dde0c8",
+      "simulate2.py": "53039b82413453caf137f6a464637ec48aaa6a2d4504c0bac8995467fd00ff57",
+      "streamed.py": "8510bcc532b36890ec75c527358fd16ba1de408254fb682941beefa225762a66"
+    },
+    "eiger_clean_commit": "b11af46fd68e3a03474c3ca2ea095f209606cd4f",
+    "eiger_clean_core_sha256": "f78d357d3b8a41e80546a27c6a2a3612f0c79da124b1fb81b9c0639626afa49b",
+    "generator": "tests/region_fdr_data.make_dataset"
+  },
+  "cases": {
+    "newer_mixed_maskfixed_B19": {
+      "spec": {
+        "name": "newer_mixed_maskfixed_B19",
+        "profile": "newer",
+        "mask_mode": "mask_fixed",
+        "B": 19,
+        "permutation_seed": 770000103,
+        "data": {
+          "seed": 20260919,
+          "missing_fraction": 0.12
+        }
+      },
+      "input_sha256": "b51fefd5fe8e9c75466e4645546fe91fa426cac5a8d067746f92096547a06626",
+      "n_candidates": 11,
+      "n_selected_at_0.05": 11
+    },
+    "newer_null_B19": {
+      "spec": {
+        "name": "newer_null_B19",
+        "profile": "newer",
+        "mask_mode": "values_with_mask",
+        "B": 19,
+        "permutation_seed": 770000105,
+        "streamed_permutations": true,
+        "data": {
+          "seed": 20260920,
+          "n_samples": 40,
+          "n_blocks": 0,
+          "missing_fraction": 0.0,
+          "chromosomes": [
+            [
+              "chr1",
+              3300
+            ],
+            [
+              "chr2",
+              3050
+            ]
+          ]
+        }
+      },
+      "input_sha256": "239e9f29438e0a6c8583118f763610c4e8e589f5ee242290cc6f8889a5883ab8",
+      "n_candidates": 0,
+      "n_selected_at_0.05": 0
+    },
+    "newer_weak_mixed_B99": {
+      "spec": {
+        "name": "newer_weak_mixed_B99",
+        "profile": "newer",
+        "mask_mode": "values_with_mask",
+        "B": 99,
+        "permutation_seed": 770000111,
+        "streamed_permutations": true,
+        "data": {
+          "seed": 11,
+          "n_samples": 12,
+          "n_blocks": 40,
+          "block_strength": 0.045,
+          "missing_fraction": 0.05,
+          "chromosomes": [
+            [
+              "chr1",
+              12000
+            ],
+            [
+              "chr2",
+              10000
+            ],
+            [
+              "chr3",
+              6000
+            ]
+          ]
+        }
+      },
+      "input_sha256": "cd308d407c3dcff59e04c5f14f64382390fd5ebadba4a5e02592ce2fa44ff934",
+      "n_candidates": 9,
+      "n_selected_at_0.05": 7
+    },
+    "legacy_noisy_mixed_B99": {
+      "spec": {
+        "name": "legacy_noisy_mixed_B99",
+        "profile": "legacy",
+        "mask_mode": "values_with_mask",
+        "B": 99,
+        "permutation_seed": 770000112,
+        "streamed_permutations": true,
+        "data": {
+          "seed": 12,
+          "n_samples": 10,
+          "noise_sd": 0.2,
+          "n_blocks": 20,
+          "block_strength": 0.12,
+          "missing_fraction": 0.03,
+          "chromosomes": [
+            [
+              "chr1",
+              5000
+            ],
+            [
+              "chr2",
+              4000
+            ]
+          ]
+        }
+      },
+      "input_sha256": "9a1aa5b2fec68ce7aca03ee9454fe5bdd0ca499e912b669a7711dea63adbf7c0",
+      "n_candidates": 43,
+      "n_selected_at_0.05": 7
+    },
+    "legacy_noisy_null_B19": {
+      "spec": {
+        "name": "legacy_noisy_null_B19",
+        "profile": "legacy",
+        "mask_mode": "values_with_mask",
+        "B": 19,
+        "permutation_seed": 770000113,
+        "data": {
+          "seed": 13,
+          "n_samples": 10,
+          "noise_sd": 0.25,
+          "n_blocks": 0,
+          "missing_fraction": 0.03,
+          "chromosomes": [
+            [
+              "chr1",
+              5000
+            ],
+            [
+              "chr2",
+              4000
+            ]
+          ]
+        }
+      },
+      "input_sha256": "9b649f7b20c6dadc8ddc1577ecee96e20ad223b611b1ef27422953d1d26a4f50",
+      "n_candidates": 96,
+      "n_selected_at_0.05": 0
+    }
+  }
+}

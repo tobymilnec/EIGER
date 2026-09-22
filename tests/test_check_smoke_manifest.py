@@ -1,236 +1,181 @@
 """Tests for ``tools/check_smoke_manifest.py``, the smoke targets' verdict.
 
-The helper decides whether ``make smoke-revised`` may report success, so its
-own failure modes need covering: a refusal must never read as a completed
-inference, and a manifest that is malformed, self-contradictory or in an
-undocumented state must fail rather than be interpreted.
-
-It is exercised as the command line the Makefile actually runs, through
-``sys.executable``. It imports nothing from eiger2, so these tests neither
-need the package installed nor can pick it up from a sibling checkout.
+Each test writes a small, internally consistent ``eiger2 call`` output
+directory, breaks one documented property, and requires the checker to name
+it. The checker is standard-library only and runs as a script.
 """
 
 from __future__ import annotations
 
+import copy
+import csv
+import importlib.util
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 CHECKER = Path(__file__).resolve().parent.parent / "tools" / "check_smoke_manifest.py"
-
-
-def make_manifest(
-    status="ok_with_warnings",
-    structural=None,
-    refused=None,
-    n_significant=11,
-    fdr_extra=None,
-    null_mode="lag",
-):
-    """A run manifest of the shape ``eiger2 call`` writes."""
-    if structural is None:
-        structural = {
-            "null_track_survival": {"passed": True},
-            "region_exchangeability": {"passed": True},
-        }
-    fdr = {"insufficient_null_opportunity_strata": list(refused or [])}
-    if fdr_extra:
-        fdr.update(fdr_extra)
-    return {
-        "caller_manifest": {
-            "status": status,
-            "null": {"mode": null_mode},
-            "gates": {"structural": structural},
-            "fdr": fdr,
-            "n_significant": n_significant,
-        }
-    }
-
-
-REFUSAL = {
-    "stratum": "20-49",
-    "observed_regions": 1,
-    "null_opportunity": 282134.0,
-    "required_null_opportunity": 499810.0,
+HEADER = [
+    "region_id", "chr", "start", "end", "n_cpg", "cpg_index_start",
+    "cpg_index_end", "caller", "region_score", "statistic_mean",
+    "scan_threshold", "coordination_qvalue", "coordination_selected",
+    "axis_status", "axis_n_axes", "axis_n_samples_tested", "axis_index",
+    "axis_effect", "axis_effect_se", "axis_effect_lower", "axis_effect_upper",
+    "axis_pvalue", "axis_qvalue", "axis_supported",
+]
+MANIFEST = {
+    "run_schema": "eiger.region_fdr_run/1",
+    "software_version": "9.9.9",
+    "status": "ok",
+    "inputs": {"files": [{"path": "betas.tsv", "sha256": "a" * 64}]},
+    "method": {"fdr_formula_version": "fdr_plus_cummin/1", "pseudocount": 1,
+               "automatic_deflation": False},
+    "profile": {"name": "newer"},
+    "settings": {"target_fdr": 0.05, "fdr_replicates_requested": 3},
+    "permutations": {"requested": 3, "completed": 3,
+                     "null_regions_per_permutation": [0, 1, 0],
+                     "scan_thresholds": [0.1, 0.1, 0.1]},
+    "results": {"n_candidates": 2, "n_selected": 1},
+    "axis": {"mode": "descriptive", "affects_primary_calls": False,
+             "inference_reported": False, "n_axes": 1,
+             "status_counts": {"estimated": 2}},
+    "threshold_ratio": {"observed_over_mean_permuted": 1.1},
 }
 
 
-def run_checker(tmp_path, manifest, exit_code=0, extra=()):
-    path = tmp_path / "run_manifest.json"
-    if isinstance(manifest, str):
-        path.write_text(manifest)
-    else:
-        path.write_text(json.dumps(manifest))
-    command = [sys.executable, str(CHECKER), str(path)]
-    command += ["--exit-code", str(exit_code), *extra]
-    return subprocess.run(command, capture_output=True, text=True)
+def _region(name, q, selected):
+    row = dict.fromkeys(HEADER, "NA")
+    row.update(region_id=name, chr="chr1", start="1", end="9", n_cpg="4",
+               caller="newer", region_score="1.0", coordination_qvalue=str(q),
+               coordination_selected=selected, axis_status="estimated",
+               axis_effect="0.2")
+    return row
 
 
-@pytest.mark.parametrize("status", ["ok", "ok_with_warnings"])
-def test_a_completed_run_with_no_refusal_passes(tmp_path, status):
-    result = run_checker(tmp_path, make_manifest(status=status))
-    assert result.returncode == 0, result.stderr
-    assert f"final inference status: {status}" in result.stdout
-    assert "completed inference for every stratum" in result.stdout
+def load_checker():
+    spec = importlib.util.spec_from_file_location("check_smoke_manifest", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def test_partial_inference_with_a_recorded_refusal_passes_and_reports_it(tmp_path):
-    result = run_checker(
-        tmp_path, make_manifest(status="partial_inference", refused=[REFUSAL])
-    )
-    assert result.returncode == 0, result.stderr
-    # The refusal is printed as a refusal, with the stratum named ...
-    assert "REFUSED inference for length stratum/strata ['20-49']" in result.stdout
-    assert "did not complete inference" in result.stdout
-    # ... and the opportunity arithmetic that justifies it is shown.
-    assert "499810.0" in result.stdout
-    # It is never described as a completed inference.
-    assert "completed inference for every stratum" not in result.stdout
+def write_run(out: Path, manifest=None, regions=None, discoveries=None,
+              n_permutation_rows=3):
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_manifest.json").write_text(json.dumps(manifest or MANIFEST))
+    regions = regions if regions is not None else [
+        _region("r1", 0.02, "True"), _region("r2", 0.5, "False"),
+    ]
+    if discoveries is None:
+        discoveries = [r for r in regions if r["coordination_selected"] == "True"]
+    for name, rows in (("regions.csv", regions), ("discoveries.csv", discoveries)):
+        with (out / name).open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=HEADER)
+            writer.writeheader()
+            writer.writerows(rows)
+    with (out / "permutations.csv").open("w", newline="") as handle:
+        handle.write("replicate,n_regions\n")
+        for b in range(n_permutation_rows):
+            handle.write(f"{b + 1},0\n")
+    return out
 
 
-def test_partial_inference_without_a_refusal_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(status="partial_inference"))
-    assert result.returncode == 1
-    assert "contradicts itself" in result.stderr
+def run(out, *extra, exit_code=0):
+    return load_checker().main([str(out), "--exit-code", str(exit_code), *extra])
 
 
-def test_a_completed_status_carrying_a_refusal_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(status="ok", refused=[REFUSAL]))
-    assert result.returncode == 1
-    assert "contradicts itself" in result.stderr
+def test_a_consistent_run_passes_and_is_summarised(tmp_path, capsys):
+    out = write_run(tmp_path / "run")
+    assert run(out, "--version", "9.9.9", "--profile", "newer",
+               "--axis-mode", "descriptive") == 0
+    printed = capsys.readouterr().out
+    assert "2 candidates, 1 selected" in printed
+    assert "3/3 permutation scans" in printed
 
 
-def test_inference_unreliable_fails(tmp_path):
-    result = run_checker(
-        tmp_path, make_manifest(status="inference_unreliable"), exit_code=1
-    )
-    assert result.returncode == 1
-    assert "refusal, not an inference" in result.stderr
+def _mutated(**changes):
+    manifest = copy.deepcopy(MANIFEST)
+    for path, value in changes.items():
+        target = manifest
+        keys = path.split("__")
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = value
+    return manifest
 
 
-def test_no_regions_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(status="no_regions"))
-    assert result.returncode == 1
-    assert "no_regions" in result.stderr
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"run_schema": "eiger.region_fdr_run/0"}, "run_schema"),
+        ({"status": "partial_inference"}, "undocumented"),
+        ({"status": "no_candidates"}, "status"),
+        ({"permutations__completed": 2}, "permutation scans"),
+        ({"permutations__scan_thresholds": [0.1]}, "scan_thresholds"),
+        ({"method__fdr_formula_version": "bh/1"}, "fdr_formula_version"),
+        ({"method__pseudocount": 0}, "pseudocount"),
+        ({"method__automatic_deflation": True}, "automatic_deflation"),
+        ({"results__n_candidates": 3}, "regions.csv has 2 rows"),
+        ({"results__n_selected": 2}, "selected rows"),
+        ({"axis__affects_primary_calls": True}, "primary calls"),
+        ({"inputs__files": [{"path": "betas.tsv", "sha256": "abc"}]}, "SHA-256"),
+    ],
+)
+def test_each_documented_property_is_enforced(tmp_path, capsys, changes, message):
+    out = write_run(tmp_path / "run", manifest=_mutated(**changes))
+    assert run(out) == 1
+    assert message in capsys.readouterr().err
 
 
-def test_a_failed_structural_gate_fails(tmp_path):
-    result = run_checker(
-        tmp_path,
-        make_manifest(
-            structural={
-                "null_track_survival": {"passed": False, "observed": 0.31},
-                "region_exchangeability": {"passed": True},
-            }
-        ),
-    )
-    assert result.returncode == 1
-    assert "structural gate(s) failed" in result.stderr
+def test_a_nonzero_exit_code_fails(tmp_path, capsys):
+    out = write_run(tmp_path / "run")
+    assert run(out, exit_code=1) == 1
+    assert "exited 1" in capsys.readouterr().err
 
 
-def test_a_gate_entry_without_a_verdict_is_not_read_as_a_pass(tmp_path):
-    result = run_checker(
-        tmp_path, make_manifest(structural={"null_track_survival": {}})
-    )
-    assert result.returncode == 1
-    assert "structural gate(s) failed" in result.stderr
+def test_a_selection_flag_contradicting_the_qvalue_fails(tmp_path, capsys):
+    regions = [_region("r1", 0.02, "True"), _region("r2", 0.04, "False")]
+    out = write_run(tmp_path / "run", regions=regions,
+                    discoveries=regions[:1])
+    assert run(out) == 1
+    assert "r2" in capsys.readouterr().err
 
 
-def test_an_undocumented_status_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(status="mostly_fine"))
-    assert result.returncode == 1
-    assert "undocumented run status" in result.stderr
-    assert "escalate" in result.stderr
+def test_discoveries_must_be_the_selected_subset(tmp_path, capsys):
+    out = write_run(tmp_path / "run", discoveries=[])
+    assert run(out) == 1
+    assert "discoveries.csv" in capsys.readouterr().err
 
 
-def test_an_exit_code_the_manifest_does_not_explain_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(status="ok"), exit_code=1)
-    assert result.returncode == 1
-    assert "exit code and manifest disagree" in result.stderr
+def test_inferential_axis_columns_must_be_empty_in_descriptive_mode(
+    tmp_path, capsys
+):
+    regions = [_region("r1", 0.02, "True"), _region("r2", 0.5, "False")]
+    regions[0]["axis_qvalue"] = "0.01"
+    out = write_run(tmp_path / "run", regions=regions)
+    assert run(out) == 1
+    assert "axis_qvalue" in capsys.readouterr().err
 
 
-def test_expect_no_refusals_rejects_a_run_that_refused_a_stratum(tmp_path):
-    manifest = make_manifest(status="partial_inference", refused=[REFUSAL])
-    assert run_checker(tmp_path, manifest).returncode == 0
-    strict = run_checker(tmp_path, manifest, extra=["--expect-no-refusals"])
-    assert strict.returncode == 1
-    assert "--expect-no-refusals" in strict.stderr
+def test_a_permutation_table_of_the_wrong_length_fails(tmp_path, capsys):
+    out = write_run(tmp_path / "run", n_permutation_rows=2)
+    assert run(out) == 1
+    assert "permutations.csv" in capsys.readouterr().err
 
 
-def test_the_other_refusal_kinds_are_inspected_too(tmp_path):
-    """Cluster-replicate and scale-opportunity refusals count as refusals."""
-    manifest = make_manifest(
-        status="partial_inference",
-        fdr_extra={"insufficient_cluster_replicates_strata": [{"stratum": "6-9"}]},
-    )
-    result = run_checker(tmp_path, manifest)
-    assert result.returncode == 0, result.stderr
-    printed = "insufficient_cluster_replicates_strata: [{'stratum': '6-9'}]"
-    assert printed in result.stdout
-    assert "REFUSED inference for length stratum/strata ['6-9']" in result.stdout
+def test_version_and_profile_expectations_are_enforced(tmp_path, capsys):
+    out = write_run(tmp_path / "run")
+    assert run(out, "--version", "2.2.0rc1") == 1
+    assert "software_version" in capsys.readouterr().err
+    assert run(out, "--profile", "legacy") == 1
+    assert "profile" in capsys.readouterr().err
 
 
-def test_a_manifest_without_a_caller_block_fails_cleanly(tmp_path):
-    result = run_checker(tmp_path, {"schema_version": 3})
-    assert result.returncode == 1
-    assert "no caller_manifest block" in result.stderr
-    assert "Traceback" not in result.stderr
-
-
-def test_malformed_json_fails_cleanly(tmp_path):
-    result = run_checker(tmp_path, "{not json")
-    assert result.returncode == 1
-    assert "not valid JSON" in result.stderr
-    assert "Traceback" not in result.stderr
-
-
-def test_a_missing_manifest_fails_cleanly(tmp_path):
-    command = [sys.executable, str(CHECKER), str(tmp_path / "absent.json")]
-    result = subprocess.run(
-        command + ["--exit-code", "0"], capture_output=True, text=True
-    )
-    assert result.returncode == 1
-    assert "cannot read" in result.stderr
-    assert "Traceback" not in result.stderr
-
-
-def test_a_manifest_with_no_structural_gates_fails(tmp_path):
-    result = run_checker(tmp_path, make_manifest(structural={}))
-    assert result.returncode == 1
-    assert "no structural gate results" in result.stderr
-
-
-def test_observed_threshold_passes_with_no_structural_gates(tmp_path):
-    # edge_threshold='observed_quantile' builds no null, so it reports no
-    # null-construction gates. That is the correct shape for that threshold
-    # source, not a truncated manifest, and it is a pass.
-    manifest = make_manifest(
-        status="discovery_only", structural={},
-        null_mode="observed_gap_support_quantile",
-    )
-    result = run_checker(tmp_path, manifest)
-    assert result.returncode == 0, result.stderr
-    assert "none built (observed-quantile threshold)" in result.stdout
-
-
-def test_discovery_only_with_the_lag_null_threshold_keeps_its_gates(tmp_path):
-    # The default: discovery mode, but the edge threshold came from the lag
-    # null, so that null's structural gates exist and must all pass.
-    manifest = make_manifest(status="discovery_only")
-    result = run_checker(tmp_path, manifest)
-    assert result.returncode == 0, result.stderr
-    assert "2 present, all passed" in result.stdout
-
-
-def test_observed_threshold_with_structural_gates_is_self_contradictory(tmp_path):
-    # Gates on a null that was never built mean one of the two statements is
-    # false; the checker must not pick which.
-    manifest = make_manifest(
-        status="discovery_only", null_mode="observed_gap_support_quantile",
-    )
-    result = run_checker(tmp_path, manifest)
-    assert result.returncode == 1
-    assert "contradicts itself" in result.stderr
+def test_a_missing_or_invalid_manifest_fails_cleanly(tmp_path, capsys):
+    assert run(tmp_path / "absent") == 1
+    assert "cannot read" in capsys.readouterr().err
+    out = write_run(tmp_path / "run")
+    (out / "run_manifest.json").write_text("{not json")
+    assert run(out) == 1
+    assert "not valid JSON" in capsys.readouterr().err

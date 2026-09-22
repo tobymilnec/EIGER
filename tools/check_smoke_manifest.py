@@ -1,50 +1,56 @@
 #!/usr/bin/env python3
-"""Inspect a smoke run's ``run_manifest.json`` and report what it actually says.
+"""Check a smoke run's outputs against what ``eiger2 call`` documents.
 
-    python tools/check_smoke_manifest.py OUT/run_manifest.json --exit-code 0
+    python tools/check_smoke_manifest.py OUT --exit-code 0 \\
+        [--version 2.2.0] [--profile newer|legacy] [--axis-mode descriptive]
 
-Used by the ``smoke`` targets in the root ``Makefile``.  It exists so that a
-green smoke target means "the run reached a documented state that was read off
-the manifest", never merely "the process exited".  A refusal is always printed
-as a refusal, and a refused run is never described as a completed inference.
+``OUT`` is the output directory of one ``eiger2 call``.  Used by the smoke
+targets in the root ``Makefile``, so that a green smoke target means "the run
+completed the documented method and its files agree with each other", never
+merely "the process exited".  Standard library only.
 
 What fails the check:
 
-* a failed structural gate (spec 2a.2 -- the null is not usable at all);
-* ``inference_unreliable`` -- the whole run's inferential columns are refused;
-* ``no_regions`` -- the example fixture is expected to produce regions;
-* a run status eiger2 does not document, which is a stop-and-escalate signal;
-* a status that contradicts the caller's exit code, or the refusal lists.
-
-What is reported but does not fail: ``partial_inference``.  It is a documented
-stratum-local state (``Python/eiger2/core.py``, spec 2c/2a.1): the null
-construction is sound and every other length stratum reports normally.  The
-refused strata and their opportunity arithmetic are printed in full.  Pass
-``--expect-no-refusals`` to demand that no stratum is refused; that is not the
-default because the shipped example currently refuses stratum '20-49' -- see
-the note in the repository's development documentation.
+* a run schema, status or software version other than the documented ones;
+* a nonzero exit code, or a status other than ``ok`` (the example is built to
+  produce candidates and q-values);
+* permutation scans that were requested but not all completed, or
+  per-permutation records that do not match the completed count;
+* an FDR formula, pseudocount or deflation setting other than the supported
+  method's;
+* ``regions.csv`` or ``discoveries.csv`` disagreeing with the manifest's
+  counts, a selected region above the target FDR, or an unselected region at
+  or below it;
+* axis annotations recorded as affecting primary calls, or inferential axis
+  columns filled in the default descriptive mode;
+* an input file recorded without a full SHA-256.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 from pathlib import Path
 
-# Run statuses eiger2 documents (Python/eiger2/core.py, spec 2a.1).  Anything
-# else is undocumented and must be escalated rather than interpreted here.
-COMPLETED_STATUSES = ("ok", "ok_with_warnings")
-DOCUMENTED_STATUSES = COMPLETED_STATUSES + (
-    "discovery_only", "partial_inference", "inference_unreliable", "no_regions",
+RUN_SCHEMA = "eiger.region_fdr_run/1"
+DOCUMENTED_STATUSES = ("ok", "no_candidates", "discovery_only")
+FDR_FORMULA_VERSION = "fdr_plus_cummin/1"
+PRIMARY_COLUMNS = (
+    "region_id", "chr", "start", "end", "n_cpg", "cpg_index_start",
+    "cpg_index_end", "caller", "region_score", "statistic_mean",
+    "scan_threshold", "coordination_qvalue", "coordination_selected",
 )
-
-# Per-stratum refusals recorded by region_fdr_result.
-REFUSAL_KEYS = (
-    "insufficient_null_opportunity_strata",
-    "insufficient_cluster_replicates_strata",
-    "insufficient_scale_opportunity_strata",
+AXIS_COLUMNS = (
+    "axis_status", "axis_n_axes", "axis_n_samples_tested", "axis_index",
+    "axis_effect", "axis_effect_se", "axis_effect_lower", "axis_effect_upper",
+    "axis_pvalue", "axis_qvalue", "axis_supported",
 )
+INFERENTIAL_AXIS_COLUMNS = ("axis_pvalue", "axis_qvalue", "axis_supported")
+MISSING = ("", "NA")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def fail(message: str) -> int:
@@ -52,149 +58,153 @@ def fail(message: str) -> int:
     return 1
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument(
-        "--exit-code", type=int, required=True,
-        help="the exit code the revised caller returned, cross-checked here",
-    )
-    parser.add_argument(
-        "--expect-no-refusals", action="store_true",
-        help="also require that no length stratum was refused",
-    )
-    args = parser.parse_args()
+def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), list(reader)
 
-    try:
-        manifest = json.loads(args.manifest.read_text())
-    except OSError as exc:
-        return fail(f"cannot read {args.manifest}: {exc}")
-    except json.JSONDecodeError as exc:
-        return fail(f"{args.manifest} is not valid JSON: {exc}")
-    if not isinstance(manifest, dict):
-        return fail(f"{args.manifest} is not a manifest object")
-    caller = manifest.get("caller_manifest")
-    if not isinstance(caller, dict):
-        return fail(f"{args.manifest} has no caller_manifest block")
 
-    # Structural gates first: they decide whether the null is usable at all,
-    # so nothing else in the manifest means anything until they pass.
-    gates = caller.get("gates") or {}
-    structural = (gates.get("structural") if isinstance(gates, dict) else None) or {}
-    # The default path builds no null, so it has no null-construction gates to
-    # report: an EMPTY structural block is correct there, and a populated one
-    # would mean a null was built after all.  Everywhere else an empty block is
-    # a truncated manifest.
-    null_block = caller.get("null") or {}
-    observed_threshold = (
-        isinstance(null_block, dict)
-        and null_block.get("mode") == "observed_gap_support_quantile"
-    )
-    if not isinstance(structural, dict):
-        return fail("the manifest's structural gate block is not an object")
-    if observed_threshold and structural:
-        return fail(
-            "the edge threshold came from the observed track, so no null was "
-            "built, but structural null gates are recorded; the manifest "
-            "contradicts itself"
-        )
-    if not observed_threshold and not structural:
-        return fail("no structural gate results in the manifest")
-    # A gate entry that does not say `passed: true` counts as failed, so a
-    # truncated or malformed manifest cannot read as a pass.
-    failed = {
-        name: gate
-        for name, gate in structural.items()
-        if not (isinstance(gate, dict) and gate.get("passed") is True)
-    }
-    if failed:
-        return fail(f"structural gate(s) failed: {failed}")
-    print(
-        "[smoke] structural gates: none built (observed-quantile threshold)"
-        if observed_threshold
-        else f"[smoke] structural gates: {len(structural)} present, all passed"
-    )
-
-    # Refused length strata, inspected and printed whether or not any exist.
-    fdr = caller.get("fdr") or {}
-    if not isinstance(fdr, dict):
-        return fail("the manifest's fdr block is not an object")
-    refused = {key: (fdr.get(key) or []) for key in REFUSAL_KEYS}
-    for key, entries in refused.items():
-        print(f"[smoke] {key}: {entries}")
-    n_refused = sum(len(entries) for entries in refused.values())
-
-    status = caller.get("status")
-    print(f"[smoke] final inference status: {status}")
-
-    if status not in DOCUMENTED_STATUSES:
-        return fail(
-            f"undocumented run status {status!r} -- stop and escalate rather "
-            "than treating this run as a pass"
-        )
-    if status == "inference_unreliable":
-        return fail(
-            "run status 'inference_unreliable': the whole run's inferential "
-            "columns are refused. This is a refusal, not an inference"
-        )
-    if status == "no_regions":
-        return fail(
-            "run status 'no_regions': the example is expected to produce "
-            "regions, so this is a regression rather than a pass"
-        )
-
-    # The status and the refusal lists must agree about what happened.
-    if status == "partial_inference" and n_refused == 0:
-        return fail(
-            "status 'partial_inference' but no refused stratum is recorded; "
-            "the manifest contradicts itself"
-        )
-    if status in COMPLETED_STATUSES and n_refused:
-        return fail(
-            f"status {status!r} reports a completed inference while "
-            f"{n_refused} stratum/strata are recorded as refused; "
-            "the manifest contradicts itself"
-        )
-
-    # The CLI returns 1 only for inference_unreliable, which already failed
-    # above; any other nonzero code here means exit and manifest disagree.
+def check(args: argparse.Namespace) -> int:
+    out: Path = args.out
+    manifest_path = out / "run_manifest.json"
     if args.exit_code != 0:
-        return fail(
-            f"caller exited {args.exit_code} but the manifest reports "
-            f"{status!r}; exit code and manifest disagree"
-        )
+        return fail(f"eiger2 call exited {args.exit_code}; the smoke run must "
+                    "exit 0")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except OSError as exc:
+        return fail(f"cannot read {manifest_path}: {exc}")
+    except json.JSONDecodeError as exc:
+        return fail(f"{manifest_path} is not valid JSON: {exc}")
+    if not isinstance(manifest, dict):
+        return fail(f"{manifest_path} is not a manifest object")
 
-    if args.expect_no_refusals and n_refused:
-        return fail(
-            f"--expect-no-refusals was requested but {n_refused} "
-            "stratum/strata were refused"
-        )
+    if manifest.get("run_schema") != RUN_SCHEMA:
+        return fail(f"run_schema is {manifest.get('run_schema')!r}, "
+                    f"expected {RUN_SCHEMA!r}")
+    if args.version and manifest.get("software_version") != args.version:
+        return fail(f"software_version is {manifest.get('software_version')!r}, "
+                    f"expected {args.version!r}")
+    status = manifest.get("status")
+    if status not in DOCUMENTED_STATUSES:
+        return fail(f"undocumented run status {status!r}")
+    if status != "ok":
+        return fail(f"status is {status!r}; the example must complete with "
+                    "candidates and q-values ('ok')")
+    profile = (manifest.get("profile") or {}).get("name")
+    if args.profile and profile != args.profile:
+        return fail(f"caller profile is {profile!r}, expected {args.profile!r}")
 
-    n_significant = caller.get("n_significant")
-    if status == "partial_inference":
-        strata = [
-            entry.get("stratum")
-            for entries in refused.values() for entry in entries
-        ]
-        print(
-            f"[smoke] revised caller REFUSED inference for length stratum/strata "
-            f"{strata}: the printed entries give the null opportunity available "
-            f"against the opportunity required. Every other stratum reported "
-            f"normally ({n_significant} significant regions); the run as a "
-            f"whole did not complete inference"
-        )
-    elif status == "discovery_only":
-        print(
-            f"[smoke] revised caller ran in its default discovery mode "
-            f"(status {status}): region FDR against the genome background was "
-            f"not attempted, and the regions are ranked candidates"
-        )
-    else:
-        print(
-            f"[smoke] revised caller completed inference for every stratum "
-            f"(status {status}, {n_significant} significant regions)"
-        )
+    files = (manifest.get("inputs") or {}).get("files") or []
+    if not files or not all(
+        isinstance(f, dict) and SHA256.fullmatch(str(f.get("sha256", "")))
+        for f in files
+    ):
+        return fail("every input file needs a full SHA-256 in inputs.files")
+
+    method = manifest.get("method") or {}
+    if method.get("fdr_formula_version") != FDR_FORMULA_VERSION:
+        return fail(f"fdr_formula_version is "
+                    f"{method.get('fdr_formula_version')!r}")
+    if method.get("pseudocount") != 1:
+        return fail(f"pseudocount is {method.get('pseudocount')!r}, expected 1")
+    if method.get("automatic_deflation") is not False:
+        return fail("automatic_deflation must be recorded as false")
+
+    permutations = manifest.get("permutations") or {}
+    requested = (manifest.get("settings") or {}).get("fdr_replicates_requested")
+    completed = permutations.get("completed")
+    if not (isinstance(requested, int) and requested >= 1):
+        return fail(f"fdr_replicates_requested is {requested!r}")
+    if permutations.get("requested") != requested or completed != requested:
+        return fail(f"{completed!r} of {requested!r} permutation scans "
+                    "completed; a partial set is not a valid FDR")
+    for key in ("null_regions_per_permutation", "scan_thresholds"):
+        if len(permutations.get(key) or []) != completed:
+            return fail(f"permutations.{key} has "
+                        f"{len(permutations.get(key) or [])} entries for "
+                        f"{completed} completed scans")
+    _header, perm_rows = _read_rows(out / "permutations.csv")
+    if len(perm_rows) != completed:
+        return fail(f"permutations.csv has {len(perm_rows)} rows for "
+                    f"{completed} completed scans")
+
+    results = manifest.get("results") or {}
+    n_candidates, n_selected = results.get("n_candidates"), results.get("n_selected")
+    if not (isinstance(n_candidates, int) and n_candidates >= 1):
+        return fail(f"n_candidates is {n_candidates!r}; the example must "
+                    "produce candidate regions")
+    target = (manifest.get("settings") or {}).get("target_fdr")
+    header, rows = _read_rows(out / "regions.csv")
+    missing = [c for c in PRIMARY_COLUMNS + AXIS_COLUMNS if c not in header]
+    if missing:
+        return fail(f"regions.csv lacks documented columns {missing}")
+    if len(rows) != n_candidates:
+        return fail(f"regions.csv has {len(rows)} rows, manifest says "
+                    f"{n_candidates} candidates")
+    selected = 0
+    for row in rows:
+        q = float(row["coordination_qvalue"])
+        flag = row["coordination_selected"]
+        if flag not in ("True", "False"):
+            return fail(f"coordination_selected {flag!r} in {row['region_id']}")
+        if (flag == "True") != (q <= target):
+            return fail(f"{row['region_id']}: coordination_selected={flag} but "
+                        f"coordination_qvalue={q} against target {target}")
+        selected += flag == "True"
+    if selected != n_selected:
+        return fail(f"{selected} selected rows in regions.csv, manifest says "
+                    f"{n_selected}")
+    _dheader, discoveries = _read_rows(out / "discoveries.csv")
+    if [r["region_id"] for r in discoveries] != [
+        r["region_id"] for r in rows if r["coordination_selected"] == "True"
+    ]:
+        return fail("discoveries.csv is not the selected subset of regions.csv")
+
+    axis = manifest.get("axis") or {}
+    if axis.get("affects_primary_calls") is not False:
+        return fail("axis annotations must be recorded as not affecting "
+                    "primary calls")
+    if args.axis_mode and axis.get("mode") != args.axis_mode:
+        return fail(f"axis mode is {axis.get('mode')!r}, expected "
+                    f"{args.axis_mode!r}")
+    if axis.get("mode") == "descriptive":
+        if axis.get("inference_reported") is not False:
+            return fail("descriptive axis mode must not report inference")
+        filled = [c for c in INFERENTIAL_AXIS_COLUMNS
+                  if any(r[c] not in MISSING for r in rows)]
+        if filled:
+            return fail(f"descriptive axis mode filled {filled}")
+
+    ratio = (manifest.get("threshold_ratio") or {}).get("observed_over_mean_permuted")
+    print(f"[smoke] {manifest_path}: schema {RUN_SCHEMA}, version "
+          f"{manifest.get('software_version')}, profile {profile}")
+    print(f"[smoke] status ok: {n_candidates} candidates, {n_selected} selected "
+          f"at q <= {target}, {completed}/{requested} permutation scans")
+    print(f"[smoke] axis: mode {axis.get('mode')}, {axis.get('n_axes')} axes, "
+          f"status counts {axis.get('status_counts')}")
+    print(f"[smoke] threshold ratio (descriptive): {ratio}")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("out", type=Path, help="the eiger2 call output directory")
+    parser.add_argument("--exit-code", type=int, required=True,
+                        help="the exit code eiger2 call returned")
+    parser.add_argument("--version", default=None,
+                        help="require this software_version")
+    parser.add_argument("--profile", choices=["newer", "legacy"], default=None,
+                        help="require this caller profile")
+    parser.add_argument("--axis-mode", default=None,
+                        help="require this axis annotation mode")
+    args = parser.parse_args(argv)
+    try:
+        return check(args)
+    except (OSError, KeyError, ValueError) as exc:
+        return fail(f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

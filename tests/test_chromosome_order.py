@@ -1,15 +1,9 @@
-"""Spec §2b prerequisite: canonical chromosome ordering.
+"""Chromosome handling: canonical order and per-chromosome lag feasibility.
 
-Natural ordering (``chr1, chr2, chr10``) conflicted with the lexicographic
-validation a prior version applied (``np.lexsort`` on ``chr`` as a string
-sorts ``"chr10"`` before ``"chr2"``), confirmed on the repo's own real hg38
-fixture (``chr1, chr7, chr19`` -- already not lexicographic). Both callers now
-group rows by chromosome in a canonical order and sort ascending within each
-chromosome themselves, regardless of the order a caller presents rows in.
-These tests pin exactly what the spec asks for: ``chr1``..``chr22``, ``chrX``,
-``chrY``, ``chrM`` plus unplaced contigs, presented in natural order,
-lexicographic order and shuffled, producing identical internal state and
-identical results.
+The callers group rows by chromosome in a canonical order (``chr1``..``chr22``,
+``chrX``, ``chrY``, ``chrM``, then other contigs lexicographically) and sort by
+position within each chromosome, whatever order the rows arrive in. Natural,
+lexicographic and shuffled presentations must give identical results.
 """
 
 from __future__ import annotations
@@ -26,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
 from eiger2.core import (  # noqa: E402
     CANONICAL_CHROMOSOMES,
     Eiger2Config,
-    call_dmrs,
     canonical_chromosome_order,
+    chromosome_lag_feasibility,
     chromosome_sort_permutation,
 )
 
@@ -114,76 +108,48 @@ def test_chromosome_sort_permutation_groups_and_sorts_regardless_of_input_order(
         assert list(block["start"]) == sorted(block["start"])
 
 
-def test_call_dmrs_results_are_independent_of_chromosome_presentation_order():
-    # A representative subset, not all 25 canonical chromosomes: natural and
-    # lexicographic order genuinely diverge here (chr9 vs chr10), and this
-    # stage's structural gates (spec §2a.2) need chromosome blocks large
-    # relative to null_replicates to reach a non-degenerate `n_regions` --
-    # the null construction is not yet chromosome-aware (that is §2b's own
-    # body, not this prerequisite), so with all 25 real chromosomes even a
-    # working construction here would be testing that pre-existing
-    # limitation, not order-invariance.
-    chroms = ["chr1", "chr2", "chr9", "chr10", "chrX"]
-    natural = list(chroms)
-    lexicographic = sorted(chroms)
-    shuffled = list(chroms)
-    random.Random(23).shuffle(shuffled)
-    assert natural != lexicographic
+def test_legacy_region_fdr_is_independent_of_chromosome_presentation_order():
+    """The supported pipeline (here its --legacy profile, which needs no lag
+    null) sorts rows itself: natural, lexicographic and shuffled chromosome
+    order give identical regions, q-values and IDs. Each chromosome's values
+    are generated from its own name, so only the presentation order varies."""
 
-    config = Eiger2Config(
-        window=4, null_min_lag=3, null_replicates=100, random_seed=5,
-        region_null_mode="lag",
+    from eiger2.coordination import (
+        LEGACY,
+        RegionFdrConfig,
+        call_coordinated_regions,
     )
-    results = []
-    for order in (natural, lexicographic, shuffled):
-        matrix, locations = _multi_chromosome_layout(
-            order, n_per_chrom=100, n_samples=10, seed=42,
-        )
-        regions, values, manifest = call_dmrs(matrix, locations, config=config)
-        results.append((regions, values, manifest))
 
-    base_regions, base_values, base_manifest = results[0]
-    # chr1, chr2, chr9, chr10, chrX is already the canonical (biological)
-    # order for this subset -- the point being tested is that ALL THREE
-    # presentations resolve to it, not just the one already in that order.
-    assert base_manifest["chromosome_order"] == [
-        "chr1", "chr2", "chr9", "chr10", "chrX",
-    ]
-    for regions, values, manifest in results[1:]:
-        pd.testing.assert_frame_equal(regions, base_regions)
-        pd.testing.assert_frame_equal(values, base_values)
-        assert manifest["chromosome_order"] == base_manifest["chromosome_order"]
-        assert manifest["status"] == base_manifest["status"]
-        assert manifest["n_regions"] == base_manifest["n_regions"]
-        assert manifest["n_cpg_retained"] == base_manifest["n_cpg_retained"]
-
-
-def test_run_legacy_results_are_independent_of_chromosome_presentation_order():
-    from eiger2.cli import run_legacy
+    def layout(order):
+        chrom_col, start_col, rows = [], [], []
+        for name in order:
+            rng = np.random.default_rng(_KNOWN.index(name) + 100)
+            values = 0.5 + 0.2 * rng.standard_normal((40, 10))
+            values[10:22] += 0.25 * rng.standard_normal(10)
+            chrom_col.extend([name] * 40)
+            start_col.extend((np.arange(40) * 50).tolist())
+            rows.append(np.clip(values, 0.0, 1.0))
+        locations = pd.DataFrame({
+            "chr": chrom_col, "start": start_col,
+            "end": [s + 1 for s in start_col],
+        })
+        return np.concatenate(rows, axis=0), locations
 
     natural = list(_KNOWN)
     lexicographic = sorted(_KNOWN)
     shuffled = list(_KNOWN)
     random.Random(29).shuffle(shuffled)
-
-    results = []
-    for order in (natural, lexicographic, shuffled):
-        matrix, locations = _multi_chromosome_layout(
-            order, n_per_chrom=20, n_samples=10, seed=17,
-        )
-        sample_names = [f"s{i}" for i in range(matrix.shape[1])]
-        frame, manifest = run_legacy(
-            matrix, locations, sample_names,
-            cov_threshold=0.01, delta_threshold=0.2, min_cpgs=5, impute=True,
-        )
-        results.append((frame, manifest))
-
-    base_frame, base_manifest = results[0]
-    assert base_manifest["chromosome_order"] == _KNOWN
-    for frame, manifest in results[1:]:
-        pd.testing.assert_frame_equal(frame, base_frame)
-        assert manifest["chromosome_order"] == base_manifest["chromosome_order"]
-        assert manifest["n_regions"] == base_manifest["n_regions"]
+    config = RegionFdrConfig(profile=LEGACY, fdr_replicates=5, axis_mode="off")
+    runs = [
+        call_coordinated_regions(*layout(order), config=config)
+        for order in (natural, lexicographic, shuffled)
+    ]
+    base = runs[0]
+    assert len(base.regions) > 0
+    assert base.manifest["input"]["chromosome_order"] == _KNOWN
+    for run in runs[1:]:
+        pd.testing.assert_frame_equal(run.regions, base.regions)
+        pd.testing.assert_frame_equal(run.permutations, base.permutations)
 
 
 def test_cli_validate_no_longer_rejects_natural_chromosome_order():
@@ -201,3 +167,28 @@ def test_cli_validate_no_longer_rejects_natural_chromosome_order():
     pd.testing.assert_frame_equal(
         out_locations.reset_index(drop=True), locations[["chr", "start", "end"]]
     )
+
+
+def test_chromosome_lag_feasibility_identifies_infeasible_chromosomes():
+    starts = np.concatenate([np.arange(2000), np.arange(40)]) * 20
+    locations = pd.DataFrame({
+        "chr": ["chrBig"] * 2000 + ["chrTiny"] * 40,
+        "start": starts,
+        "end": starts + 1,
+    })
+    config = Eiger2Config(window=4, null_min_lag=50)
+    feasibility = chromosome_lag_feasibility(locations, config)
+
+    # l_max = (n_c - 2) // (span - 1) with span = max(window, 2) = 4: the
+    # largest lag that still leaves _lag_null_track two usable positions.
+    assert feasibility["chrBig"]["feasible"] is True
+    assert feasibility["chrBig"]["n_cpg"] == 2000
+    assert feasibility["chrBig"]["l_max"] == (2000 - 2) // 3
+
+    assert feasibility["chrTiny"]["feasible"] is False
+    assert feasibility["chrTiny"]["n_cpg"] == 40
+    assert feasibility["chrTiny"]["l_max"] == (40 - 2) // 3
+
+    # every edge here is gap-eligible: n_cpg - 1 internal edges per chromosome
+    assert feasibility["chrBig"]["eligible_observed_edges"] == 1999
+    assert feasibility["chrTiny"]["eligible_observed_edges"] == 39

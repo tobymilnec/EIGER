@@ -1,0 +1,7 @@
+# The sdist carries the package, its build inputs and the documents the README
+# links to. Tests stay in the repository: they need fixtures and helpers that
+# are not part of the package.
+include CITATION.cff
+include docs/USER_GUIDE.md
+include examples/make_example_data.py
+prune tests

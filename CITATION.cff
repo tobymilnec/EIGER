@@ -2,24 +2,12 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "EIGER: label-free discovery of regionally coordinated DNA methylation"
 abstract: >-
-  EIGER identifies differentially methylated regions without requiring
-  predefined sample groups, by segmenting the genome into blocks in which
-  neighbouring CpGs co-vary across samples. Version 2 adds pairwise-complete
-  estimation, a scale-free discovery statistic, a locality-breaking null and a
-  region-level empirical false discovery rate. The originally published caller
-  is retained and runnable via --legacy. Version 2.0.1 corrects the direction
-  and tied-cutoff handling of the region-level false discovery rate estimator
-  and adds finite-null uncertainty quantification via simultaneous Garwood
-  Monte Carlo bounds on each region's q-value. Version 2.1.0 replaces the
-  region-level null with a member-step construction that reproduces the
-  observed statistic's autocorrelation by construction, corrects the
-  null-adequacy floor from a per-stratum to an aggregate check, exposes the
-  region-level null as a command-line option with an automatic small-input
-  fallback, and removes the broken permutation null mode. Version 2.2.0 adds
-  chromosome-aware null construction, explicit opportunity and structural
-  status reporting, prevalence diagnostics, and the revised component-
-  deflation rule. Calibration claims are conditional on the evaluated regimes;
-  refusal and partial-inference states remain explicit outputs.
+  EIGER finds regions of coordinated DNA methylation without predefined sample
+  groups: runs of neighbouring CpGs whose methylation co-varies across samples.
+  Each candidate region receives a coordination q-value from complete
+  within-CpG permutation rescans of the data, and optional descriptive
+  annotations of how the region follows genome-wide sample axes. The
+  originally published covariance statistic is available with --legacy.
 type: software
 authors:
   - family-names: Milne-Clark

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Audit a built EIGER wheel and the environment it was installed into.
+"""Audit built EIGER distributions and the environment a wheel was installed into.
 
-    python tools/check_wheel.py environment --forbid DIR [--forbid DIR]
-    python tools/check_wheel.py contents  DIST/eiger-2.2.0-py3-none-any.whl
-    python tools/check_wheel.py installed --wheel WHEEL --forbid DIR [--forbid DIR]
+    python tools/check_wheel.py --version V environment --forbid DIR [--forbid DIR]
+    python tools/check_wheel.py --version V contents  DIST/eiger-V-py3-none-any.whl
+    python tools/check_wheel.py --version V sdist     DIST/eiger-V.tar.gz
+    python tools/check_wheel.py --version V installed --wheel WHEEL --forbid DIR \
+        [--legacy] [--require-absent MODULE ...]
 
 Used by the ``wheel-check`` and ``wheel-gate`` targets in the root ``Makefile``.
 It exists so that a green wheel target means "the artefact that a user would
@@ -22,8 +24,18 @@ a clear refusal rather than a confusing pip message.
 * its top level is exactly ``eiger2``, ``functions`` and the distribution
   metadata directory -- no benchmarking, paper, analysis, provenance, script,
   result or fixture material may ride along;
+* every runtime module is present and no retired research module came back;
+* the metadata declares no dependency the default workflow does not import
+  (``numba`` and ``scikit-learn`` only under the ``legacy`` extra, no
+  ``diptest``);
 * ``LICENSE`` is present under the distribution metadata;
 * the ``eiger2`` console entry point is declared.
+
+``sdist`` reads the source archive the same way: one ``eiger-VERSION/`` root,
+the build inputs, the runtime modules, and none of the retired modules or
+research material. The wheel ``python -m build`` produces is built from this
+sdist, so a wheel that passes ``contents`` also shows the sdist is
+self-contained.
 
 ``installed`` must be run **by the interpreter of the target environment, from
 a working directory outside the source checkout**.  It requires that the
@@ -31,7 +43,11 @@ imported package comes from that environment's ``site-packages`` and from the
 built wheel, not from a checkout that happens to be on ``sys.path``: a missing
 packaged file must fail here rather than being satisfied by the source tree.
 ``--forbid`` marks a directory that nothing importable may come from; pass the
-checkout and, in CI, the workspace.
+checkout and, in CI, the workspace.  ``--require-absent`` names a module that
+must not be importable at all (the optional ``legacy`` dependencies in a
+default install); ``--legacy`` additionally imports the legacy covariance code.
+It then runs one small permutation-FDR call through the installed package, so
+the artefact a user installs is exercised, not only opened.
 """
 
 from __future__ import annotations
@@ -54,6 +70,37 @@ FORBIDDEN_COMPONENTS = (
     "benchmarking", "paper", "analysis", "provenance",
     "scripts", "results", "fixtures",
 )
+
+# Every module the release needs at run time.
+REQUIRED_MODULES = (
+    "eiger2/__init__.py", "eiger2/axis.py", "eiger2/cli.py",
+    "eiger2/coordination.py", "eiger2/core.py", "eiger2/io.py",
+    "functions/processing.py",
+)
+
+# Research modules removed from the release.  Named so that a regression says
+# which one came back.
+RETIRED_MODULES = (
+    "eiger2/benchmark.py", "eiger2/probability.py", "eiger2/confirm.py",
+    "eiger2/layouts.py", "eiger2/manifest_utils.py",
+    "functions/load_functions.py", "functions/scoring.py",
+    "functions/plotting.py", "functions/DMR_plotting_TMC.R",
+)
+
+# Dependencies the default install must not pull in, and the extra that must
+# carry the legacy ones.
+FORBIDDEN_REQUIREMENTS = ("diptest",)
+LEGACY_REQUIREMENTS = ("numba", "scikit-learn")
+
+# Build inputs the sdist must carry to rebuild the wheel on its own, and the
+# documents the README links to.
+SDIST_REQUIRED = (
+    "PKG-INFO", "pyproject.toml", "README.md", "LICENSE", "CITATION.cff",
+    "docs/USER_GUIDE.md", "examples/make_example_data.py",
+)
+
+# Modules the default workflow must never import.
+OPTIONAL_MODULES = ("numba", "sklearn", "diptest", "matplotlib")
 
 
 def fail(message: str) -> int:
@@ -82,6 +129,10 @@ def check_contents(args: argparse.Namespace) -> int:
                 archive.read(f"{metadata_dir}/entry_points.txt").decode()
                 if f"{metadata_dir}/entry_points.txt" in names else ""
             )
+            metadata = (
+                archive.read(f"{metadata_dir}/METADATA").decode()
+                if f"{metadata_dir}/METADATA" in names else None
+            )
     except OSError as exc:
         return fail(f"cannot read {wheel}: {exc}")
     except KeyError as exc:
@@ -109,11 +160,19 @@ def check_contents(args: argparse.Namespace) -> int:
         if offending:
             return fail(
                 f"{name!r} carries {offending[0]!r} into the wheel; that "
-                "material belongs in the eiger_paper repository"
+                "research material does not ship with the package"
             )
     missing = [pkg for pkg in ALLOWED_TOP_LEVEL if pkg not in top_level]
     if missing:
         return fail(f"the wheel does not contain {missing}")
+    problem = _module_problem(set(names), prefix="")
+    if problem:
+        return fail(problem)
+    if metadata is None:
+        return fail(f"{metadata_dir}/METADATA is missing")
+    problem = _requirement_problem(metadata)
+    if problem:
+        return fail(problem)
     if not license_names:
         return fail(f"no LICENSE under {metadata_dir}/")
     if "eiger2 = eiger2.cli:main" not in entry_points:
@@ -124,8 +183,102 @@ def check_contents(args: argparse.Namespace) -> int:
 
     print(f"[wheel] archive: {wheel.name} ({len(names)} entries)")
     print(f"[wheel] top level: {', '.join(top_level)}")
+    print(f"[wheel] runtime modules present: {len(REQUIRED_MODULES)}; "
+          "no retired module")
+    print("[wheel] requirements: no diptest; numba and scikit-learn only "
+          "under the legacy extra")
     print(f"[wheel] licence: {license_names[0]}")
     print("[wheel] entry point: eiger2 = eiger2.cli:main")
+    return 0
+
+
+def _module_problem(names: set[str], prefix: str) -> str | None:
+    """A missing runtime module or a retired one, as a message, else None."""
+
+    missing = [m for m in REQUIRED_MODULES if prefix + m not in names]
+    if missing:
+        return f"runtime module(s) missing: {missing}"
+    retired = [m for m in RETIRED_MODULES if prefix + m in names]
+    if retired:
+        return f"retired research module(s) shipped: {retired}"
+    return None
+
+
+def _requirement_problem(metadata: str) -> str | None:
+    """Check ``Requires-Dist`` lines of wheel METADATA or sdist PKG-INFO."""
+
+    requirements = [
+        line.split(":", 1)[1].strip() for line in metadata.splitlines()
+        if line.startswith("Requires-Dist:")
+    ]
+
+    def name(requirement: str) -> str:
+        head = requirement.split(";", 1)[0]
+        for stop in "<>=!~[ (":
+            head = head.split(stop, 1)[0]
+        return head.strip().lower().replace("_", "-")
+
+    for requirement in requirements:
+        if name(requirement) in FORBIDDEN_REQUIREMENTS:
+            return f"forbidden dependency declared: {requirement!r}"
+        if name(requirement) in LEGACY_REQUIREMENTS and (
+            'extra == "legacy"' not in requirement
+            and "extra == 'legacy'" not in requirement
+        ):
+            return (f"{requirement!r} is a default dependency; it belongs "
+                    "under the legacy extra")
+    legacy = {
+        name(r) for r in requirements
+        if 'extra == "legacy"' in r or "extra == 'legacy'" in r
+    }
+    missing = [r for r in LEGACY_REQUIREMENTS if r not in legacy]
+    if missing:
+        return f"the legacy extra does not declare {missing}"
+    return None
+
+
+def check_sdist(args: argparse.Namespace) -> int:
+    import tarfile
+
+    sdist = Path(args.sdist)
+    expected_name = f"eiger-{args.version}.tar.gz"
+    if sdist.name != expected_name:
+        return fail(f"sdist is named {sdist.name!r}, expected {expected_name!r}")
+    root = f"eiger-{args.version}/"
+    try:
+        with tarfile.open(sdist, "r:gz") as archive:
+            members = [m for m in archive.getmembers() if m.isfile()]
+            names = {m.name for m in members}
+            pkg_info = (
+                archive.extractfile(root + "PKG-INFO").read().decode()
+                if root + "PKG-INFO" in names else None
+            )
+    except (OSError, tarfile.TarError) as exc:
+        return fail(f"cannot read {sdist}: {exc}")
+    if not names:
+        return fail(f"{sdist} is empty")
+    outside = sorted(n for n in names if not n.startswith(root))
+    if outside:
+        return fail(f"entries outside {root}: {outside[:5]}")
+    missing = [f for f in SDIST_REQUIRED if root + f not in names]
+    if missing:
+        return fail(f"the sdist lacks build input(s) {missing}")
+    problem = _module_problem(names, prefix=root + "Python/")
+    if problem:
+        return fail(problem)
+    for name in names:
+        offending = [
+            part for part in Path(name).parts if part in FORBIDDEN_COMPONENTS
+        ]
+        if offending:
+            return fail(f"{name!r} carries {offending[0]!r} into the sdist")
+    if f"Version: {args.version}" not in (pkg_info or "").splitlines():
+        return fail(f"PKG-INFO does not declare Version: {args.version}")
+    problem = _requirement_problem(pkg_info or "")
+    if problem:
+        return fail(problem)
+    print(f"[sdist] archive: {sdist.name} ({len(names)} files under {root})")
+    print("[sdist] build inputs, runtime modules and requirements ok")
     return 0
 
 
@@ -229,11 +382,13 @@ def check_installed(args: argparse.Namespace) -> int:
             )
         print(f"[wheel] installed from {url}")
 
-    # Every advertised import, from this environment only.  benchmark is
-    # listed explicitly: its paper-only modes moved out, and it must import
-    # with no fixture present.
-    for name in ("eiger2.benchmark", "eiger2.cli", "functions.load_functions",
-                 "functions.scoring"):
+    # Every runtime import, from this environment only.  The legacy code
+    # imports numba and scikit-learn, so it is imported only with --legacy.
+    modules = ["eiger2.cli", "eiger2.coordination", "eiger2.axis",
+               "eiger2.core", "eiger2.io"]
+    if args.legacy:
+        modules.append("functions.processing")
+    for name in modules:
         try:
             __import__(name)
         except ImportError as exc:
@@ -241,13 +396,74 @@ def check_installed(args: argparse.Namespace) -> int:
         imported = Path(sys.modules[name].__file__).resolve()
         if purelib not in imported.parents:
             return fail(f"{name} imported from {imported}, not from {purelib}")
-    print("[wheel] eiger2.benchmark, eiger2.cli, functions.* import from the wheel")
+    print(f"[wheel] {', '.join(modules)} import from the wheel")
+    if not args.legacy:
+        loaded = [m for m in OPTIONAL_MODULES if m in sys.modules]
+        if loaded:
+            return fail(f"the default import loaded optional module(s) {loaded}")
+        print(f"[wheel] default import loads none of {', '.join(OPTIONAL_MODULES)}")
+
+    import importlib.util
+
+    present = [m for m in args.require_absent if importlib.util.find_spec(m)]
+    if present:
+        return fail(f"module(s) {present} are installed but must be absent "
+                    "from this environment")
+    if args.require_absent:
+        print(f"[wheel] absent as required: {', '.join(args.require_absent)}")
+
+    return check_run(args.version, legacy=args.legacy)
+
+
+def check_run(version: str, *, legacy: bool = False) -> int:
+    """One small permutation-FDR call through the installed package.
+
+    The data are built here, so no fixture or checkout is needed.  3,200 CpGs
+    is above the default profile's 3,002-CpG lag minimum; the planted block
+    must come back as a candidate, and all three permutation scans must
+    complete.
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    from eiger2 import LEGACY, NEWER, RegionFdrConfig, call_coordinated_regions
+
+    rng = np.random.default_rng(7)
+    n_cpg, n_samples = 3_200, 16
+    betas = 0.5 + rng.normal(0.0, 0.05, size=(n_cpg, n_samples))
+    betas[1_600:1_612] += 0.15 * rng.normal(0.0, 1.0, size=n_samples)
+    betas = np.clip(betas, 0.0, 1.0)
+    start = 1_000 + 50 * np.arange(n_cpg)
+    locations = pd.DataFrame({"chr": "chr1", "start": start, "end": start + 1})
+    for profile in (NEWER, LEGACY) if legacy else (NEWER,):
+        run = call_coordinated_regions(
+            betas, locations,
+            config=RegionFdrConfig(profile=profile, fdr_replicates=3),
+        )
+        manifest = run.manifest
+        if manifest.get("software_version") != version:
+            return fail(f"the {profile.name} run reports software_version "
+                        f"{manifest.get('software_version')!r}")
+        if manifest["permutations"]["completed"] != 3:
+            return fail(f"the {profile.name} run completed "
+                        f"{manifest['permutations']['completed']} of 3 scans")
+        covered = (
+            (run.regions["cpg_index_start"] <= 1_605)
+            & (run.regions["cpg_index_end"] >= 1_605)
+        ).any()
+        if not covered:
+            return fail(f"the {profile.name} run did not find the planted block")
+        print(f"[wheel] {profile.name} run: {len(run.regions)} candidate(s), "
+              f"3/3 permutation scans, status {manifest['status']}")
     return 0
 
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default="2.2.0", help="expected version")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", required=True,
+                        help="the version this release declares")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     environment = subparsers.add_parser(
@@ -266,6 +482,12 @@ def main(argv: list[str] | None = None) -> int:
     contents.add_argument("wheel")
     contents.set_defaults(handler=check_contents)
 
+    sdist = subparsers.add_parser(
+        "sdist", help="audit the source archive without unpacking it"
+    )
+    sdist.add_argument("sdist")
+    sdist.set_defaults(handler=check_sdist)
+
     installed = subparsers.add_parser(
         "installed",
         help="check the environment running this interpreter (run it outside "
@@ -279,11 +501,18 @@ def main(argv: list[str] | None = None) -> int:
         "--forbid", action="append", default=[],
         help="a directory nothing importable may come from; repeatable",
     )
+    installed.add_argument(
+        "--legacy", action="store_true",
+        help="the legacy extra is installed: import and run the legacy code too",
+    )
+    installed.add_argument(
+        "--require-absent", action="append", default=[],
+        help="a module that must not be importable; repeatable",
+    )
     installed.set_defaults(handler=check_installed)
 
     args = parser.parse_args(argv)
     return args.handler(args)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

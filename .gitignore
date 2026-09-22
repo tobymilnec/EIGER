@@ -34,6 +34,8 @@ env/
 # "legacy*/" cannot swallow a similarly named directory somewhere else in the
 # tree.
 /results/
+/results_matrix/
+/example_data/
 /legacy/
 /both/
 examples/data/

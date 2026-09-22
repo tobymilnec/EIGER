@@ -284,7 +284,7 @@ def load_matrix(
     min_observed_samples: int = 2,
     min_depth: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Load one chromosome (or everything) ready for ``call_dmrs``.
+    """Load one chromosome (or everything) ready for ``call_coordinated_regions``.
 
     ``min_depth`` masks individual CpG/sample observations below a read-depth
     floor. Set it to ~10 if the shared-read diagnostic shows a depth trend.

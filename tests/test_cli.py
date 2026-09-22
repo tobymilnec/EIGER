@@ -1,7 +1,9 @@
-"""Tests for eiger2.cli's argument parsing (Stage 1f Task 1a, master spec pre-release).
+"""Tests for the ``eiger2`` command line.
 
-parse_args()/`_config_from_args` do not touch the filesystem, so these tests exercise
-argument round-tripping directly without needing real input files.
+The supported command is ``eiger2 call`` (coordination FDR, optionally
+``--legacy``) and ``eiger2 compare`` on two existing outputs. Historical
+options are rejected with a migration message rather than silently changing
+meaning.
 """
 
 from __future__ import annotations
@@ -17,13 +19,48 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from region_fdr_data import make_dataset  # noqa: E402
 
 import eiger2.cli as cli  # noqa: E402
-from eiger2.cli import _config_from_args, build_parser  # noqa: E402
+from eiger2.cli import RETIRED_OPTIONS, build_parser  # noqa: E402
+from eiger2.coordination import (  # noqa: E402
+    LEGACY,
+    RegionFdrConfig,
+    call_coordinated_regions,
+)
 
-_BASE_ARGS = [
-    "call", "--betas", "betas.tsv", "--locations", "cpgs.bed", "--out", "out/",
-]
+_LEGACY_DATA = {
+    "seed": 12,
+    "n_samples": 10,
+    "noise_sd": 0.2,
+    "n_blocks": 20,
+    "block_strength": 0.12,
+    "missing_fraction": 0.03,
+    "chromosomes": (("chr1", 5_000), ("chr2", 4_000)),
+    "shuffle_rows": True,
+}
+
+
+@pytest.fixture(scope="module")
+def inputs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("cli_inputs")
+    betas, locations = make_dataset(**_LEGACY_DATA)
+    samples = [f"S{i}" for i in range(betas.shape[1])]
+    pd.DataFrame(betas, columns=samples).to_csv(
+        root / "betas.tsv", sep="\t", index=False, na_rep="NA"
+    )
+    locations.to_csv(root / "cpgs.bed", sep="\t", index=False)
+    return root, betas, locations, samples
+
+
+def _call(inputs, out, *extra):
+    root = inputs[0]
+    return cli.main([
+        "call", "--betas", str(root / "betas.tsv"), "--locations",
+        str(root / "cpgs.bed"), "--out", str(out), "--quiet", *extra,
+    ])
 
 
 def test_git_provenance_records_dirty_state_and_deterministic_fingerprint(
@@ -55,206 +92,28 @@ def test_git_provenance_records_dirty_state_and_deterministic_fingerprint(
     }
 
 
-def test_region_null_mode_cli_flag_round_trips_into_config():
-    for value in ("member_step", "lag", "off"):
-        args = build_parser().parse_args(
-            [*_BASE_ARGS, "--region-null-mode", value]
-        )
-        config = _config_from_args(args)
-        assert config.region_null_mode == value
-
-
-def test_region_null_mode_unset_leaves_config_at_its_own_default():
-    # The CLI flag choices are member_step/lag/off; leaving it unset applies
-    # Eiger2Config's own field default untouched (matching every other
-    # --null-* flag's default=None pattern, filtered out of
-    # _config_from_args's kwargs by the `is not None` check). Since v2.3 that
-    # default is "off": ranked candidates, no genome-background region FDR.
-    args = build_parser().parse_args(_BASE_ARGS)
-    config = _config_from_args(args)
-    assert config.region_null_mode == "off"
-
-
-def test_n_lag_draws_cli_flag_round_trips_into_config():
-    args = build_parser().parse_args([*_BASE_ARGS, "--n-lag-draws", "123"])
-    assert _config_from_args(args).n_lag_draws == 123
-
-
-@pytest.mark.parametrize(
-    ("region_null_mode", "expected_option", "wrong_option"),
-    [
-        ("member_step", "--n-lag-draws", "--null-replicates"),
-        ("lag", "--null-replicates", "--n-lag-draws"),
-    ],
-)
-def test_insufficient_opportunity_advice_names_mode_effective_volume_control(
-    monkeypatch, tmp_path, capsys, region_null_mode, expected_option, wrong_option,
+def test_git_provenance_ignores_a_repository_that_is_not_this_checkout(
+    monkeypatch, tmp_path,
 ):
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    caller_manifest = {
-        "status": "partial_inference",
-        "gates": {
-            "region_null_mode": region_null_mode,
-            "structural": {},
-        },
-        "fdr": {
-            "insufficient_null_opportunity_strata": [{
-                "stratum": "50+", "observed_regions": 1,
-                "null_opportunity": 10.0, "required_null_opportunity": 100.0,
-                "m_opportunity": 10.0,
-            }],
-        },
-        "layout": {},
-        "null": {},
+    """An installed package inside someone else's Git repository (a virtual
+    environment created in an analysis project) must not report that
+    repository's commit or dirty state as EIGER's source."""
+
+    fake_module = tmp_path / "venv" / "lib" / "site-packages" / "eiger2" / "cli.py"
+    fake_module.parent.mkdir(parents=True)
+    fake_module.write_text("")
+
+    def must_not_run(command, **_kwargs):
+        raise AssertionError(f"git was run for an installed package: {command}")
+
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.subprocess, "run", must_not_run)
+    assert cli._source_checkout() is None
+    assert cli._git_provenance() == {
+        "git_commit": "unknown",
+        "git_worktree_dirty": None,
+        "git_worktree_fingerprint_sha256": None,
     }
-    monkeypatch.setattr(
-        cli, "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli, "call_dmrs",
-        lambda *_args, **_kwargs: (
-            pd.DataFrame(), pd.DataFrame(), caller_manifest,
-        ),
-    )
-
-    out = tmp_path / region_null_mode
-    assert cli.main([
-        "call", "--matrix", "unused.tsv", "--out", str(out),
-        "--biological-support-policy", "five_class_v1",
-    ]) == 0
-    captured = capsys.readouterr()
-    assert expected_option in captured.err
-    assert wrong_option not in captured.err
-
-
-def test_legacy_call_accepts_none_fdr_diagnostics(monkeypatch, tmp_path):
-    """The legacy manifest carries ``fdr=None`` when no FDR was requested."""
-
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    monkeypatch.setattr(
-        cli,
-        "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run_legacy",
-        lambda *_args, **_kwargs: (
-            pd.DataFrame(),
-            {"caller": "legacy", "fdr": None, "n_regions": 0},
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "_git_provenance",
-        lambda: {
-            "git_commit": "dirty-head",
-            "git_worktree_dirty": True,
-            "git_worktree_fingerprint_sha256": "a" * 64,
-        },
-    )
-
-    out = tmp_path / "legacy"
-    argv = ["call", "--matrix", "unused.tsv", "--out", str(out), "--legacy"]
-    assert cli.main(argv) == 0
-    manifest = json.loads((out / "run_manifest.json").read_text())
-    assert manifest["caller_manifest"]["fdr"] is None
-    assert manifest["git_commit"] == "dirty-head"
-    assert manifest["git_worktree_dirty"] is True
-    assert manifest["git_worktree_fingerprint_sha256"] == "a" * 64
-
-
-def test_revised_cli_writes_lean_regions_and_separate_support_diagnostics(
-    monkeypatch, tmp_path
-):
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    regions = pd.DataFrame({
-        "region_id": ["r1"], "region_qvalue": [0.01],
-        "coordination_significant": pd.array([True], dtype="boolean"),
-        "biological_class": ["cohort_supported"],
-        "significant": pd.array([True], dtype="boolean"),
-        "passes_prevalence": [True],
-        "minority_size_descriptive": [2],
-        "minor_group_size_descriptive": [1],
-    })
-    regions.attrs["region_support_diagnostics"] = pd.DataFrame({
-        "region_id": ["r1"], "two_means_minority_size": [2],
-        "largest_gap_tail_size_legacy": [1],
-    })
-    caller_manifest = {
-        "status": "ok", "gates": {"structural": {}}, "fdr": {},
-        "layout": {}, "null": {}, "n_regions": 1,
-        "biological_support": {
-            "policy": {"name": "five_class_v1"},
-            "diagnostics_file": "region_support_diagnostics.csv",
-        },
-    }
-    monkeypatch.setattr(
-        cli, "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli, "call_dmrs",
-        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
-    )
-    out = tmp_path / "support"
-    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
-    main = pd.read_csv(out / "regions.csv")
-    diagnostics = pd.read_csv(out / "region_support_diagnostics.csv")
-    assert "biological_class" in main
-    assert "coordination_significant" in main
-    assert "passes_prevalence" in main
-    assert "minority_size_descriptive" not in main
-    assert diagnostics.loc[0, "two_means_minority_size"] == 2
-    assert "two_means_minority_samples" not in diagnostics
-    assert "largest_gap_tail_samples_legacy" not in diagnostics
-    manifest = json.loads((out / "run_manifest.json").read_text())
-    assert manifest["caller_manifest"]["biological_support"]["policy"]["name"] \
-        == "five_class_v1"
-
-
-def test_revised_cli_default_off_writes_no_support_diagnostics(
-    monkeypatch, tmp_path
-):
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    regions = pd.DataFrame({
-        "region_id": ["r1"], "region_qvalue": [0.5],
-        "coordination_significant": pd.array([False], dtype="boolean"),
-        "biological_class": [None],
-        "significant": pd.array([False], dtype="boolean"),
-    })
-    caller_manifest = {
-        "status": "ok", "gates": {"structural": {}}, "fdr": {},
-        "layout": {}, "null": {}, "n_regions": 1,
-        "biological_support": {
-            "policy": {"name": "off"}, "diagnostics_file": None,
-        },
-    }
-    monkeypatch.setattr(
-        cli, "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli, "call_dmrs",
-        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
-    )
-    out = tmp_path / "support_off"
-    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
-    assert (out / "regions.csv").exists()
-    assert not (out / "region_support_diagnostics.csv").exists()
 
 
 def test_cli_input_parsing_matches_python_api_dtype_bit_for_bit(tmp_path):
@@ -302,117 +161,13 @@ def test_cli_input_parsing_matches_python_api_dtype_bit_for_bit(tmp_path):
     assert np.isfinite(cli_statistic).any()
 
 
-def test_command_call_exits_non_zero_and_prints_blocked_summary(
-    monkeypatch, tmp_path, capsys,
-):
-    """Spec §2a.4: command_call exits non-zero on inference_unreliable and
-    names every failed structural gate with its measured value."""
-
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    fake_manifest = {
-        "status": "inference_unreliable",
-        "gates": {
-            "structural": {
-                "surviving_null_tracks": {
-                    "surviving": 7, "null_replicates": 100,
-                    "fraction": 0.07, "floor_fraction": 0.5, "passed": False,
-                },
-                "null_coverage": {
-                    "value": 0.213, "floor": 0.25, "passed": False,
-                },
-                "null_construction": {
-                    "value": 50_000, "floor": 1_000, "passed": True,
-                },
-            },
-        },
-        "fdr": {"status": "structural_gate_failure"},
-        "null": {},
-        "layout": {},
-    }
-    monkeypatch.setattr(
-        cli,
-        "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli,
-        "call_dmrs",
-        lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), fake_manifest),
-    )
-
-    out = tmp_path / "blocked"
-    argv = [
-        "call", "--betas", "unused.tsv", "--locations", "unused.bed",
-        "--out", str(out),
-    ]
-    exit_code = cli.main(argv)
-    captured = capsys.readouterr()
-
-    assert exit_code == 1
-    assert "BLOCKED" in captured.err
-    assert "surviving_null_tracks" in captured.err
-    assert "7/100" in captured.err
-    assert "null_coverage" in captured.err
-    assert "21.3%" in captured.err
-    assert "null_construction" not in captured.err
-
-
-def test_manifest_envelope_and_caller_manifest_schema_versions_agree():
-    """Spec §2a.6: the manifest envelope used to report schema "2.1" while the
-    caller manifest reported "2.2"/"2.3" -- reconciled to one literal,
-    pinned here across both real caller manifests (not the mocked fixture
-    other tests use, which would hide a literal drifting out of sync)."""
-
-    from eiger2.cli import run_legacy
-    from eiger2.core import call_dmrs
-    from eiger2.manifest_utils import build_manifest_envelope
-
-    envelope = build_manifest_envelope(
-        config_dict={}, git_commit="deadbeef", input_checksums={},
-        random_seed=1, derived_seeds={}, runtime_seconds=0.1, peak_memory_mb=1.0,
-        warnings=[], fdr_decision="point",
-    )
-
-    # eiger2 caller: the fast "insufficient_cpgs" early return still sets
-    # schema_version, without needing a real region-calling run.
-    from eiger2.core import Eiger2Config
-
-    _regions, _values, eiger2_manifest = call_dmrs(
-        np.full((2, 5), 0.5), pd.DataFrame(
-            {"chr": ["chr1", "chr1"], "start": [0, 10], "end": [1, 11]}
-        ),
-        config=Eiger2Config(min_cpgs=5),
-    )
-    assert eiger2_manifest["status"] == "insufficient_cpgs"
-
-    # legacy caller: fdr_replicates=0 skips the (separately, deliberately
-    # unsupported -- see test_run_legacy_fdr_replicates_fails_cleanly_not_a_traceback)
-    # FDR annotation path, exercising only discovery.
-    matrix = np.random.default_rng(0).uniform(0.1, 0.9, size=(30, 20))
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 30, "start": range(30), "end": range(1, 31)}
-    )
-    _frame, legacy_manifest = run_legacy(
-        matrix, locations, [f"S{i}" for i in range(20)],
-        cov_threshold=0.012, delta_threshold=0.2, min_cpgs=5, impute=True,
-        fdr_replicates=0,
-    )
-
-    assert envelope["schema_version"] == eiger2_manifest["schema_version"]
-    assert envelope["schema_version"] == legacy_manifest["schema_version"]
-    assert envelope["schema_version"] == "2.3"
-
-
 def test_command_compare_handles_a_regions_csv_mixing_available_and_unavailable(
     tmp_path,
 ):
     """A `.notna().any()` guard only checks that SOME row is available, not
     every row, so a frame mixing available and unavailable `significant`
     values (e.g. a future partial_inference run refusing one length stratum
-    while reporting the rest -- see docs/FDR.md §14) passed the guard and
+    while reporting the rest) passed the guard and
     then raised on `.astype(bool)`, which cannot convert the unavailable
     rows' NA. `.fillna(False)` handles every mix -- all available, all
     unavailable, or, as here, both at once -- treating unavailable rows the
@@ -449,153 +204,133 @@ def test_command_compare_handles_a_regions_csv_mixing_available_and_unavailable(
     assert summary["B_regions"].iloc[0] == 1
 
 
-def _bottom_stratum_cli_run(monkeypatch, tmp_path, capsys, n_cpgs, n_bottom):
-    """Run `eiger2 call` over a canned region table of the given CpG counts."""
-
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
-    )
-    regions = pd.DataFrame({
-        "region_id": [f"r{i}" for i in range(len(n_cpgs))],
-        "n_cpg": list(n_cpgs),
-        "region_qvalue": [0.01] * len(n_cpgs),
-        "significant": pd.array([True] * len(n_cpgs), dtype="boolean"),
-        "coordination_significant": pd.array(
-            [True] * len(n_cpgs), dtype="boolean"
-        ),
-        "biological_class": [None] * len(n_cpgs),
-    })
-    caller_manifest = {
-        "status": "ok",
-        "gates": {"structural": {}},
-        "fdr": {"n_significant_bottom_stratum": n_bottom},
-        "layout": {}, "null": {}, "n_regions": len(n_cpgs),
-        "biological_support": {
-            "policy": {"name": "off"}, "diagnostics_file": None,
-        },
-    }
-    monkeypatch.setattr(
-        cli, "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
-    )
-    monkeypatch.setattr(
-        cli, "call_dmrs",
-        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
-    )
-    out = tmp_path / f"bottom_{n_bottom}"
-    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
-    return capsys.readouterr()
+def test_legacy_call_writes_the_output_contract(inputs, tmp_path):
+    out = tmp_path / "legacy"
+    assert _call(inputs, out, "--legacy", "--fdr-replicates", "9") == 0
+    for name in ("regions.csv", "discoveries.csv", "permutations.csv",
+                 "run_manifest.json"):
+        assert (out / name).exists(), name
+    regions = pd.read_csv(out / "regions.csv")
+    assert list(regions.columns[:13]) == [
+        "region_id", "chr", "start", "end", "n_cpg", "cpg_index_start",
+        "cpg_index_end", "caller", "region_score", "statistic_mean",
+        "scan_threshold", "coordination_qvalue", "coordination_selected",
+    ]
+    assert "region_qvalue" not in regions.columns
+    assert "significant" not in regions.columns
+    discoveries = pd.read_csv(out / "discoveries.csv")
+    assert len(discoveries) == int(regions["coordination_selected"].sum())
+    manifest = json.loads((out / "run_manifest.json").read_text())
+    assert manifest["run_schema"] == "eiger.region_fdr_run/1"
+    assert manifest["permutations"]["completed"] == 9
+    assert manifest["settings"]["fdr_replicates_requested"] == 9
+    assert manifest["profile"]["cov_threshold"] == 0.01
+    assert manifest["method"]["fdr_formula_version"] == "fdr_plus_cummin/1"
+    assert len(manifest["permutations"]["scan_thresholds"]) == 9
+    assert manifest["threshold_ratio"]["observed_over_mean_permuted"] == 1.0
+    assert all(len(f["sha256"]) == 64 for f in manifest["inputs"]["files"])
+    assert manifest["axis"]["inference_reported"] is False
 
 
-def _near_cutoff_cli_run(monkeypatch, tmp_path, capsys, latent_structure):
-    """Run `eiger2 call` over a canned manifest carrying the given diagnostics."""
-
-    matrix = np.full((5, 5), 0.5)
-    locations = pd.DataFrame(
-        {"chr": ["chr1"] * 5, "start": range(5), "end": range(1, 6)}
+def test_cli_and_api_agree(inputs, tmp_path):
+    root = inputs[0]
+    out = tmp_path / "agree"
+    assert _call(inputs, out, "--legacy", "--fdr-replicates", "9") == 0
+    written = pd.read_csv(out / "regions.csv", float_precision="round_trip")
+    # the API on exactly the matrix the CLI parsed from the same files
+    betas, locations, samples = cli.load_inputs(root / "betas.tsv", root / "cpgs.bed")
+    api = call_coordinated_regions(
+        betas, locations, sample_names=samples,
+        config=RegionFdrConfig(profile=LEGACY, fdr_replicates=9),
+    ).regions
+    np.testing.assert_array_equal(written["region_id"], api["region_id"])
+    np.testing.assert_array_equal(written["region_score"], api["region_score"])
+    np.testing.assert_array_equal(
+        written["coordination_qvalue"], api["coordination_qvalue"]
     )
-    regions = pd.DataFrame({
-        "region_id": ["r0"],
-        "n_cpg": [12],
-        "region_qvalue": [0.01],
-        "significant": pd.array([True], dtype="boolean"),
-        "coordination_significant": pd.array([True], dtype="boolean"),
-        "biological_class": [None],
-    })
-    caller_manifest = {
-        "status": "ok",
-        "gates": {"structural": {}},
-        "fdr": {"n_significant_bottom_stratum": 0},
-        "layout": {}, "null": {}, "n_regions": 1,
-        "latent_structure": latent_structure,
-        "biological_support": {
-            "policy": {"name": "off"}, "diagnostics_file": None,
-        },
-    }
-    monkeypatch.setattr(
-        cli, "_resolve_inputs",
-        lambda _args: (matrix, locations, [f"S{i}" for i in range(5)], []),
+    np.testing.assert_array_equal(
+        written["coordination_selected"].astype(bool),
+        api["coordination_selected"].astype(bool),
     )
-    monkeypatch.setattr(
-        cli, "call_dmrs",
-        lambda *_args, **_kwargs: (regions, pd.DataFrame(), caller_manifest),
-    )
-    out = tmp_path / "near_cutoff"
-    assert cli.main(["call", "--matrix", "unused.tsv", "--out", str(out)]) == 0
-    return capsys.readouterr()
 
 
-def test_near_cutoff_note_names_the_component_its_concentration_and_the_cutoff(
-    monkeypatch, tmp_path, capsys,
+def test_discovery_only_writes_empty_qvalues_and_no_discoveries_table(inputs, tmp_path):
+    out = tmp_path / "discovery"
+    assert _call(inputs, out, "--legacy", "--discovery-only") == 0
+    regions = pd.read_csv(out / "regions.csv")
+    assert regions["coordination_qvalue"].isna().all()
+    assert regions["coordination_selected"].isna().all()
+    assert not (out / "discoveries.csv").exists()
+
+
+def test_lag_infeasible_input_fails_with_a_reason(inputs, tmp_path, capsys):
+    # 5,000 CpGs on the longest chromosome cannot host a 5,000-row lag
+    assert _call(inputs, tmp_path / "newer", "--fdr-replicates", "3",
+                 "--null-min-lag", "5000") == 1
+    assert "distant-lag candidate threshold" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("option", sorted(RETIRED_OPTIONS))
+def test_retired_options_fail_with_a_migration_message(option, capsys):
+    argv = ["call", "--betas", "b.tsv", "--locations", "c.bed", "--out", "o", option]
+    if option not in {"--no-confirm", "--compute-posterior"}:
+        argv.append("1")
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(argv)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert f"{option} is no longer supported" in err
+
+
+def test_profile_specific_options_are_not_silently_ignored():
+    args = build_parser().parse_args(
+        ["call", "--matrix", "m.tsv", "--out", "o", "--legacy", "--window", "3"]
+    )
+    with pytest.raises(SystemExit, match="newer profile only"):
+        cli._config_from_args(args)
+    args = build_parser().parse_args(
+        ["call", "--matrix", "m.tsv", "--out", "o", "--cov-threshold", "0.02"]
+    )
+    with pytest.raises(SystemExit, match="--legacy only"):
+        cli._config_from_args(args)
+
+
+def test_defaults_resolve_to_the_frozen_profiles():
+    args = build_parser().parse_args(["call", "--matrix", "m.tsv", "--out", "o"])
+    config = cli._config_from_args(args)
+    assert config.fdr_replicates == 99
+    assert config.target_fdr == 0.05
+    assert config.profile.is_reference_default()
+    assert config.axis_mode == "descriptive"
+    assert config.mask_mode == "values_with_mask"
+    args = build_parser().parse_args(
+        ["call", "--matrix", "m.tsv", "--out", "o", "--legacy",
+         "--axis-annotations", "experimental-inference", "--fdr-replicates", "0"]
+    )
+    with pytest.raises(SystemExit, match="fdr_replicates"):
+        cli._config_from_args(args)
+
+
+def test_compare_requires_existing_outputs(tmp_path):
+    with pytest.raises(SystemExit, match="--regions-a and --regions-b"):
+        cli.main(["compare", "--out", str(tmp_path)])
+
+
+def test_legacy_without_its_dependencies_exits_1_with_an_install_hint(
+    inputs, tmp_path, monkeypatch, capsys
 ):
-    # FIX_SPEC WP6b item 2: exactly ONE run-level note, naming which candidate
-    # is near, where it sits, and what it is near -- a user cannot act on
-    # "something was close" without all three.
-    captured = _near_cutoff_cli_run(
-        monkeypatch, tmp_path, capsys,
-        latent_structure={
-            "n_candidates": 2,
-            "loading_concentration": [0.0843, 0.0960],
-            "component_verdict": ["nuisance_deflated", "nuisance_deflated"],
-            "n_components": 2,
-            "deflation_max_concentration": 0.10,
-            "deflation_near_cutoff_margin": 0.02,
-            "near_cutoff_components": [{
-                "component": 1,
-                "loading_concentration": 0.0960,
-                "verdict": "nuisance_deflated",
-            }],
-        },
-    )
-    assert captured.err.count("Deflation decision near its cutoff") == 1
-    assert "1 of 2 candidate component(s)" in captured.err
-    assert "component 1 at 0.0960 (nuisance_deflated)" in captured.err
-    assert "0.02 of the 0.1 cutoff" in captured.err
+    """A default install has no numba or scikit-learn. --legacy must stop with
+    a message naming them, not a traceback and not a fallback to another
+    method. The hint names the packages, never a bare ``pip install eiger``:
+    that distribution name on the public index belongs to another project."""
 
+    import functions
 
-def test_near_cutoff_note_is_silent_when_no_component_is_near_the_cutoff(
-    monkeypatch, tmp_path, capsys,
-):
-    # FIX_SPEC WP6b item 2: an empty list is recorded on every run, and an empty
-    # list must not print -- the note is only informative when it is rare.
-    captured = _near_cutoff_cli_run(
-        monkeypatch, tmp_path, capsys,
-        latent_structure={
-            "n_candidates": 2,
-            "loading_concentration": [0.0640, 0.3100],
-            "component_verdict": ["nuisance_deflated", "biological_kept"],
-            "n_components": 1,
-            "deflation_max_concentration": 0.10,
-            "deflation_near_cutoff_margin": 0.02,
-            "near_cutoff_components": [],
-        },
-    )
-    assert "Deflation decision near its cutoff" not in captured.err
-
-
-def test_bottom_stratum_note_is_silent_when_no_short_region_is_significant(
-    monkeypatch, tmp_path, capsys,
-):
-    # FIX_SPEC §WP2: 6+ CpG significant regions are inside the length regime
-    # that measured on target, so the run says nothing.
-    captured = _bottom_stratum_cli_run(
-        monkeypatch, tmp_path, capsys, n_cpgs=[8, 12, 30], n_bottom=0,
-    )
-    assert "Short-region calibration limitation" not in captured.err
-
-
-def test_bottom_stratum_note_is_emitted_once_per_run_not_per_region(
-    monkeypatch, tmp_path, capsys,
-):
-    # FIX_SPEC §WP2: three significant 4-CpG regions, still exactly ONE note
-    # -- the measured 6.9-15.4% miscalibration is a property of the regime,
-    # not of any individual row. The note names docs/FDR.md and the measured
-    # range so a user does not have to go looking for either.
-    captured = _bottom_stratum_cli_run(
-        monkeypatch, tmp_path, capsys, n_cpgs=[4, 4, 5, 20], n_bottom=3,
-    )
-    assert captured.err.count("Short-region calibration limitation") == 1
-    assert "6.9-15.4%" in captured.err
-    assert "docs/FDR.md" in captured.err
-    assert "3 of 4 significant region(s)" in captured.err
+    # an earlier test may have imported it; hide both routes to the module
+    monkeypatch.delattr(functions, "processing", raising=False)
+    monkeypatch.setitem(sys.modules, "functions.processing", None)
+    assert _call(inputs, tmp_path / "out", "--legacy") == 1
+    err = capsys.readouterr().err
+    assert "pip install numba scikit-learn" in err
+    assert "pip install 'eiger" not in err
+    assert not (tmp_path / "out" / "regions.csv").exists()

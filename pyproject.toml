@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eiger"
-version = "2.3.0"
-description = "Label-free discovery of regionally coordinated DNA methylation, with a region-level empirical false discovery rate"
+dynamic = ["version"]
+description = "Label-free discovery of regionally coordinated DNA methylation, with a permutation-based region FDR"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -24,15 +24,16 @@ dependencies = [
     "numpy>=1.23",
     "pandas>=1.5",
     "scipy>=1.9",
-    # Hartigan's dip test, the tier-two confirmation test (docs/CONFIRM.md).
-    # A runtime dependency, not an extra: confirmation is on by default.
-    "diptest>=0.9",
 ]
 
 [project.optional-dependencies]
+# `eiger2 call --legacy` runs the original covariance code
+# (Python/functions/processing.py), which imports numba and scikit-learn.
 legacy = ["numba>=0.57", "scikit-learn>=1.1"]
-fast = ["numba>=0.57"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "build>=1.0"]
+dev = ["pytest>=7.0", "ruff", "build>=1.0"]
+
+[project.urls]
+Repository = "https://github.com/tobymilnec/EIGER"
 
 [project.scripts]
 eiger2 = "eiger2.cli:main"
@@ -40,22 +41,19 @@ eiger2 = "eiger2.cli:main"
 [tool.setuptools]
 package-dir = { "" = "Python" }
 
+[tool.setuptools.dynamic]
+# The one source of the version: eiger2/__init__.py.
+version = { attr = "eiger2.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["Python"]
-# Only the runtime library and the original implementation used by --legacy ship.
-# Paper analyses, benchmark harnesses, and large fixtures live in eiger_paper.
+# The runtime library and the original covariance code used by --legacy.
 include = ["eiger2*", "functions*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [
     "error::RuntimeWarning",
-    # scipy's own internal advisory from stats.ttest_ind's variance calculation
-    # on near-identical samples (characterise_region's Welch's t-test on the
-    # minor/major split) -- not an eiger2 numerical bug, and scipy already
-    # states the result may be unreliable rather than silently returning a
-    # wrong one.
-    "ignore:Precision loss occurred in moment calculation:RuntimeWarning",
 ]
 
 [tool.ruff]
@@ -74,8 +72,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# The published 2023 implementation, invoked verbatim by --legacy. It is the
-# baseline the revised method is compared against and is deliberately NOT
-# reformatted: any edit here would weaken the claim that --legacy runs the
-# original code rather than a paraphrase of it.
+# The published 2023 implementation, whose covariance statistic --legacy runs.
+# Deliberately not reformatted, so it stays the original code.
 "Python/functions/**" = ["ALL"]

@@ -29,25 +29,26 @@ jobs:
         run: make lint PYTHON=python
       - name: Test the shipped package
         run: make test PYTHON=python
-      # Both callers over the synthetic example, in a temporary directory.
-      # The revised caller's verdict is read off run_manifest.json by
-      # tools/check_smoke_manifest.py, never off the exit code alone: the
-      # shipped example reaches `partial_inference`, which the CLI exits 0
-      # for, and exit 1 means `inference_unreliable`, which is a refusal and
-      # fails here.
-      - name: Smoke test both callers
+      # Every documented command over the synthetic example, in a temporary
+      # directory.  Each run is judged by tools/check_smoke_manifest.py from
+      # run_manifest.json and the tables it describes, never off the exit code
+      # alone: status `ok`, all permutation scans completed, selections
+      # consistent with the q-values, descriptive axis columns only.
+      - name: Smoke test every documented command
         run: make smoke PYTHON=python
 
-  # What the editable job cannot catch: a file missing from the wheel, an
-  # invalid entry point, or a runtime dependency that only the source checkout
-  # satisfies.  This job never installs the checkout -- it installs the built
-  # wheel into a fresh environment and runs every import, CLI call and smoke
-  # call from a temporary working directory outside the workspace.
+  # What the editable job cannot catch: a file missing from the wheel or
+  # sdist, an invalid entry point, a runtime dependency that only the source
+  # checkout satisfies, or an optional dependency the default install needs.
+  # This job never installs the checkout -- it installs the built wheel into a
+  # fresh environment, first without extras and then with `[legacy]`, and runs
+  # every import, CLI call and smoke run from a temporary working directory
+  # outside the workspace.
   #
   # One representative Python version is sufficient here and the matrix above
-  # is not duplicated: the artefact is `eiger-2.2.0-py3-none-any.whl`, a pure
-  # Python wheel with no compiled extension and no version-specific packaged
-  # content, so the same file is what 3.10, 3.11 and 3.12 would each install.
+  # is not duplicated: the artefact is a pure Python `py3-none-any` wheel with
+  # no compiled extension and no version-specific packaged content, so the
+  # same file is what 3.10, 3.11 and 3.12 would each install.
   # `make wheel-gate` asserts that `py3-none-any` filename, so a wheel that
   # ever became version-specific would fail this job rather than silently
   # reduce its coverage.  Interpreter-level compatibility across all three
@@ -65,11 +66,12 @@ jobs:
       # this job: it must arrive from the wheel `make wheel-gate` builds.
       - name: Install the build tooling
         run: python -m pip install --upgrade pip build
-      # Builds an isolated sdist and wheel, requires exactly one wheel, audits
-      # the archive (top level, licence, entry point, version, platform tag),
-      # installs `<wheel>[legacy]` into a fresh virtualenv outside the
-      # repository, checks provenance and import isolation from installed
-      # metadata, then runs the revised and legacy callers from that
-      # environment's own `eiger2` executable.
+      # Builds an isolated sdist and a wheel from it, audits both archives
+      # (modules, requirements, licence, entry point, version, platform tag),
+      # installs the wheel without extras into a fresh virtualenv outside the
+      # repository, checks provenance, import isolation and the absence of the
+      # optional dependencies, runs the documented commands from that
+      # environment's own `eiger2` executable, checks that `--legacy` refuses
+      # with the install hint, then adds `[legacy]` and runs the legacy caller.
       - name: Build, install and smoke-test the wheel
         run: make wheel-gate PYTHON=python

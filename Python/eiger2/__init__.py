@@ -1,65 +1,38 @@
-"""EIGER 2 — stripped-back co-variation DMR discovery.
+"""EIGER -- label-free discovery of regionally coordinated DNA methylation.
 
-Discovery is: centre CpGs, remove genome-wide latent structure estimated off a
-thinned CpG set, compute a local co-variation statistic, segment it against a
-locality-breaking null, and assign a region-level FDR by pushing null tracks
-through the identical segmentation.
-
-Everything about *which* samples differ and *by how much* is post-selection
-characterisation and is kept strictly downstream of discovery.
+The supported workflow is :func:`call_coordinated_regions` (``eiger2 call`` on
+the command line): scan the CpG-by-sample matrix for runs of coordinated
+adjacent CpGs, rescan ``B`` complete within-CpG permutations of the matrix, and
+report each candidate region's coordination q-value. Axis effects are
+secondary, descriptive annotations of the same candidates and never change a
+primary call. See :mod:`eiger2.coordination` and :mod:`eiger2.axis`.
 """
 
-__version__ = "2.3.0"
+__version__ = "2.2.0"
 
-from .confirm import confirm_regions, region_sample_means, two_component_fit
-from .core import (
-    Eiger2Config,
-    RegionFdrResult,
-    biological_support_diagnostics,
-    call_dmrs,
-    centre_cpgs,
-    characterise_region,
-    classify_biological_support,
-    deflate,
-    edge_statistic,
-    estimate_latent_basis,
-    main_region_table,
-    null_threshold,
-    region_fdr,
-    region_fdr_result,
-    segment,
-)
-from .probability import (
-    LocalFdrResult,
-    calibration_error,
-    estimate_pi0,
-    local_fdr,
-    reliability_table,
+from .axis import annotate_axes
+from .coordination import (
+    LEGACY,
+    NEWER,
+    CallerProfile,
+    CandidateThresholdError,
+    PermutationScanError,
+    RegionFdrConfig,
+    RegionFdrRun,
+    call_coordinated_regions,
+    coordination_fdr,
 )
 
 __all__ = [
     "__version__",
-    "Eiger2Config",
-    "LocalFdrResult",
-    "RegionFdrResult",
-    "calibration_error",
-    "biological_support_diagnostics",
-    "call_dmrs",
-    "centre_cpgs",
-    "confirm_regions",
-    "characterise_region",
-    "deflate",
-    "edge_statistic",
-    "estimate_latent_basis",
-    "classify_biological_support",
-    "main_region_table",
-    "estimate_pi0",
-    "local_fdr",
-    "null_threshold",
-    "region_fdr",
-    "region_fdr_result",
-    "reliability_table",
-    "region_sample_means",
-    "segment",
-    "two_component_fit",
+    "CallerProfile",
+    "CandidateThresholdError",
+    "LEGACY",
+    "NEWER",
+    "PermutationScanError",
+    "RegionFdrConfig",
+    "RegionFdrRun",
+    "annotate_axes",
+    "call_coordinated_regions",
+    "coordination_fdr",
 ]
